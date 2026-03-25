@@ -75,6 +75,7 @@ private:
     void              RefreshRecvView();
     void              RefreshDiagnostics();
     void              RefreshLogView();
+    void              CreateTooltips();
 
     // Layout helpers
     void LayoutControls(int w, int h);
@@ -169,6 +170,8 @@ private:
     std::vector<BYTE>              m_lastRecvData;  // only last transmission
     bool                           m_hexSendMode   {false};
     bool                           m_hexRecvMode   {false};
+    bool                           m_ignoreEditChange {false}; // suppress EN_CHANGE during programmatic edits
+    HWND                           m_hTooltip         {nullptr};
     bool                           m_listening     {false};
     bool                           m_clientConn    {false};
     float                          m_splitRatio    {0.5f};

@@ -65,6 +65,10 @@ private:
     void UpdateStats();
     void RefreshDiagnostics();
     void SwitchBottomTab(int tab);
+    void RefreshC2TView();
+    void RefreshT2CView();
+    void UpdateTitle();
+    void CreateTooltips();
 
     // ---- Network events ----
     void OnRelayListening(int port);
@@ -72,6 +76,7 @@ private:
     void OnRelayClientDisconn();
     void OnRelayTargetConn();
     void OnRelayTargetDisconn();
+    void OnRelayTargetConnecting();
     void OnRelayClientData(const BYTE* data, int len, bool forwarded);
     void OnRelayTargetData(const BYTE* data, int len, bool forwarded);
     void OnRelayError(int err, const std::wstring& msg);
@@ -94,6 +99,7 @@ private:
     HWND m_hEditTargetPort  {nullptr};
     HWND m_hComboProtocol   {nullptr};
     HWND m_hEditTimeout     {nullptr};
+    HWND m_hChkNoTimeout    {nullptr};  // "No timeout" checkbox
     HWND m_hBtnStart        {nullptr};
     HWND m_hBtnStop         {nullptr};
     HWND m_hStaticStatus    {nullptr};
@@ -106,6 +112,8 @@ private:
     HWND m_hBtnDropC2T      {nullptr};
     HWND m_hStaticBufC2T    {nullptr};
     HWND m_hHexC2T          {nullptr};
+    HWND m_hChkHexC2T       {nullptr};  // "Hex View" toggle
+    HWND m_hEditTextC2T     {nullptr};  // normal text view
 
     // T2C panel
     HWND m_hChkAutoT2C      {nullptr};
@@ -113,13 +121,14 @@ private:
     HWND m_hBtnDropT2C      {nullptr};
     HWND m_hStaticBufT2C    {nullptr};
     HWND m_hHexT2C          {nullptr};
+    HWND m_hChkHexT2C       {nullptr};  // "Hex View" toggle
+    HWND m_hEditTextT2C     {nullptr};  // normal text view
 
     // Log / tab
     HWND m_hTab             {nullptr};
     HWND m_hListLog         {nullptr};
     HWND m_hComboFilter     {nullptr};
     HWND m_hBtnClearLog     {nullptr};
-    HWND m_hStaticFilterLbl {nullptr};
 
     // Fonts
     HFONT m_hFontMono       {nullptr};
@@ -166,5 +175,11 @@ private:
 
     // Connection info
     std::wstring m_clientAddr;
+    std::wstring m_targetAddr;   // stored when target connects
     bool         m_isListening    {false};
+
+    // View mode flags for data panels
+    bool         m_hexModeC2T    {false};  // false = text view, true = hex view
+    bool         m_hexModeT2C    {false};
+    HWND         m_hTooltip      {nullptr};
 };

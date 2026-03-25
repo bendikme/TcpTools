@@ -76,6 +76,7 @@ private:
     void              RefreshRecvView();
     void              RefreshDiagnostics();
     void              RefreshLogView();
+    void              CreateTooltips();
 
     // ---- Layout ------------------------------------------------
     void LayoutControls(int w, int h);
@@ -183,8 +184,12 @@ private:
     std::vector<BYTE>           m_lastRecvData;  // only last transmission (reset on each Send)
     bool                        m_hexSendMode  {false};
     bool                        m_hexRecvMode  {false};
+    bool                        m_ignoreEditChange {false}; // suppress EN_CHANGE during programmatic edits
+    HWND                        m_hTooltip         {nullptr};
     bool                        m_connected    {false};
-    bool                        m_autoConnect  {false};
+    bool                        m_autoConnect     {false};
+    bool                        m_pendingAutoSend   {false}; // set when auto-connect is triggered before send
+    bool                        m_pendingCyclicStart{false}; // set when auto-connect is triggered before cyclic
     Utils::TimePoint            m_connectTime{};
     int                         m_logFilter    {0}; // 0=All, 1=Data, 2=Connection, 3=Errors
     size_t                      m_totalBytesSent {0};

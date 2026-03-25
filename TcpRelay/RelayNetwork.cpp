@@ -60,11 +60,149 @@ bool RelayNetwork::StartRelay(int listenPort, const std::string& targetHost, int
     m_stopRequested = false;
     m_udpMode = udpMode;
 
-    std::thread([this, listenPort, targetHost, targetPort, timeoutSec]() {
-        AcceptLoop(listenPort, targetHost, targetPort, timeoutSec);
-    }).detach();
+    if (m_udpMode) {
+        // UDP: single combined loop (target + client together)
+        std::thread([this, listenPort, targetHost, targetPort, timeoutSec]() {
+            AcceptLoop(listenPort, targetHost, targetPort, timeoutSec);
+        }).detach();
+    } else {
+        // TCP: two independent threads - connect to target immediately AND accept clients
+        std::thread([this, targetHost, targetPort, timeoutSec]() {
+            TargetConnectLoop(targetHost, targetPort, timeoutSec);
+        }).detach();
+        std::thread([this, listenPort, timeoutSec]() {
+            AcceptClientLoop(listenPort, timeoutSec);
+        }).detach();
+    }
 
     return true;
+}
+
+// ---- TargetConnectLoop -----------------------------------------
+// Independent thread: continuously connects to target, retries on disconnect.
+
+void RelayNetwork::TargetConnectLoop(std::string host, int port, int timeoutSec)
+{
+    while (!m_stopRequested) {
+        // Notify UI that we're attempting to connect
+        PostMessage(m_notifyWnd, WM_RELAY_TARGET_CONNECTING, 0, 0);
+
+        if (ConnectToTarget(host, port, timeoutSec)) {
+            // ConnectToTarget set m_targetConnected=true and posted WM_RELAY_TARGET_CONN
+            TargetRecvLoop(); // blocks; TargetRecvLoop posts WM_RELAY_TARGET_DISCONN on exit
+
+            // Cleanup dead target socket
+            if (m_targetSock != INVALID_SOCKET) {
+                shutdown(m_targetSock, SD_BOTH);
+                closesocket(m_targetSock);
+                m_targetSock = INVALID_SOCKET;
+            }
+        }
+
+        if (m_stopRequested) break;
+
+        // Wait 2 seconds before retrying (interruptible)
+        for (int i = 0; i < 10 && !m_stopRequested; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+
+    if (m_targetSock != INVALID_SOCKET) {
+        shutdown(m_targetSock, SD_BOTH);
+        closesocket(m_targetSock);
+        m_targetSock = INVALID_SOCKET;
+    }
+    m_targetConnected = false;
+}
+
+// ---- AcceptClientLoop ------------------------------------------
+// Independent thread: listens for clients, one at a time.
+
+void RelayNetwork::AcceptClientLoop(int listenPort, int timeoutSec)
+{
+    SOCKET listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listenSock == INVALID_SOCKET) {
+        PostError(WSAGetLastError(), L"socket() failed");
+        m_stopRequested = true;
+        PostMessage(m_notifyWnd, WM_RELAY_STOPPED, 0, 0);
+        return;
+    }
+    BOOL reuse = TRUE;
+    setsockopt(listenSock, SOL_SOCKET, SO_REUSEADDR, (char*)&reuse, sizeof(reuse));
+    BOOL nodelay = TRUE;
+    setsockopt(listenSock, IPPROTO_TCP, TCP_NODELAY, (char*)&nodelay, sizeof(nodelay));
+
+    sockaddr_in addr = {};
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons((u_short)listenPort);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(listenSock, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+        PostError(WSAGetLastError(), L"bind() failed on port " + std::to_wstring(listenPort));
+        closesocket(listenSock);
+        m_stopRequested = true;
+        PostMessage(m_notifyWnd, WM_RELAY_STOPPED, 0, 0);
+        return;
+    }
+    if (listen(listenSock, SOMAXCONN) == SOCKET_ERROR) {
+        PostError(WSAGetLastError(), L"listen() failed");
+        closesocket(listenSock);
+        m_stopRequested = true;
+        PostMessage(m_notifyWnd, WM_RELAY_STOPPED, 0, 0);
+        return;
+    }
+
+    m_listenSock = listenSock;
+    m_listening  = true;
+    PostMessage(m_notifyWnd, WM_RELAY_LISTENING, (WPARAM)listenPort, 0);
+
+    while (!m_stopRequested) {
+        fd_set rfds;
+        FD_ZERO(&rfds); FD_SET(listenSock, &rfds);
+        timeval tv { 0, 200000 };
+        int r = select(0, &rfds, nullptr, nullptr, &tv);
+        if (r < 0) break;
+        if (r == 0) continue;
+
+        sockaddr_in clientAddr = {}; int clen = sizeof(clientAddr);
+        SOCKET clientSock = accept(listenSock, (sockaddr*)&clientAddr, &clen);
+        if (clientSock == INVALID_SOCKET) {
+            if (m_stopRequested) break;
+            continue;
+        }
+
+        BOOL nd = TRUE;
+        setsockopt(clientSock, IPPROTO_TCP, TCP_NODELAY, (char*)&nd, sizeof(nd));
+        if (timeoutSec > 0) {
+            DWORD tvMs = (DWORD)(timeoutSec * 1000);
+            setsockopt(clientSock, SOL_SOCKET, SO_RCVTIMEO, (char*)&tvMs, sizeof(tvMs));
+            setsockopt(clientSock, SOL_SOCKET, SO_SNDTIMEO, (char*)&tvMs, sizeof(tvMs));
+        }
+
+        m_clientSock      = clientSock;
+        m_clientConnected = true;
+        PostMessage(m_notifyWnd, WM_RELAY_CLIENT_CONN, 0,
+                    (LPARAM)new std::wstring(GetPeerAddrStr(clientSock)));
+
+        ClientRecvLoop(); // blocks until client disconnects
+
+        m_clientConnected = false;
+        if (m_clientSock != INVALID_SOCKET) {
+            closesocket(m_clientSock);
+            m_clientSock = INVALID_SOCKET;
+        }
+        if (!m_stopRequested)
+            PostMessage(m_notifyWnd, WM_RELAY_CLIENT_DISCONN, 0, 0);
+    }
+
+    m_listening  = false;
+    m_listenSock = INVALID_SOCKET;
+    closesocket(listenSock);
+
+    // Signal TargetConnectLoop to exit too
+    if (!m_stopRequested) {
+        m_stopRequested = true;
+        PostMessage(m_notifyWnd, WM_RELAY_STOPPED, 0, 0);
+    }
 }
 
 // ---- StopRelay -------------------------------------------------
@@ -128,6 +266,7 @@ bool RelayNetwork::ConnectToTarget(const std::string& host, int port, int timeou
     freeaddrinfo(res);
 
     // Non-blocking connect with timeout
+    // timeoutSec==0 means "no-timeout mode": 3s per attempt, no error posted on failure
     u_long mode = 1;
     ioctlsocket(s, FIONBIO, &mode);
 
@@ -136,12 +275,15 @@ bool RelayNetwork::ConnectToTarget(const std::string& host, int port, int timeou
     fd_set wfds, efds;
     FD_ZERO(&wfds); FD_SET(s, &wfds);
     FD_ZERO(&efds); FD_SET(s, &efds);
-    timeval timeout { timeoutSec, 0 };
+    int effectiveSec = (timeoutSec == 0) ? 3 : timeoutSec;
+    timeval timeout { effectiveSec, 0 };
     int r = select(0, nullptr, &wfds, &efds, &timeout);
 
     if (r <= 0 || FD_ISSET(s, &efds)) {
-        PostError(r == 0 ? WSAETIMEDOUT : WSAGetLastError(),
-                  r == 0 ? L"Target connection timed out" : L"Target connection failed");
+        if (timeoutSec > 0) {
+            PostError(r == 0 ? WSAETIMEDOUT : WSAGetLastError(),
+                      r == 0 ? L"Target connection timed out" : L"Target connection failed");
+        }
         closesocket(s);
         return false;
     }
@@ -304,8 +446,18 @@ void RelayNetwork::AcceptLoop(int listenPort, std::string targetHost, int target
             PostMessage(m_notifyWnd, WM_RELAY_CLIENT_CONN, 0,
                         (LPARAM)new std::wstring(GetPeerAddrStr(clientSock)));
 
-            // Connect to target
-            if (!ConnectToTarget(targetHost, targetPort, timeoutSec)) {
+            // Connect to target - with indefinite retry in no-timeout mode (timeoutSec==0)
+            bool targetOk = ConnectToTarget(targetHost, targetPort, timeoutSec);
+            if (!targetOk && timeoutSec == 0 && !m_stopRequested) {
+                PostMessage(m_notifyWnd, WM_RELAY_ERROR, 0,
+                            (LPARAM)new std::wstring(L"Target not available, waiting (no-timeout mode)..."));
+                while (!m_stopRequested && !targetOk) {
+                    std::this_thread::sleep_for(std::chrono::seconds(2));
+                    if (m_stopRequested) break;
+                    targetOk = ConnectToTarget(targetHost, targetPort, 0);
+                }
+            }
+            if (!targetOk) {
                 closesocket(clientSock);
                 m_clientSock      = INVALID_SOCKET;
                 m_clientConnected = false;

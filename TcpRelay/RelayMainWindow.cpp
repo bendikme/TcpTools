@@ -34,7 +34,7 @@ HWND RelayMainWindow::Create(HINSTANCE hInst, int nCmdShow)
     s_instance = self;
 
     HWND hWnd = CreateWindowExW(
-        0, WndClassName, L"TCP/UDP Relay",
+        0, WndClassName, L"TCP/UDP Relay v26.3.1",
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT, 1200, 800,
         nullptr, nullptr, hInst, self);
@@ -113,8 +113,8 @@ LRESULT RelayMainWindow::HandleMessage(HWND hWnd, UINT msg, WPARAM wParam, LPARA
     case WM_KEYDOWN:
         if (wParam == VK_F1) {
             MessageBoxW(hWnd,
-                L"TCP/UDP Relay v1.0\n\nCopyright \u00A9 2026 Bendik Eide.\nAll rights reserved.",
-                L"About TCP/UDP Relay", MB_OK | MB_ICONINFORMATION);
+                L"TCP/UDP Relay v26.3.1\n\nCopyright \u00A9 2026 Bendik Eide.\nAll rights reserved.",
+                L"About TCP/UDP Relay v26.3.1", MB_OK | MB_ICONINFORMATION);
             return 0;
         }
         break;
@@ -176,9 +176,14 @@ LRESULT RelayMainWindow::HandleMessage(HWND hWnd, UINT msg, WPARAM wParam, LPARA
         OnRelayStopped();
         return 0;
 
+    case WM_RELAY_TARGET_CONNECTING:
+        OnRelayTargetConnecting();
+        return 0;
+
     case WM_DESTROY:
         if (m_network) m_network->StopRelay();
         if (m_hImgListLog) ImageList_Destroy(m_hImgListLog);
+        if (m_hTooltip) { DestroyWindow(m_hTooltip); m_hTooltip = nullptr; }
         if (m_hFontMono) { DeleteObject(m_hFontMono); m_hFontMono = nullptr; }
         PostQuitMessage(0);
         return 0;
@@ -215,8 +220,9 @@ void RelayMainWindow::OnCreate(HWND hWnd)
     SendMessageW(m_hComboProtocol, CB_SETCURSEL, 0, 0);
 
     MakeLabel(hWnd, hI, L"Timeout:", 535, y0 + 2, 52, 18);
-    m_hEditTimeout = MakeEdit(hWnd, hI, IDC_EDIT_TIMEOUT, 588, y0, 35, 22, L"5");
+    m_hEditTimeout  = MakeEdit(hWnd, hI, IDC_EDIT_TIMEOUT, 588, y0, 35, 22, L"5");
     MakeLabel(hWnd, hI, L"s", 626, y0 + 2, 10, 18);
+    m_hChkNoTimeout = MakeCheckbox(hWnd, hI, IDC_CHK_NO_TIMEOUT, 640, y0 + 2, 90, 18, L"No timeout", false);
 
     // ---- Row 1: Start/Stop + Status + Connection indicators ----
     int y1 = y0 + 28;
@@ -254,8 +260,13 @@ void RelayMainWindow::OnCreate(HWND hWnd)
     EnableWindow(m_hBtnFwdC2T, FALSE);
     EnableWindow(m_hBtnDropC2T, FALSE);
 
-    // C2T HexView
+    // C2T HexView (hidden by default) + text view (shown by default) + hex toggle
     m_hHexC2T = HexView::Create(hWnd, 0, 0, 10, 10, IDC_STATIC_HEX_C2T, hI);
+    ShowWindow(m_hHexC2T, SW_HIDE);  // text view is default
+    m_hEditTextC2T = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
+        0, 0, 10, 10, hWnd, (HMENU)IDC_EDIT_TEXT_C2T, hI, nullptr);
+    m_hChkHexC2T = MakeCheckbox(hWnd, hI, IDC_CHK_HEX_C2T, 0, 0, 80, 20, L"Hex View", false);
 
     // T2C panel
     m_hGrpT2C = CreateWindowExW(0, L"BUTTON", L"Target \u2192 Client",
@@ -271,8 +282,13 @@ void RelayMainWindow::OnCreate(HWND hWnd)
     EnableWindow(m_hBtnFwdT2C, FALSE);
     EnableWindow(m_hBtnDropT2C, FALSE);
 
-    // T2C HexView
+    // T2C HexView (hidden by default) + text view (shown by default) + hex toggle
     m_hHexT2C = HexView::Create(hWnd, 0, 0, 10, 10, IDC_STATIC_HEX_T2C, hI);
+    ShowWindow(m_hHexT2C, SW_HIDE);  // text view is default
+    m_hEditTextT2C = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
+        0, 0, 10, 10, hWnd, (HMENU)IDC_EDIT_TEXT_T2C, hI, nullptr);
+    m_hChkHexT2C = MakeCheckbox(hWnd, hI, IDC_CHK_HEX_T2C, 0, 0, 80, 20, L"Hex View", false);
 
     // ---- Bottom: Tab Control ----
     m_hTab = CreateWindowExW(0, WC_TABCONTROLW, nullptr,
@@ -289,7 +305,6 @@ void RelayMainWindow::OnCreate(HWND hWnd)
     TabCtrl_InsertItem(m_hTab, 2, &ti);
 
     // Log filter controls (inside tab content area)
-    m_hStaticFilterLbl = MakeLabel(hWnd, hI, L"Filter:", 0, 0, 38, 20);
     m_hComboFilter = CreateWindowExW(0, L"COMBOBOX", nullptr,
         WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
         0, 0, 100, 200, hWnd, (HMENU)IDC_COMBO_LOGFILTER, hI, nullptr);
@@ -299,8 +314,11 @@ void RelayMainWindow::OnCreate(HWND hWnd)
     m_hBtnClearLog = MakeButton(hWnd, hI, IDC_BTN_CLEARLOG, 0, 0, 70, 22, L"Clear Log");
 
     // Log ListView (virtual mode)
+    // NOTE: No WS_CLIPSIBLINGS — the list sits inside the tab control's rect.
+    // With WS_CLIPSIBLINGS the tab (a sibling) would be clipped from the list's
+    // paint region, making the entire update region empty and the list invisible.
     m_hListLog = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, nullptr,
-        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS |
+        WS_CHILD | WS_VISIBLE |
         LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_OWNERDATA | LVS_NOSORTHEADER,
         0, 0, 10, 10, hWnd, (HMENU)IDC_LIST_LOG, hI, nullptr);
 
@@ -396,12 +414,16 @@ void RelayMainWindow::OnCreate(HWND hWnd)
         SendMessageW(h, WM_SETFONT, (WPARAM)lp, TRUE);
         return TRUE;
     }, (LPARAM)hFont);
-    // Re-apply monospace font to diagnostics
+    // Re-apply monospace font to diagnostics and text views
     SendMessageW(m_hStaticDiagInfo, WM_SETFONT, (WPARAM)m_hFontMono, TRUE);
+    SendMessageW(m_hEditTextC2T,    WM_SETFONT, (WPARAM)m_hFontMono, TRUE);
+    SendMessageW(m_hEditTextT2C,    WM_SETFONT, (WPARAM)m_hFontMono, TRUE);
 
     // Initial layout from WM_CREATE
     RECT rc; GetClientRect(hWnd, &rc);
     OnSize(hWnd, rc.right, rc.bottom);
+    SwitchBottomTab(0); // ensure log tab is visible by default
+    CreateTooltips();
 }
 
 // ---- OnSize ----------------------------------------------------
@@ -410,49 +432,59 @@ void RelayMainWindow::OnSize(HWND hWnd, int cx, int cy)
 {
     if (cx < 200 || cy < 200) return;
 
-    const int M = 8;           // margin
+    const int M = 8;
     const int ROW_H = 22;
     const int y0 = 10;
     const int y1 = y0 + 28;   // Start/Stop row
     const int yMid = y1 + 32; // panels start
 
-    // --- Two hex panels share the middle area ---
-    int botReserve = 260;      // minimum for tab panel
-    int midH = cy - yMid - botReserve;
-    if (midH < 160) midH = 160;
-    int panelW = (cx - 3 * M) / 2;
-    int hexH = midH - 50;
-    if (hexH < 60) hexH = 60;
+    // Middle panels split the available height 60/40 with the tab panel
+    int availH = cy - yMid - M;
+    // Middle gets at least 160px, tab gets at least 200px
+    int midH = std::max(160, availH * 6 / 10);
+    if (availH - midH - M < 200) midH = std::max(160, availH - 200 - M);
+    int hexH = midH - 46;
+    if (hexH < 40) hexH = 40;
 
+    int panelW = (cx - 3 * M) / 2;
+    if (panelW < 80) panelW = 80;
     int c2tX = M;
     int t2cX = M + panelW + M;
 
-    // Count control slots for DeferWindowPos (generous estimate)
-    HDWP dwp = BeginDeferWindowPos(35);
+    HDWP dwp = BeginDeferWindowPos(45);
     auto Move = [&](HWND h, int x, int y, int w, int hh) {
         if (h && dwp) dwp = DeferWindowPos(dwp, h, nullptr, x, y, w, hh,
             SWP_NOZORDER | SWP_NOACTIVATE);
     };
 
-    // Connection indicators in row 1 (after status label)
-    Move(m_hStaticClientInd, 560, y1 + 4, std::max(0, (cx - 560) / 2 - 20), 18);
-    Move(m_hStaticTargetInd, 560 + std::max(0, (cx - 560) / 2), y1 + 4, std::max(0, (cx - 560) / 2 - 20), 18);
+    // Connection indicators in row 1 (responsive, after status label)
+    int indW = std::max(10, (cx - 560) / 2 - 10);
+    Move(m_hStaticClientInd, 560,           y1 + 4, indW, 18);
+    Move(m_hStaticTargetInd, 560 + indW + 10, y1 + 4, indW, 18);
 
-    // C2T panel
-    Move(m_hGrpC2T,       c2tX, yMid, panelW, midH);
-    Move(m_hChkAutoC2T,   c2tX + 10,  yMid + 18, 110, 20);
-    Move(m_hBtnFwdC2T,    c2tX + 120, yMid + 18, 60, ROW_H);
-    Move(m_hBtnDropC2T,   c2tX + 185, yMid + 18, 50, ROW_H);
-    Move(m_hStaticBufC2T, c2tX + 245, yMid + 21, panelW - 260, 16);
-    Move(m_hHexC2T,       c2tX + 5,   yMid + 44, panelW - 10, hexH);
+    // --- C2T panel ---
+    Move(m_hGrpC2T,       c2tX,          yMid,      panelW, midH);
+    // Toolbar row: AutoFwd | Forward | Drop | [Hex View chk right-aligned]
+    Move(m_hChkAutoC2T,   c2tX + 10,     yMid + 18, 110, 20);
+    Move(m_hBtnFwdC2T,    c2tX + 125,    yMid + 17, 60,  ROW_H);
+    Move(m_hBtnDropC2T,   c2tX + 190,    yMid + 17, 50,  ROW_H);
+    int hexChkX_c2t = c2tX + panelW - 90;
+    Move(m_hChkHexC2T,    hexChkX_c2t,   yMid + 17, 82,  ROW_H);
+    Move(m_hStaticBufC2T, c2tX + 248,    yMid + 20, hexChkX_c2t - c2tX - 258, 16);
+    // Data area: text or hex view (same rect, toggled)
+    Move(m_hHexC2T,       c2tX + 5,      yMid + 44, panelW - 10, hexH);
+    Move(m_hEditTextC2T,  c2tX + 5,      yMid + 44, panelW - 10, hexH);
 
-    // T2C panel
-    Move(m_hGrpT2C,       t2cX, yMid, panelW, midH);
-    Move(m_hChkAutoT2C,   t2cX + 10,  yMid + 18, 110, 20);
-    Move(m_hBtnFwdT2C,    t2cX + 120, yMid + 18, 60, ROW_H);
-    Move(m_hBtnDropT2C,   t2cX + 185, yMid + 18, 50, ROW_H);
-    Move(m_hStaticBufT2C, t2cX + 245, yMid + 21, panelW - 260, 16);
-    Move(m_hHexT2C,       t2cX + 5,   yMid + 44, panelW - 10, hexH);
+    // --- T2C panel ---
+    Move(m_hGrpT2C,       t2cX,          yMid,      panelW, midH);
+    Move(m_hChkAutoT2C,   t2cX + 10,     yMid + 18, 110, 20);
+    Move(m_hBtnFwdT2C,    t2cX + 125,    yMid + 17, 60,  ROW_H);
+    Move(m_hBtnDropT2C,   t2cX + 190,    yMid + 17, 50,  ROW_H);
+    int hexChkX_t2c = t2cX + panelW - 90;
+    Move(m_hChkHexT2C,    hexChkX_t2c,   yMid + 17, 82,  ROW_H);
+    Move(m_hStaticBufT2C, t2cX + 248,    yMid + 20, hexChkX_t2c - t2cX - 258, 16);
+    Move(m_hHexT2C,       t2cX + 5,      yMid + 44, panelW - 10, hexH);
+    Move(m_hEditTextT2C,  t2cX + 5,      yMid + 44, panelW - 10, hexH);
 
     // --- Bottom tab area ---
     int yBot = yMid + midH + M;
@@ -468,14 +500,13 @@ void RelayMainWindow::OnSize(HWND hWnd, int cx, int cy)
     int tw = tabRc.right - tabRc.left;
     int th = tabRc.bottom - tabRc.top;
 
-    // Filter row (inside tab content, top)
-    Move(m_hStaticFilterLbl, tx + 4, ty + 4, 38, 18);
-    Move(m_hComboFilter,     tx + 44, ty + 2, 110, 200);
-    Move(m_hBtnClearLog,     tx + 160, ty + 2, 74, ROW_H);
+    // Filter row (inside tab content, top) - no separate label, matches other apps
+    Move(m_hComboFilter,  tx + 2,   ty + 2, 120, 200);
+    Move(m_hBtnClearLog,  tx + 126, ty + 2, 74,  ROW_H);
 
     // Log ListView (below filter row)
-    int listY = ty + ROW_H + 8;
-    int listH = th - ROW_H - 10;
+    int listY = ty + ROW_H + 6;
+    int listH = th - ROW_H - 8;
     if (listH < 40) listH = 40;
     Move(m_hListLog, tx + 2, listY, tw - 4, listH);
 
@@ -486,13 +517,18 @@ void RelayMainWindow::OnSize(HWND hWnd, int cx, int cy)
     Move(m_hStatT2CPkts,   tx + 10, ty + 70,  tw - 20, 18);
     Move(m_hStatClients,   tx + 10, ty + 100, tw - 20, 18);
     Move(m_hStatTarget,    tx + 10, ty + 120, tw - 20, 18);
-    Move(m_hBtnClearStats, tx + 10, ty + 150, 90, ROW_H);
+    Move(m_hBtnClearStats, tx + 10, ty + 150, 90,      ROW_H);
 
     // Diagnostics (same content area, shown when tab == 1)
-    Move(m_hStaticDiagInfo, tx + 10, ty + 10, tw - 20, th - 50);
-    Move(m_hBtnRefreshDiag, tx + 10, ty + th - 34, 90, ROW_H);
+    Move(m_hStaticDiagInfo, tx + 10, ty + 10,       tw - 20, th - 50);
+    Move(m_hBtnRefreshDiag, tx + 10, ty + th - 34,  90,      ROW_H);
 
     if (dwp) EndDeferWindowPos(dwp);
+    RedrawWindow(hWnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+    // Re-apply tab visibility so that controls get a fresh SW_SHOW/SW_HIDE after
+    // every resize.  Without this, the tab's WS_CLIPSIBLINGS paint can race
+    // against the repositioned list and leave a stale clip region.
+    SwitchBottomTab(m_bottomTab);
 }
 
 // ---- OnCommand -------------------------------------------------
@@ -508,6 +544,20 @@ void RelayMainWindow::OnCommand(HWND hWnd, int id, int code, HWND hCtl)
     case IDC_BTN_FWD_T2C:    DoForwardT2C(); break;
     case IDC_BTN_DROP_T2C:   DoDropT2C();    break;
     case IDC_BTN_CLEARLOG:   ClearLog();     break;
+
+    case IDC_CHK_NO_TIMEOUT:
+        EnableWindow(m_hEditTimeout,
+            SendMessageW(m_hChkNoTimeout, BM_GETCHECK, 0, 0) == BST_UNCHECKED);
+        break;
+
+    case IDC_CHK_HEX_C2T:
+        m_hexModeC2T = (SendMessageW(m_hChkHexC2T, BM_GETCHECK, 0, 0) == BST_CHECKED);
+        RefreshC2TView();
+        break;
+    case IDC_CHK_HEX_T2C:
+        m_hexModeT2C = (SendMessageW(m_hChkHexT2C, BM_GETCHECK, 0, 0) == BST_CHECKED);
+        RefreshT2CView();
+        break;
     case IDC_BTN_CLEARSTATS:
         m_bytesC2T = m_bytesT2C = m_packetsC2T = m_packetsT2C = 0;
         UpdateStats();
@@ -701,7 +751,8 @@ void RelayMainWindow::DoStartRelay()
     int listenPort = Utils::GetDlgInt(m_hWnd, IDC_EDIT_LISTEN_PORT, 9001);
     std::string targetIP = Utils::ToUTF8(Utils::GetWindowText(m_hEditTargetIP));
     int targetPort = Utils::GetDlgInt(m_hWnd, IDC_EDIT_TARGET_PORT, 9002);
-    int timeout    = Utils::GetDlgInt(m_hWnd, IDC_EDIT_TIMEOUT, 5);
+    bool noTimeout = (SendMessageW(m_hChkNoTimeout, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    int timeout    = noTimeout ? 0 : Utils::GetDlgInt(m_hWnd, IDC_EDIT_TIMEOUT, 5);
     bool udpMode   = (SendMessageW(m_hComboProtocol, CB_GETCURSEL, 0, 0) == 1);
 
     if (targetIP.empty()) {
@@ -790,6 +841,7 @@ void RelayMainWindow::DoDropC2T()
     m_bufC2TPackets = 0;
     UpdateBufferLabel(true);
     HexView::ClearData(m_hHexC2T);
+    SetWindowTextW(m_hEditTextC2T, L"");
     AddLogEntry(LogType::Info, L"C\u2192T", sz, L"Dropped buffered data", false);
 }
 
@@ -801,7 +853,60 @@ void RelayMainWindow::DoDropT2C()
     m_bufT2CPackets = 0;
     UpdateBufferLabel(false);
     HexView::ClearData(m_hHexT2C);
+    SetWindowTextW(m_hEditTextT2C, L"");
     AddLogEntry(LogType::Info, L"T\u2192C", sz, L"Dropped buffered data", false);
+}
+
+// ---- View-mode refresh helpers --------------------------------
+
+void RelayMainWindow::RefreshC2TView()
+{
+    if (m_hexModeC2T) {
+        ShowWindow(m_hEditTextC2T, SW_HIDE);
+        ShowWindow(m_hHexC2T,      SW_SHOW);
+        HexView::SetData(m_hHexC2T, m_bufferC2T);
+    } else {
+        ShowWindow(m_hHexC2T,      SW_HIDE);
+        ShowWindow(m_hEditTextC2T, SW_SHOW);
+    }
+}
+
+void RelayMainWindow::RefreshT2CView()
+{
+    if (m_hexModeT2C) {
+        ShowWindow(m_hEditTextT2C, SW_HIDE);
+        ShowWindow(m_hHexT2C,      SW_SHOW);
+        HexView::SetData(m_hHexT2C, m_bufferT2C);
+    } else {
+        ShowWindow(m_hHexT2C,      SW_HIDE);
+        ShowWindow(m_hEditTextT2C, SW_SHOW);
+    }
+}
+
+// Helper: append a packet as text to a read-only multiline edit
+static void AppendPacketText(HWND hEdit, const BYTE* data, int len)
+{
+    // Prevent unbounded growth
+    if (GetWindowTextLengthW(hEdit) > 80000)
+        SetWindowTextW(hEdit, L"[Output cleared - exceeded display limit]\r\n");
+
+    std::wstring s;
+    s.reserve(len + 32);
+    wchar_t hdr[48];
+    swprintf_s(hdr, L"[%d bytes] ", len);
+    s += hdr;
+    for (int i = 0; i < len; i++) {
+        BYTE b = data[i];
+        if      (b == '\r') continue;
+        else if (b == '\n') s += L"\r\n";
+        else if (b == '\t') s += L'\t';
+        else if (b >= 0x20 && b < 0x7F) s += (wchar_t)b;
+        else s += L'.';
+    }
+    s += L"\r\n";
+    int textLen = GetWindowTextLengthW(hEdit);
+    SendMessageW(hEdit, EM_SETSEL, textLen, textLen);
+    SendMessageW(hEdit, EM_REPLACESEL, FALSE, (LPARAM)s.c_str());
 }
 
 void RelayMainWindow::SetRelayUI(bool listening)
@@ -815,7 +920,14 @@ void RelayMainWindow::SetRelayUI(bool listening)
     EnableWindow(m_hEditTargetIP,   !listening);
     EnableWindow(m_hEditTargetPort, !listening);
     EnableWindow(m_hComboProtocol,  !listening);
-    EnableWindow(m_hEditTimeout,    !listening);
+    EnableWindow(m_hChkNoTimeout,   !listening);
+    // Only enable timeout edit if not listening AND not in no-timeout mode
+    if (!listening) {
+        bool noTimeout = (SendMessageW(m_hChkNoTimeout, BM_GETCHECK, 0, 0) == BST_CHECKED);
+        EnableWindow(m_hEditTimeout, !noTimeout);
+    } else {
+        EnableWindow(m_hEditTimeout, FALSE);
+    }
 
     if (!listening) {
         Utils::SetWindowText(m_hStaticStatus, L"Idle");
@@ -865,6 +977,12 @@ void RelayMainWindow::SwitchBottomTab(int tab)
     ShowWindow(m_hListLog,     showLog ? SW_SHOW : SW_HIDE);
     ShowWindow(m_hComboFilter, showLog ? SW_SHOW : SW_HIDE);
     ShowWindow(m_hBtnClearLog, showLog ? SW_SHOW : SW_HIDE);
+    if (showLog) {
+        // Ensure the list stays on top of its sibling tab control, and force a
+        // full repaint so the content area isn't left blank after a resize.
+        SetWindowPos(m_hListLog, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        InvalidateRect(m_hListLog, nullptr, TRUE);
+    }
 
     // Diagnostics controls
     ShowWindow(m_hStaticDiagInfo,  showDiag ? SW_SHOW : SW_HIDE);
@@ -1006,21 +1124,27 @@ void RelayMainWindow::OnRelayListening(int port)
     std::wstring proto = m_network ? m_network->GetProtocolStr() : L"TCP";
     Utils::SetWindowText(m_hStaticStatus,
         L"[" + proto + L"] Listening on port " + std::to_wstring(port) + L" ...");
+    Utils::SetWindowText(m_hStaticTargetInd, L"\u25CC Target: connecting...");
     AddLogEntry(LogType::Listening, L"-", 0,
                 L"[" + proto + L"] Listening on port " + std::to_wstring(port), false);
     if (m_bottomTab == 1) RefreshDiagnostics();
+    UpdateTitle();
 }
 
 void RelayMainWindow::OnRelayClientConn(const std::wstring& addr)
 {
     m_clientAddr = addr;
     std::wstring proto = m_network ? m_network->GetProtocolStr() : L"TCP";
+    bool targetOk = m_network && m_network->IsTargetConnected();
+    std::wstring tgt = Utils::GetWindowText(m_hEditTargetIP) + L":" + Utils::GetWindowText(m_hEditTargetPort);
     Utils::SetWindowText(m_hStaticStatus,
-        L"[" + proto + L"] Client: " + addr + L" | Target: connecting...");
+        targetOk ? L"[" + proto + L"] Relaying: " + addr + L" \u2194 " + tgt
+                 : L"[" + proto + L"] Client: " + addr + L" | Target: connecting...");
     Utils::SetWindowText(m_hStaticClientInd, L"\u25CF Client: " + addr);
     AddLogEntry(LogType::ClientConn, L"-", 0,
                 L"[" + proto + L"] Client connected: " + addr, false);
     if (m_bottomTab == 1) RefreshDiagnostics();
+    UpdateTitle();
 }
 
 void RelayMainWindow::OnRelayClientDisconn()
@@ -1028,36 +1152,90 @@ void RelayMainWindow::OnRelayClientDisconn()
     std::wstring proto = m_network ? m_network->GetProtocolStr() : L"TCP";
     std::wstring prevAddr = m_clientAddr;
     m_clientAddr.clear();
+    bool targetOk = m_network && m_network->IsTargetConnected();
     Utils::SetWindowText(m_hStaticStatus,
-        m_isListening ? L"[" + proto + L"] Listening (client disconnected)..." : L"Idle");
+        m_isListening ? (targetOk ? L"[" + proto + L"] Target connected, awaiting client..."
+                                  : L"[" + proto + L"] Listening (client disconnected)...")
+                      : L"Idle");
     Utils::SetWindowText(m_hStaticClientInd, L"\u25CB Client: disconnected");
     AddLogEntry(LogType::ClientDisconn, L"-", 0,
                 L"[" + proto + L"] Client disconnected" + (prevAddr.empty() ? L"" : L": " + prevAddr),
                 false);
     if (m_bottomTab == 1) RefreshDiagnostics();
+    UpdateTitle();
 }
 
 void RelayMainWindow::OnRelayTargetConn()
 {
     std::wstring proto = m_network ? m_network->GetProtocolStr() : L"TCP";
     std::wstring tgt = Utils::GetWindowText(m_hEditTargetIP) + L":" + Utils::GetWindowText(m_hEditTargetPort);
-    Utils::SetWindowText(m_hStaticStatus,
-        L"[" + proto + L"] Relaying: " + m_clientAddr + L" \u2194 " + tgt);
+    m_targetAddr = tgt;
     Utils::SetWindowText(m_hStaticTargetInd, L"\u25CF Target: " + tgt);
+    if (m_clientAddr.empty())
+        Utils::SetWindowText(m_hStaticStatus,
+            L"[" + proto + L"] Target connected, awaiting client...");
+    else
+        Utils::SetWindowText(m_hStaticStatus,
+            L"[" + proto + L"] Relaying: " + m_clientAddr + L" \u2194 " + tgt);
     AddLogEntry(LogType::TargetConn, L"-", 0,
                 L"[" + proto + L"] Connected to target: " + tgt, false);
     if (m_bottomTab == 1) RefreshDiagnostics();
+    UpdateTitle();
 }
 
 void RelayMainWindow::OnRelayTargetDisconn()
 {
+    m_targetAddr.clear();
     std::wstring proto = m_network ? m_network->GetProtocolStr() : L"TCP";
     AddLogEntry(LogType::TargetDisconn, L"-", 0,
                 L"[" + proto + L"] Target disconnected", false);
-    Utils::SetWindowText(m_hStaticStatus,
-        m_isListening ? L"[" + proto + L"] Listening (target disconnected)..." : L"Idle");
-    Utils::SetWindowText(m_hStaticTargetInd, L"\u25CB Target: disconnected");
+    // Relay auto-reconnects to target in new architecture
+    Utils::SetWindowText(m_hStaticTargetInd, L"\u25CC Target: reconnecting...");
+    if (m_clientAddr.empty())
+        Utils::SetWindowText(m_hStaticStatus,
+            L"[" + proto + L"] Listening | Target: reconnecting...");
+    else
+        Utils::SetWindowText(m_hStaticStatus,
+            L"[" + proto + L"] Client: " + m_clientAddr + L" | Target: reconnecting...");
     if (m_bottomTab == 1) RefreshDiagnostics();
+    UpdateTitle();
+}
+
+void RelayMainWindow::OnRelayTargetConnecting()
+{
+    Utils::SetWindowText(m_hStaticTargetInd, L"\u25CC Target: connecting...");
+    std::wstring proto = m_network ? m_network->GetProtocolStr() : L"TCP";
+    if (m_clientAddr.empty())
+        Utils::SetWindowText(m_hStaticStatus,
+            L"[" + proto + L"] Listening | Target: connecting...");
+    else
+        Utils::SetWindowText(m_hStaticStatus,
+            L"[" + proto + L"] Client: " + m_clientAddr + L" | Target: connecting...");
+    UpdateTitle();
+}
+
+void RelayMainWindow::UpdateTitle()
+{
+    if (!m_isListening) {
+        SetWindowTextW(m_hWnd, L"TCP Relay v26.3.1");
+        return;
+    }
+    std::wstring lp  = Utils::GetWindowText(m_hEditListenPort);
+    std::wstring tip = Utils::GetWindowText(m_hEditTargetIP);
+    std::wstring tp  = Utils::GetWindowText(m_hEditTargetPort);
+    bool targetOk = m_network && m_network->IsTargetConnected();
+    bool clientOk = m_network && m_network->IsClientConnected();
+    std::wstring title = L"TCP Relay v26.3.1  \u2013  :";
+    title += lp + L" \u2192 " + tip + L":" + tp;
+    if (clientOk && targetOk)
+        title += L"  (Relaying)";
+    else if (targetOk)
+        title += L"  (Target connected)";
+    else if (clientOk)
+        title += L"  (Client connected)";
+    else
+        title += L"  (Listening)";
+    SetWindowTextW(m_hWnd, title.c_str());
 }
 
 void RelayMainWindow::OnRelayClientData(const BYTE* data, int len, bool forwarded)
@@ -1072,9 +1250,10 @@ void RelayMainWindow::OnRelayClientData(const BYTE* data, int len, bool forwarde
     }
     if (len > 32) preview += L"...";
 
-    // Update hex view with latest data
+    // Update hex view and text view with latest data
     std::vector<BYTE> chunk(data, data + len);
     HexView::SetData(m_hHexC2T, chunk);
+    AppendPacketText(m_hEditTextC2T, data, len);
 
     if (forwarded) {
         // Auto-forwarded - just log it
@@ -1103,8 +1282,10 @@ void RelayMainWindow::OnRelayTargetData(const BYTE* data, int len, bool forwarde
     }
     if (len > 32) preview += L"...";
 
+    // Update hex view and text view with latest data
     std::vector<BYTE> chunk(data, data + len);
     HexView::SetData(m_hHexT2C, chunk);
+    AppendPacketText(m_hEditTextT2C, data, len);
 
     if (forwarded) {
         m_bytesT2C += len;
@@ -1126,10 +1307,68 @@ void RelayMainWindow::OnRelayError(int err, const std::wstring& msg)
 
 void RelayMainWindow::OnRelayStopped()
 {
-    SetRelayUI(false);
+    SetRelayUI(false);   // sets m_isListening = false
     std::wstring proto = m_network ? m_network->GetProtocolStr() : L"TCP";
     AddLogEntry(LogType::Stopped, L"-", 0, L"[" + proto + L"] Relay stopped", false);
-    Utils::SetWindowText(m_hStaticClientInd, L"\u25CF Client: -");
-    Utils::SetWindowText(m_hStaticTargetInd, L"\u25CF Target: -");
+    Utils::SetWindowText(m_hStaticClientInd, L"\u25CB Client: -");
+    Utils::SetWindowText(m_hStaticTargetInd, L"\u25CB Target: -");
+    m_clientAddr.clear();
+    m_targetAddr.clear();
     m_network.reset();
+    UpdateTitle();       // shows "TCP Relay" (idle)
+}
+
+// ============================================================
+//  CreateTooltips
+// ============================================================
+
+void RelayMainWindow::CreateTooltips()
+{
+    m_hTooltip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+        WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+        m_hWnd, nullptr, m_hInst, nullptr);
+    if (!m_hTooltip) return;
+    SendMessageW(m_hTooltip, TTM_SETMAXTIPWIDTH, 0, 360);
+
+    auto tip = [&](HWND ctrl, const wchar_t* text) {
+        if (!ctrl) return;
+        TOOLINFOW ti = {};
+        ti.cbSize   = sizeof(TOOLINFOW);
+        ti.uFlags   = TTF_IDISHWND | TTF_SUBCLASS;
+        ti.hwnd     = m_hWnd;
+        ti.uId      = (UINT_PTR)ctrl;
+        ti.lpszText = (LPWSTR)text;
+        SendMessageW(m_hTooltip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+    };
+
+    // ---- Config row ----
+    tip(m_hEditListenPort, L"Port this relay listens on for incoming client connections.");
+    tip(m_hEditTargetIP,   L"IP address or hostname of the upstream server to forward traffic to.");
+    tip(m_hEditTargetPort, L"Port on the upstream server.");
+    tip(m_hComboProtocol,  L"Protocol:\n  TCP \u2014 reliable, ordered stream relay.\n  UDP \u2014 connectionless datagram relay.");
+    tip(m_hEditTimeout,    L"Connection timeout in seconds when connecting to the target server.");
+    tip(m_hChkNoTimeout,   L"Disable timeout \u2014 the relay waits indefinitely when connecting to the target.");
+    tip(m_hBtnStart,       L"Start the relay: begin listening for clients and forward to the target server.");
+    tip(m_hBtnStop,        L"Stop the relay and close all active connections.");
+
+    // ---- Client\u2192Target panel ----
+    tip(m_hChkAutoC2T,     L"Auto-forward C\u2192T \u2014 Client\u2192Target data is forwarded immediately without buffering.\n"
+                            L"Uncheck to manually inspect, forward, or drop each packet.");
+    tip(m_hBtnFwdC2T,      L"Manually forward the buffered Client\u2192Target data to the target server.");
+    tip(m_hBtnDropC2T,     L"Discard the buffered Client\u2192Target data. Nothing will be sent to the target.");
+    tip(m_hChkHexC2T,      L"Show Client\u2192Target data as hexadecimal bytes instead of plain text.");
+
+    // ---- Target\u2192Client panel ----
+    tip(m_hChkAutoT2C,     L"Auto-forward T\u2192C \u2014 Target\u2192Client data is forwarded immediately without buffering.\n"
+                            L"Uncheck to manually inspect, forward, or drop each packet.");
+    tip(m_hBtnFwdT2C,      L"Manually forward the buffered Target\u2192Client data to the client.");
+    tip(m_hBtnDropT2C,     L"Discard the buffered Target\u2192Client data. Nothing will be sent to the client.");
+    tip(m_hChkHexT2C,      L"Show Target\u2192Client data as hexadecimal bytes instead of plain text.");
+
+    // ---- Bottom panel ----
+    tip(m_hBtnClearLog,    L"Remove all entries from the relay log.");
+    tip(m_hComboFilter,    L"Filter the log:\n  All | Data only | Connection events | Errors");
+    tip(m_hBtnRefreshDiag, L"Refresh live socket diagnostics for the listen, client, and target sockets.");
+    tip(m_hBtnClearStats,  L"Reset all traffic byte and packet counters to zero.");
 }

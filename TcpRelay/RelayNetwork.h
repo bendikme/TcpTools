@@ -61,6 +61,8 @@ public:
 
 private:
     void AcceptLoop(int listenPort, std::string targetHost, int targetPort, int timeoutSec);
+    void AcceptClientLoop(int listenPort, int timeoutSec);
+    void TargetConnectLoop(std::string host, int port, int timeoutSec);
     bool ConnectToTarget(const std::string& host, int port, int timeoutSec);
     void ClientRecvLoop();
     void TargetRecvLoop();

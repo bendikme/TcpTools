@@ -17,6 +17,7 @@
 #define IDC_BTN_START           1006
 #define IDC_BTN_STOP            1007
 #define IDC_STATIC_STATUS       1008
+#define IDC_CHK_NO_TIMEOUT      1009  // "No timeout" checkbox
 
 // Client -> Target direction panel
 #define IDC_CHK_AUTO_C2T        1010
@@ -24,6 +25,8 @@
 #define IDC_BTN_DROP_C2T        1012
 #define IDC_STATIC_BUF_C2T     1013
 #define IDC_STATIC_HEX_C2T     1014  // HexView control
+#define IDC_CHK_HEX_C2T        1015  // "Hex View" toggle checkbox
+#define IDC_EDIT_TEXT_C2T      1016  // Text (normal) view
 
 // Target -> Client direction panel
 #define IDC_CHK_AUTO_T2C        1020
@@ -31,6 +34,8 @@
 #define IDC_BTN_DROP_T2C        1022
 #define IDC_STATIC_BUF_T2C     1023
 #define IDC_STATIC_HEX_T2C     1024  // HexView control
+#define IDC_CHK_HEX_T2C        1025  // "Hex View" toggle checkbox
+#define IDC_EDIT_TEXT_T2C      1026  // Text (normal) view
 
 // Log
 #define IDC_LIST_LOG            1050
@@ -79,3 +84,4 @@
 #define WM_RELAY_TARGET_DATA        (WM_APP + 7)
 #define WM_RELAY_ERROR              (WM_APP + 8)
 #define WM_RELAY_STOPPED            (WM_APP + 9)
+#define WM_RELAY_TARGET_CONNECTING  (WM_APP + 10)  // target is trying to reconnect

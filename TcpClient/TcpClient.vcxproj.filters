@@ -9,18 +9,43 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="pch.cpp"><Filter>Source Files</Filter></ClCompile>
-    <ClCompile Include="Network.cpp"><Filter>Source Files</Filter></ClCompile>
-    <ClCompile Include="HexView.cpp"><Filter>Source Files</Filter></ClCompile>
-    <ClCompile Include="MainWindow.cpp"><Filter>Source Files</Filter></ClCompile>
-    <ClCompile Include="main.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="pch.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Network.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="HexView.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="MainWindow.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="main.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="pch.h"><Filter>Header Files</Filter></ClInclude>
-    <ClInclude Include="resource.h"><Filter>Header Files</Filter></ClInclude>
-    <ClInclude Include="Utils.h"><Filter>Header Files</Filter></ClInclude>
-    <ClInclude Include="Network.h"><Filter>Header Files</Filter></ClInclude>
-    <ClInclude Include="HexView.h"><Filter>Header Files</Filter></ClInclude>
-    <ClInclude Include="MainWindow.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="pch.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="resource.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Utils.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Network.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="HexView.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="MainWindow.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="app.rc" />
   </ItemGroup>
 </Project>

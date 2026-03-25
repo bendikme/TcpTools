@@ -76,7 +76,7 @@ HWND MainWindow::Create(HINSTANCE hInst, int nCmdShow,
 
     HWND hWnd = CreateWindowExW(
         0, ClassName(),
-        L"TCP Client",
+        L"TCP Client v26.3.1",
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
         CW_USEDEFAULT, CW_USEDEFAULT, 1180, 820,
         nullptr, nullptr, hInst, p);
@@ -139,8 +139,8 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
     case WM_KEYDOWN:
         if (wParam == VK_F1) {
             MessageBoxW(hWnd,
-                L"TCP Client v1.0\n\nCopyright \u00A9 2026 Bendik Eide.\nAll rights reserved.",
-                L"About TCP Client", MB_OK | MB_ICONINFORMATION);
+                L"TCP Client v26.3.1\n\nCopyright \u00A9 2026 Bendik Eide.\nAll rights reserved.",
+                L"About TCP Client v26.3.1", MB_OK | MB_ICONINFORMATION);
             return 0;
         }
         break;
@@ -277,7 +277,7 @@ void MainWindow::OnCreate(HWND hWnd, HINSTANCE hInst,
     m_hBtnDisconnect = MakeButton(IDC_BTN_DISCONNECT, L"Disconnect", 0,0,10,10);
     m_hChkKeepAlive  = MakeCheck(IDC_CHK_KEEPALIVE, L"Keep Alive",  0,0,10,10);
     m_hChkAutoDisc   = MakeCheck(IDC_CHK_AUTODISCONNECT, L"Auto-Disconnect After Send", 0,0,10,10);
-    m_hChkAutoConnect = MakeCheck(0, L"Auto-Connect Before Send", 0,0,10,10);
+    m_hChkAutoConnect = MakeCheck(IDC_CHK_AUTOCONNECT, L"Auto-Connect Before Send", 0,0,10,10);
     m_hStaticStatus  = MakeLabel(L"\u25CF Disconnected", 0,0,10,10);
 
     // Apply defaults from CLI args
@@ -330,6 +330,7 @@ void MainWindow::OnCreate(HWND hWnd, HINSTANCE hInst,
         0,0,10,10, hWnd, (HMENU)(UINT_PTR)IDC_EDIT_SEND, hInst, nullptr);
     SendMessage(m_hEditSend, WM_SETFONT, (WPARAM)m_hFontMono, TRUE);
     SetWindowSubclass(m_hEditSend, SendEditSubclassProc, 1, 0);
+    SendMessage(m_hEditSend, EM_SETLIMITTEXT, 0, 0); // no character limit
 
     m_hHexSend = HexView::Create(hWnd, 0,0,10,10, IDC_STATIC_HEXVIEW, hInst);
     ShowWindow(m_hHexSend, SW_HIDE);
@@ -347,6 +348,7 @@ void MainWindow::OnCreate(HWND hWnd, HINSTANCE hInst,
         ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
         0,0,10,10, hWnd, (HMENU)(UINT_PTR)IDC_EDIT_RECV, hInst, nullptr);
     SendMessage(m_hEditRecv, WM_SETFONT, (WPARAM)m_hFontMono, TRUE);
+    SendMessage(m_hEditRecv, EM_SETLIMITTEXT, 0, 0); // no character limit
 
     m_hHexRecv = HexView::Create(hWnd, 0,0,10,10, IDC_STATIC_HEXRECV, hInst);
     ShowWindow(m_hHexRecv, SW_HIDE);
@@ -483,6 +485,9 @@ void MainWindow::OnCreate(HWND hWnd, HINSTANCE hInst,
     // Initial layout
     RECT rc; GetClientRect(hWnd, &rc);
     LayoutControls(rc.right, rc.bottom);
+
+    // Tooltips
+    CreateTooltips();
 
     // Auto-connect after the window is visible (post so WM_CREATE returns first)
     if (m_autoConnect) PostMessageW(hWnd, WM_COMMAND, MAKEWPARAM(IDC_BTN_CONNECT, BN_CLICKED), 0);
@@ -701,6 +706,7 @@ void MainWindow::OnDestroy()
     }
     if (m_net) m_net->Disconnect();
     if (m_hImgListLog) ImageList_Destroy(m_hImgListLog);
+    if (m_hTooltip) { DestroyWindow(m_hTooltip); m_hTooltip = nullptr; }
     if (m_hFont)     DeleteObject(m_hFont);
     if (m_hFontMono) DeleteObject(m_hFontMono);
 }
@@ -791,6 +797,16 @@ void MainWindow::OnCommand(WORD id, WORD notify, HWND hCtrl)
             Button_SetCheck(m_hChkKeepAlive, BST_UNCHECKED);
         break;
 
+    case IDC_CHK_AUTOCONNECT:
+        SetConnectionUI(m_connected);
+        break;
+
+    case IDC_EDIT_SEND:
+        // Clear cached sendData when the user actually types so the hex view
+        // re-syncs from the editor next time. Guard against programmatic SetWindowText.
+        if (notify == EN_CHANGE && !m_ignoreEditChange) m_sendData.clear();
+        break;
+
     case IDC_BTN_REFRESHDIAG:
         RefreshDiagnostics();
         break;
@@ -819,7 +835,15 @@ void MainWindow::OnCommand(WORD id, WORD notify, HWND hCtrl)
             AddLogEntry(std::move(sle));
         } else {
             if (!m_connected) {
-                MessageBoxW(m_hWnd, L"Not connected.", L"Not connected", MB_ICONWARNING);
+                if (Button_GetCheck(m_hChkAutoConnect) == BST_CHECKED) {
+                    // Auto-connect then fire cyclic — same pattern as DoSend.
+                    if (!m_pendingCyclicStart) {
+                        m_pendingCyclicStart = true;
+                        DoConnect();
+                    }
+                } else {
+                    MessageBoxW(m_hWnd, L"Not connected.", L"Not connected", MB_ICONWARNING);
+                }
                 break;
             }
             // Parse interval
@@ -974,12 +998,15 @@ void MainWindow::DoDisconnect()
 
 void MainWindow::DoSend()
 {
-    // Auto-connect if enabled and not connected
+    // Auto-connect if enabled and not connected.
+    // Don't post a retry message — that causes an infinite re-entry loop while the
+    // async connect is in flight.  Instead, set a flag; OnNetConnected() will call
+    // DoSend() exactly once after the connection is established.
     if (!m_connected && Button_GetCheck(m_hChkAutoConnect) == BST_CHECKED) {
-        DoConnect();
-        // Connection is async; schedule send after WM_NET_CONNECTED
-        // We do a simple post-back to retry send after a short delay
-        PostMessageW(m_hWnd, WM_COMMAND, MAKEWPARAM(IDC_BTN_SEND, BN_CLICKED), 0);
+        if (!m_pendingAutoSend) {
+            m_pendingAutoSend = true;
+            DoConnect();
+        }
         return;
     }
     if (!m_connected) {
@@ -1053,9 +1080,12 @@ void MainWindow::DoLoadFile()
     // Text view: attempt UTF-8 decode
     std::string raw(m_sendData.begin(), m_sendData.end());
     std::wstring wide = Utils::ToWide(raw);
-    SetWindowTextW(m_hEditSend, wide.c_str());
-
+    // Set hex view BEFORE the editor text so EN_CHANGE clearing m_sendData
+    // doesn't wipe the data we just stored for the hex view.
     HexView::SetData(m_hHexSend, m_sendData);
+    m_ignoreEditChange = true;
+    SetWindowTextW(m_hEditSend, wide.c_str());
+    m_ignoreEditChange = false;
 
     // Show appropriate view
     RefreshSendView();
@@ -1090,9 +1120,7 @@ std::vector<BYTE> MainWindow::GetSendData()
         }
         return out;
     } else {
-        // If file was loaded, prefer raw file bytes
-        if (!m_sendData.empty()) return m_sendData;
-        // Otherwise encode edit content as UTF-8
+        // Always encode current editor content as UTF-8 so edits are reflected
         std::wstring ws = Utils::GetWindowText(m_hEditSend);
         std::string s = Utils::ToUTF8(ws);
         return std::vector<BYTE>(s.begin(), s.end());
@@ -1139,7 +1167,8 @@ void MainWindow::RefreshSendView()
     if (m_hexSendMode) {
         ShowWindow(m_hEditSend, SW_HIDE);
         ShowWindow(m_hHexSend,  SW_SHOW);
-        // Sync hex from m_sendData or from text content
+        // Sync hex: use raw sendData if available (from file load / log reload),
+        // otherwise re-encode current editor text so user edits are reflected.
         if (m_sendData.empty()) {
             std::wstring ws = Utils::GetWindowText(m_hEditSend);
             std::string s   = Utils::ToUTF8(ws);
@@ -1253,7 +1282,7 @@ void MainWindow::SetConnectionUI(bool connected)
     EnableWindow(m_hBtnConnect,    !connected);
     EnableWindow(m_hBtnDisconnect,  connected);
     EnableWindow(m_hBtnSend,        connected || Button_GetCheck(m_hChkAutoConnect) == BST_CHECKED);
-    EnableWindow(m_hBtnCyclicStart, connected);
+    EnableWindow(m_hBtnCyclicStart, connected || Button_GetCheck(m_hChkAutoConnect) == BST_CHECKED);
     EnableWindow(m_hEditIP,        !connected);
     EnableWindow(m_hEditPort,      !connected);
     EnableWindow(m_hEditTimeout,   !connected);
@@ -1263,8 +1292,16 @@ void MainWindow::SetConnectionUI(bool connected)
     EnableWindow(m_hChkAutoConnect,!connected);
     if (connected) {
         SetWindowTextW(m_hStaticStatus, L"\u25CF Connected");
+        // Build title: "TCP Client  –  ip:port"
+        std::wstring ip   = Utils::GetWindowText(m_hEditIP);
+        std::wstring port = Utils::GetWindowText(m_hEditPort);
+        bool isUdp = (SendMessage(m_hComboProtocol, CB_GETCURSEL, 0, 0) == 1);
+        std::wstring title = std::wstring(isUdp ? L"UDP Client v26.3.1" : L"TCP Client v26.3.1")
+                             + L"  \u2013  " + ip + L":" + port;
+        SetWindowTextW(m_hWnd, title.c_str());
     } else {
         SetWindowTextW(m_hStaticStatus, L"\u25CF Disconnected");
+        SetWindowTextW(m_hWnd, L"TCP Client v26.3.1");
     }
     InvalidateRect(m_hStaticStatus, nullptr, TRUE);
 }
@@ -1277,6 +1314,17 @@ void MainWindow::OnNetConnected()
 {
     m_connectTime = Utils::Now();
     SetConnectionUI(true);
+
+    // If the connection was triggered by auto-connect-before-send, fire the send now.
+    if (m_pendingAutoSend) {
+        m_pendingAutoSend = false;
+        DoSend(); // will proceed since m_connected is now true
+    }
+    // If the connection was triggered by auto-connect-before-cyclic, start cyclic now.
+    if (m_pendingCyclicStart) {
+        m_pendingCyclicStart = false;
+        PostMessageW(m_hWnd, WM_COMMAND, MAKEWPARAM(IDC_BTN_CYCLIC_START, BN_CLICKED), 0);
+    }
 
     bool isUdp = (SendMessage(m_hComboProtocol, CB_GETCURSEL, 0, 0) == 1);
     const wchar_t* proto = isUdp ? L"UDP" : L"TCP";
@@ -1337,6 +1385,8 @@ void MainWindow::OnNetConnected()
 
 void MainWindow::OnNetDisconnected()
 {
+    m_pendingAutoSend    = false; // cancel pending auto-send if connection dropped
+    m_pendingCyclicStart = false; // cancel pending cyclic start if connection dropped
     if (m_cyclicRunning) {
         m_cyclicStop = true;
         if (m_cyclicThread.joinable()) m_cyclicThread.join();
@@ -1456,6 +1506,8 @@ void MainWindow::OnNetSendComplete(size_t bytesSent, CycleStats* pStats)
 
 void MainWindow::OnNetError(int wsaErr, std::wstring* pMsg)
 {
+    m_pendingAutoSend    = false; // cancel pending auto-send if connection failed
+    m_pendingCyclicStart = false; // cancel pending cyclic start if connection failed
     std::wstring msg;
     if (pMsg) { msg = *pMsg; delete pMsg; }
 
@@ -1483,10 +1535,13 @@ void MainWindow::AppendReceiveText(const std::vector<BYTE>& data)
     if (m_hexRecvMode) {
         HexView::SetData(m_hHexRecv, m_recvData);
     } else {
-        // Limit receive text to ~256KB to avoid memory bloat
+        const int MAX_CHARS = 1 * 1024 * 1024; // 1 MB rolling cap
+        const int TRIM_TO   = MAX_CHARS / 2;    // keep newest ~512 KB
         int len = GetWindowTextLengthW(m_hEditRecv);
-        if (len > 256 * 1024) {
-            SetWindowTextW(m_hEditRecv, L"[...buffer trimmed...]\r\n");
+        if (len > MAX_CHARS) {
+            // Remove oldest half, preserving recent data
+            SendMessage(m_hEditRecv, EM_SETSEL, 0, TRIM_TO);
+            SendMessage(m_hEditRecv, EM_REPLACESEL, FALSE, (LPARAM)L"[...older output trimmed...]\r\n");
             len = GetWindowTextLengthW(m_hEditRecv);
         }
         std::string s(data.begin(), data.end());
@@ -1697,8 +1752,10 @@ void MainWindow::DoReloadLogEntry(int idx)
         m_sendData = le.data;
         std::string s(m_sendData.begin(), m_sendData.end());
         std::wstring ws = Utils::ToWide(s);
-        SetWindowTextW(m_hEditSend, ws.c_str());
         HexView::SetData(m_hHexSend, m_sendData);
+        m_ignoreEditChange = true;
+        SetWindowTextW(m_hEditSend, ws.c_str());
+        m_ignoreEditChange = false;
         RefreshSendView();
         // Switch to send tab / bring focus
         SetFocus(m_hEditSend);
@@ -1720,4 +1777,74 @@ void MainWindow::DoReloadLogEntry(int idx)
 
     // Flash stats if available
     if (le.stats.valid) UpdateStats(le.stats);
+}
+
+// ============================================================
+//  CreateTooltips
+// ============================================================
+
+void MainWindow::CreateTooltips()
+{
+    m_hTooltip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+        WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+        m_hWnd, nullptr, m_hInst, nullptr);
+    if (!m_hTooltip) return;
+    SendMessageW(m_hTooltip, TTM_SETMAXTIPWIDTH, 0, 360);
+
+    auto tip = [&](HWND ctrl, const wchar_t* text) {
+        if (!ctrl) return;
+        TOOLINFOW ti = {};
+        ti.cbSize   = sizeof(TOOLINFOW);
+        ti.uFlags   = TTF_IDISHWND | TTF_SUBCLASS;
+        ti.hwnd     = m_hWnd;
+        ti.uId      = (UINT_PTR)ctrl;
+        ti.lpszText = (LPWSTR)text;
+        SendMessageW(m_hTooltip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+    };
+
+    // ---- Connection group ----
+    tip(m_hEditIP,           L"Server IP address or hostname to connect to.");
+    tip(m_hEditPort,         L"Server port number (1\u201365535).");
+    tip(m_hEditTimeout,      L"Connection timeout in seconds. Enter 0 to wait indefinitely.");
+    tip(m_hComboProtocol,    L"Protocol:\n  TCP \u2014 reliable, ordered stream connection.\n  UDP \u2014 fast, connectionless datagrams (no delivery guarantee).");
+    tip(m_hBtnConnect,       L"Open a connection to the configured server.");
+    tip(m_hBtnDisconnect,    L"Close the current connection.");
+    tip(m_hChkKeepAlive,     L"Enable TCP keep-alive probes so broken connections are detected and reported early.");
+    tip(m_hChkAutoDisc,      L"Disconnect automatically after every send. Useful for testing request/response protocols where a fresh connection is needed each time.");
+    tip(m_hChkAutoConnect,   L"Connect automatically before sending if not already connected. The send is deferred until the connection is established.");
+
+    // ---- Send group ----
+    tip(m_hEditSend,         L"Type the data to send here. Press Ctrl+Enter to send without clicking the button.");
+    tip(m_hBtnSend,          L"Send the editor contents to the server.  [Shortcut: Ctrl+Enter]");
+    tip(m_hBtnLoadFile,      L"Load a binary or text file from disk into the send editor.");
+    tip(m_hBtnClearSend,     L"Clear the send editor.");
+    tip(m_hChkHexSend,       L"Hex View \u2014 enter and display send data as space-separated hex byte pairs (e.g.  48 65 6C 6C 6F).");
+    tip(m_hChkAutoClearSend, L"Clear the send editor automatically after each successful send.");
+    tip(m_hComboSep,         L"Framing \u2014 wraps the payload with a delimiter before sending:\n"
+                              L"  None     \u2014 no extra bytes added\n"
+                              L"  STX/ETX  \u2014 0x02 \u2026 0x03\n"
+                              L"  CR LF    \u2014 0x0D 0x0A\n"
+                              L"  LF / CR / NUL\n"
+                              L"  Custom   \u2014 enter your own prefix and suffix as hex bytes");
+    tip(m_hEditPreFix,       L"Custom framing prefix as hex bytes (e.g.  AA BB CC). Prepended before every send.");
+    tip(m_hEditSufFix,       L"Custom framing suffix as hex bytes (e.g.  0D 0A). Appended after every send.");
+
+    // ---- Cyclic send ----
+    tip(m_hEditCyclicInterval, L"Cyclic send interval in seconds (minimum 0.001 s = 1 ms). Examples: 1.0, 0.5, 0.1.");
+    tip(m_hBtnCyclicStart,   L"Start / stop sending the current payload repeatedly at the configured interval.");
+
+    // ---- Receive group ----
+    tip(m_hEditRecv,         L"Data received from the server (read-only). New data is appended as it arrives.");
+    tip(m_hBtnClearRecv,     L"Clear the receive display.");
+    tip(m_hBtnCopyRecv,      L"Copy all received data to the clipboard.");
+    tip(m_hBtnSaveRecv,      L"Save the data from the last received transmission to a file.\nOnly the most recent send/receive cycle is kept.");
+    tip(m_hChkHexRecv,       L"Hex View \u2014 display received data as hexadecimal bytes.");
+    tip(m_hChkAutoClearRecv, L"Clear the receive display automatically before each incoming message.");
+
+    // ---- Bottom panel ----
+    tip(m_hBtnClearLog,      L"Remove all entries from the history log.");
+    tip(m_hComboLogFilter,   L"Filter the log:\n  All | Data only | Connection events | Errors");
+    tip(m_hBtnRefreshDiag,   L"Refresh live socket diagnostics: buffer sizes, Nagle algorithm state, keep-alive, estimated MTU.");
+    tip(m_hBtnClearStats,    L"Reset all timing and byte-count statistics to zero.");
 }

@@ -62,6 +62,7 @@
 // Auto-clear checkboxes
 #define IDC_CHK_AUTOCLEAR_SEND  1070
 #define IDC_CHK_AUTOCLEAR_RECV  1071
+#define IDC_CHK_AUTOCONNECT     1072
 
 // Diagnostics
 #define IDC_STATIC_DIAG_INFO    1080

@@ -188,7 +188,21 @@ void ServerNetwork::AcceptLoop(int port, int timeoutSec)
             AppendLogFile(chunk);
 
             if (m_echoMode) {
-                sendto(listenSock, (char*)buf.data(), n, 0, (sockaddr*)&fromAddr, sizeof(fromAddr));
+                Utils::TimePoint echoStart = Utils::Now();
+                int ns = sendto(listenSock, (char*)buf.data(), n, 0, (sockaddr*)&fromAddr, sizeof(fromAddr));
+                Utils::TimePoint echoEnd = Utils::Now();
+
+                CycleStats* pStats = new CycleStats;
+                {
+                    std::lock_guard<std::mutex> slk(m_statsMutex);
+                    m_stats.sendStart = echoStart;
+                    m_stats.sendEnd   = echoEnd;
+                    m_stats.bytesSent += (size_t)(ns > 0 ? ns : 0);
+                    *pStats = m_stats;
+                    pStats->valid = true;
+                }
+                PostMessage(m_notifyWnd, WM_NET_SEND_COMPLETE,
+                            (WPARAM)(ns > 0 ? ns : 0), (LPARAM)pStats);
             }
 
             BYTE* copy = new BYTE[n];
@@ -303,12 +317,25 @@ void ServerNetwork::RecvLoop(SOCKET clientSock)
 
         // Echo mode: immediately send back what we received
         if (m_echoMode) {
+            Utils::TimePoint echoStart = Utils::Now();
             int total = n, sent = 0;
             while (sent < total) {
                 int s = ::send(clientSock, (char*)buf.data() + sent, total - sent, 0);
                 if (s == SOCKET_ERROR) break;
                 sent += s;
             }
+            Utils::TimePoint echoEnd = Utils::Now();
+
+            CycleStats* pStats = new CycleStats;
+            {
+                std::lock_guard<std::mutex> slk(m_statsMutex);
+                m_stats.sendStart = echoStart;
+                m_stats.sendEnd   = echoEnd;
+                m_stats.bytesSent += (size_t)sent;
+                *pStats = m_stats;
+                pStats->valid = true;
+            }
+            PostMessage(m_notifyWnd, WM_NET_SEND_COMPLETE, (WPARAM)sent, (LPARAM)pStats);
         }
 
         // Post data to UI
