@@ -10,7 +10,7 @@
 
 // Relay configuration controls
 #define IDC_EDIT_LISTEN_PORT    1001
-#define IDC_EDIT_TARGET_IP      1002
+#define IDC_COMBO_TARGET        1002
 #define IDC_EDIT_TARGET_PORT    1003
 #define IDC_COMBO_PROTOCOL      1004
 #define IDC_EDIT_TIMEOUT        1005
@@ -85,3 +85,4 @@
 #define WM_RELAY_ERROR              (WM_APP + 8)
 #define WM_RELAY_STOPPED            (WM_APP + 9)
 #define WM_RELAY_TARGET_CONNECTING  (WM_APP + 10)  // target is trying to reconnect
+#define WM_PARSE_TARGET_COMBO       (WM_APP + 20)

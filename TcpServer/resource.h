@@ -5,7 +5,7 @@
 #define IDI_APPICON             102
 
 // Server controls
-#define IDC_EDIT_PORT           1002
+#define IDC_COMBO_PORT          1002
 #define IDC_EDIT_TIMEOUT        1003
 #define IDC_BTN_STARTSERVER     1004
 #define IDC_BTN_STOPSERVER      1005

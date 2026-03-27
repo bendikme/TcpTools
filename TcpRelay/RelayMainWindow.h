@@ -95,7 +95,7 @@ private:
 
     // Config controls
     HWND m_hEditListenPort  {nullptr};
-    HWND m_hEditTargetIP    {nullptr};
+    HWND m_hComboTarget     {nullptr};
     HWND m_hEditTargetPort  {nullptr};
     HWND m_hComboProtocol   {nullptr};
     HWND m_hEditTimeout     {nullptr};
@@ -182,4 +182,10 @@ private:
     bool         m_hexModeC2T    {false};  // false = text view, true = hex view
     bool         m_hexModeT2C    {false};
     HWND         m_hTooltip      {nullptr};
+
+    // Connection history
+    std::vector<std::wstring> m_targetHistory;
+    void    PopulateTargetCombo();
+    void    OnTargetComboSelChange();
+    void    DoParseComboParts();
 };

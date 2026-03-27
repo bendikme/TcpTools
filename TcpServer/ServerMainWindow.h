@@ -92,7 +92,7 @@ private:
     HFONT     m_hFontMono     {nullptr};
 
     // Server panel
-    HWND    m_hEditPort       {nullptr};
+    HWND    m_hComboPort      {nullptr};
     HWND    m_hEditTimeout    {nullptr};
     HWND    m_hBtnStart       {nullptr};
     HWND    m_hBtnStop        {nullptr};
@@ -178,4 +178,8 @@ private:
     int                            m_logFilter     {0}; // 0=All, 1=Data, 2=Connection, 3=Errors
     size_t                         m_totalBytesSent {0};
     size_t                         m_totalBytesRecv {0};
+
+    // Connection history
+    std::vector<std::wstring>      m_portHistory;
+    void    PopulatePortCombo();
 };

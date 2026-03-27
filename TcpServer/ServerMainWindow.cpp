@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "ServerMainWindow.h"
+#include "../Version.h"
 
 // ============================================================
 //  Subclass proc for Send edit - intercepts Ctrl+Enter
@@ -72,7 +73,7 @@ HWND ServerMainWindow::Create(HINSTANCE hInst, int nCmdShow,
     auto* p = new Params{ defaultPort, autoStart, echoMode, logFile };
 
     HWND hWnd = CreateWindowExW(
-        0, ClassName(), L"TCP Server v26.3.1",
+        0, ClassName(), L"TCP Server v" TCPTOOLS_VERSION,
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
         CW_USEDEFAULT, CW_USEDEFAULT, 1180, 820,
         nullptr, nullptr, hInst, p); // pass params via lpCreateParams
@@ -133,8 +134,8 @@ LRESULT CALLBACK ServerMainWindow::WndProc(HWND hWnd, UINT msg, WPARAM wParam, L
     case WM_KEYDOWN:
         if (wParam == VK_F1) {
             MessageBoxW(hWnd,
-                L"TCP Server v26.3.1\n\nCopyright \u00A9 2026 Bendik Eide.\nAll rights reserved.",
-                L"About TCP Server v26.3.1", MB_OK | MB_ICONINFORMATION);
+                L"TCP Server v" TCPTOOLS_VERSION L"\n\n" TCPTOOLS_COPYRIGHT,
+                L"About TCP Server v" TCPTOOLS_VERSION, MB_OK | MB_ICONINFORMATION);
             return 0;
         }
         break;
@@ -233,7 +234,10 @@ void ServerMainWindow::OnCreate(HWND hWnd, HINSTANCE hInst,
     // --- Server group ---
     m_hGrpServer    = MakeGroupBox(IDC_GRP_SERVER, L" Server ", 0,0,10,10);
     m_hLblPort      = MakeLabel(L"Port:", 0,0,35,ROW_H);
-    m_hEditPort     = MakeEdit(IDC_EDIT_PORT, 0,0,10,10);
+    m_hComboPort    = CreateWindowExW(0, L"COMBOBOX", L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWN | CBS_AUTOHSCROLL,
+        0,0,10,200, hWnd, (HMENU)(UINT_PTR)IDC_COMBO_PORT, hInst, nullptr);
+    SendMessage(m_hComboPort, WM_SETFONT, (WPARAM)m_hFont, TRUE);
     m_hLblTimeout   = MakeLabel(L"Timeout (s):", 0,0,80,ROW_H);
     m_hEditTimeout  = MakeEdit(IDC_EDIT_TIMEOUT, 0,0,10,10);
     m_hBtnStart     = MakeButton(IDC_BTN_STARTSERVER, L"Start Server", 0,0,10,10);
@@ -250,8 +254,12 @@ void ServerMainWindow::OnCreate(HWND hWnd, HINSTANCE hInst,
     SendMessage(m_hComboProtocol, CB_ADDSTRING, 0, (LPARAM)L"UDP");
     SendMessage(m_hComboProtocol, CB_SETCURSEL, 0, 0);
 
+    // Load port history and populate combo
+    m_portHistory = Utils::LoadHistory(L"TcpServer");
+    PopulatePortCombo();
+
     wchar_t portBuf[16]; swprintf_s(portBuf, L"%d", defaultPort);
-    SetWindowTextW(m_hEditPort, portBuf);
+    SetWindowTextW(m_hComboPort, portBuf);
     SetWindowTextW(m_hEditTimeout, L"5");
     if (echoMode) Button_SetCheck(m_hChkEcho, BST_CHECKED);
     EnableWindow(m_hBtnStop, FALSE);
@@ -419,7 +427,7 @@ void ServerMainWindow::OnCreate(HWND hWnd, HINSTANCE hInst,
 
     // Auto-start if requested
     if (autoStart) {
-        int port = ::GetDlgItemInt(hWnd, IDC_EDIT_PORT, nullptr, FALSE);
+        int port = _wtoi(Utils::GetWindowText(m_hComboPort).c_str());
         if (port <= 0) port = defaultPort;
         int timeout = ::GetDlgItemInt(hWnd, IDC_EDIT_TIMEOUT, nullptr, FALSE);
         if (timeout <= 0) timeout = 5;
@@ -439,7 +447,7 @@ void ServerMainWindow::OnGetMinMaxInfo(MINMAXINFO* mm)
 
 void ServerMainWindow::LayoutControls(int W, int H)
 {
-    if (!m_hEditPort) return;
+    if (!m_hComboPort) return;
 
     HDWP hdwp = BeginDeferWindowPos(54);
     auto Move = [&](HWND hw, int x, int y, int w, int h) {
@@ -457,7 +465,7 @@ void ServerMainWindow::LayoutControls(int W, int H)
 
     // Row 1: Port | Timeout | Start | Stop | Status
     Move(m_hLblPort,    cx, cy, 35, ROW_H); cx += 37;
-    Move(m_hEditPort,   cx, cy, 60, ROW_H); cx += 64;
+    Move(m_hComboPort, cx, cy, 80, 200); cx += 84;
     Move(m_hLblTimeout, cx, cy, 80, ROW_H); cx += 82;
     Move(m_hEditTimeout,cx, cy, 40, ROW_H); cx += 44;
     Move(m_hComboProtocol, cx, cy, 55, 200); cx += 59;
@@ -714,24 +722,50 @@ void ServerMainWindow::OnCommand(WORD id, WORD notify, HWND /*hCtrl*/)
 }
 
 // ============================================================
+//  Connection history helpers
+// ============================================================
+
+void ServerMainWindow::PopulatePortCombo()
+{
+    SendMessage(m_hComboPort, CB_RESETCONTENT, 0, 0);
+    for (auto& e : m_portHistory)
+        SendMessage(m_hComboPort, CB_ADDSTRING, 0, (LPARAM)e.c_str());
+}
+
+// ============================================================
 //  DoStartServer / DoStopServer
 // ============================================================
 
 void ServerMainWindow::DoStartServer()
 {
     if (m_listening) return;
-    int port    = ::GetDlgItemInt(m_hWnd, IDC_EDIT_PORT, nullptr, FALSE);
-    int timeout = ::GetDlgItemInt(m_hWnd, IDC_EDIT_TIMEOUT, nullptr, FALSE);
-    if (port <= 0 || port > 65535) {
-        MessageBoxW(m_hWnd, L"Enter a valid port (1-65535).", L"Invalid port", MB_ICONWARNING);
+
+    // Validate port
+    std::wstring portW = Utils::GetWindowText(m_hComboPort);
+    int port = 0;
+    if (!Utils::IsValidPort(portW, port)) {
+        MessageBoxW(m_hWnd, L"Please enter a valid port number (1\u201365535).", L"Invalid port", MB_ICONWARNING);
+        SetFocus(m_hComboPort);
         return;
     }
+
+    int timeout = ::GetDlgItemInt(m_hWnd, IDC_EDIT_TIMEOUT, nullptr, FALSE);
     if (timeout <= 0) timeout = 5;
+
+    bool udp = (SendMessage(m_hComboProtocol, CB_GETCURSEL, 0, 0) == 1);
+
+    // Check if port is already in use
+    if (!Utils::IsPortAvailable(port, udp)) {
+        wchar_t msg[128];
+        swprintf_s(msg, L"Port %d is already in use.\nPlease choose a different port.", port);
+        MessageBoxW(m_hWnd, msg, L"Port busy", MB_ICONWARNING);
+        SetFocus(m_hComboPort);
+        return;
+    }
 
     if (!m_net) m_net = std::make_unique<ServerNetwork>(m_hWnd);
     bool echo = Button_GetCheck(m_hChkEcho) == BST_CHECKED;
     m_net->SetEchoMode(echo);
-    bool udp = (SendMessage(m_hComboProtocol, CB_GETCURSEL, 0, 0) == 1);
     m_net->StartListening(port, timeout, udp);
 }
 
@@ -874,7 +908,7 @@ std::vector<BYTE> ServerMainWindow::GetSendData()
 NetConfig ServerMainWindow::BuildNetConfig()
 {
     NetConfig cfg;
-    cfg.port       = ::GetDlgItemInt(m_hWnd, IDC_EDIT_PORT, nullptr, FALSE);
+    cfg.port       = _wtoi(Utils::GetWindowText(m_hComboPort).c_str());
     cfg.timeoutSec = ::GetDlgItemInt(m_hWnd, IDC_EDIT_TIMEOUT, nullptr, FALSE);
     if (cfg.timeoutSec <= 0) cfg.timeoutSec = 5;
     cfg.separator  = GetSeparatorMode();
@@ -1004,7 +1038,7 @@ void ServerMainWindow::SetServerUI(bool listening, bool clientConnected)
     m_clientConn = clientConnected;
     EnableWindow(m_hBtnStart,      !listening);
     EnableWindow(m_hBtnStop,        listening);
-    EnableWindow(m_hEditPort,      !listening);
+    EnableWindow(m_hComboPort,     !listening);
     EnableWindow(m_hEditTimeout,   !listening);
     EnableWindow(m_hComboProtocol, !listening);
     // Echo mode can always be toggled (SetEchoMode propagates to running network)
@@ -1019,6 +1053,15 @@ void ServerMainWindow::SetServerUI(bool listening, bool clientConnected)
 void ServerMainWindow::OnNetListening(int port)
 {
     SetServerUI(true, false);
+
+    // Save port to history
+    {
+        std::wstring entry = std::to_wstring(port);
+        Utils::SaveHistory(L"TcpServer", entry, m_portHistory);
+        PopulatePortCombo();
+        SetWindowTextW(m_hComboPort, entry.c_str());
+    }
+
     wchar_t buf[80];
     swprintf_s(buf, L"\u25CC Listening on port %d", port);
     SetWindowTextW(m_hStaticStatus, buf);
@@ -1028,7 +1071,7 @@ void ServerMainWindow::OnNetListening(int port)
 
     // Title bar
     wchar_t titleBuf[128];
-    swprintf_s(titleBuf, L"TCP Server v26.3.1  \u2013  Listening :%d", port);
+    swprintf_s(titleBuf, L"TCP Server v" TCPTOOLS_VERSION L"  \u2013  Listening :%d", port);
     SetWindowTextW(m_hWnd, titleBuf);
 
     LogEntry le;
@@ -1067,7 +1110,7 @@ void ServerMainWindow::OnNetStopped()
     SetWindowTextW(m_hStaticStatus, L"\u25CF Not listening");
     SetWindowTextW(m_hStaticClient, L"");
     InvalidateRect(m_hStaticStatus, nullptr, TRUE);
-    SetWindowTextW(m_hWnd, L"TCP Server v26.3.1");
+    SetWindowTextW(m_hWnd, L"TCP Server v" TCPTOOLS_VERSION);
 
     LogEntry le;
     le.type      = LogType::Stopped;
@@ -1093,9 +1136,9 @@ void ServerMainWindow::OnNetClientConnected(std::wstring* pAddrStr)
 
     // Title bar
     {
-        std::wstring portStr = Utils::GetWindowText(m_hEditPort);
+        std::wstring portStr = Utils::GetWindowText(m_hComboPort);
         wchar_t titleBuf[256];
-        swprintf_s(titleBuf, L"TCP Server v26.3.1  \u2013  :%s  \u25CF  %s",
+        swprintf_s(titleBuf, L"TCP Server v" TCPTOOLS_VERSION L"  \u2013  :%s  \u25CF  %s",
                    portStr.c_str(), addr.c_str());
         SetWindowTextW(m_hWnd, titleBuf);
     }
@@ -1161,13 +1204,13 @@ void ServerMainWindow::OnNetClientDisconnected()
         SetWindowTextW(m_hStaticStatus, L"\u25CC Listening");
         SetWindowTextW(m_hStaticClient, L"Client disconnected -- waiting...");
         // Restore listening title
-        std::wstring portStr = Utils::GetWindowText(m_hEditPort);
-        std::wstring titleStr = L"TCP Server v26.3.1  \u2013  Listening :" + portStr;
+        std::wstring portStr = Utils::GetWindowText(m_hComboPort);
+        std::wstring titleStr = L"TCP Server v" TCPTOOLS_VERSION L"  \u2013  Listening :" + portStr;
         SetWindowTextW(m_hWnd, titleStr.c_str());
     } else {
         SetWindowTextW(m_hStaticStatus, L"\u25CF Not listening");
         SetWindowTextW(m_hStaticClient, L"");
-        SetWindowTextW(m_hWnd, L"TCP Server v26.3.1");
+        SetWindowTextW(m_hWnd, L"TCP Server v" TCPTOOLS_VERSION);
     }
     InvalidateRect(m_hStaticStatus, nullptr, TRUE);
     InvalidateRect(m_hStaticClient, nullptr, TRUE);
@@ -1538,7 +1581,7 @@ void ServerMainWindow::CreateTooltips()
     };
 
     // ---- Server group ----
-    tip(m_hEditPort,         L"Port number the server listens on (1\u201365535).");
+    tip(m_hComboPort,        L"Port number the server listens on. Select from recent ports or type a new one.");
     tip(m_hEditTimeout,      L"Receive / accept timeout in seconds. Use 0 to wait indefinitely.");
     tip(m_hComboProtocol,    L"Protocol:\n  TCP \u2014 reliable, ordered stream connection.\n  UDP \u2014 connectionless datagrams.");
     tip(m_hBtnStart,         L"Start the server and begin listening for incoming client connections.");

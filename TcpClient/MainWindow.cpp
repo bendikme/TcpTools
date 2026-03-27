@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "MainWindow.h"
+#include "../Version.h"
 
 // ============================================================
 //  Subclass proc for Send edit - intercepts Ctrl+Enter
@@ -76,7 +77,7 @@ HWND MainWindow::Create(HINSTANCE hInst, int nCmdShow,
 
     HWND hWnd = CreateWindowExW(
         0, ClassName(),
-        L"TCP Client v26.3.1",
+        L"TCP Client v" TCPTOOLS_VERSION,
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
         CW_USEDEFAULT, CW_USEDEFAULT, 1180, 820,
         nullptr, nullptr, hInst, p);
@@ -139,8 +140,8 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
     case WM_KEYDOWN:
         if (wParam == VK_F1) {
             MessageBoxW(hWnd,
-                L"TCP Client v26.3.1\n\nCopyright \u00A9 2026 Bendik Eide.\nAll rights reserved.",
-                L"About TCP Client v26.3.1", MB_OK | MB_ICONINFORMATION);
+                L"TCP Client v" TCPTOOLS_VERSION L"\n\n" TCPTOOLS_COPYRIGHT,
+                L"About TCP Client v" TCPTOOLS_VERSION, MB_OK | MB_ICONINFORMATION);
             return 0;
         }
         break;
@@ -208,6 +209,10 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
             SetWindowTextW(self->m_hStaticCyclicCount, cbuf);
         }
         return 0;
+
+    case WM_PARSE_HOST_COMBO:
+        if (self) self->DoParseComboParts();
+        return 0;
     }
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
@@ -270,7 +275,10 @@ void MainWindow::OnCreate(HWND hWnd, HINSTANCE hInst,
 
     // --- Connection group (placeholder pos; real pos set in LayoutControls) ---
     m_hGrpConn     = MakeGroupBox(IDC_GRP_CONNECTION, L" Connection ", 0,0,10,10);
-    m_hEditIP      = MakeEdit(IDC_EDIT_IP,   0,0,10,10);
+    m_hComboHost   = CreateWindowExW(0, L"COMBOBOX", L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWN | CBS_AUTOHSCROLL,
+        0,0,10,200, hWnd, (HMENU)(UINT_PTR)IDC_COMBO_HOST, hInst, nullptr);
+    SendMessage(m_hComboHost, WM_SETFONT, (WPARAM)m_hFont, TRUE);
     m_hEditPort    = MakeEdit(IDC_EDIT_PORT, 0,0,10,10);
     m_hEditTimeout = MakeEdit(IDC_EDIT_TIMEOUT,0,0,10,10);
     m_hBtnConnect    = MakeButton(IDC_BTN_CONNECT,    L"Connect",    0,0,10,10);
@@ -280,11 +288,16 @@ void MainWindow::OnCreate(HWND hWnd, HINSTANCE hInst,
     m_hChkAutoConnect = MakeCheck(IDC_CHK_AUTOCONNECT, L"Auto-Connect Before Send", 0,0,10,10);
     m_hStaticStatus  = MakeLabel(L"\u25CF Disconnected", 0,0,10,10);
 
+    // Load connection history and populate combo
+    m_connHistory = Utils::LoadHistory(L"TcpClient");
+    PopulateHostCombo();
+
     // Apply defaults from CLI args
     wchar_t portBuf[16]; swprintf_s(portBuf, L"%d", defaultPort);
-    SetWindowTextW(m_hEditIP,      defaultIP.c_str());
+    SetWindowTextW(m_hComboHost,   defaultIP.c_str());
     SetWindowTextW(m_hEditPort,    portBuf);
     SetWindowTextW(m_hEditTimeout, L"5");
+    DoParseComboParts();
     Button_SetCheck(m_hChkKeepAlive, BST_CHECKED);
     EnableWindow(m_hBtnDisconnect, FALSE);
 
@@ -509,7 +522,7 @@ void MainWindow::OnGetMinMaxInfo(MINMAXINFO* mm)
 
 void MainWindow::LayoutControls(int W, int H)
 {
-    if (!m_hEditIP) return; // not yet created
+    if (!m_hComboHost) return; // not yet created
 
     HDWP hdwp = BeginDeferWindowPos(54);
     auto Move = [&](HWND hw, int x, int y, int w, int h) {
@@ -528,7 +541,7 @@ void MainWindow::LayoutControls(int W, int H)
 
     // Row 1: IP | Port | Timeout | Connect | Disconnect | Status
     Move(m_hLblHost,    cx, cy, 35, ROW_H); cx += 35 + 2;
-    Move(m_hEditIP, cx, cy, 140, ROW_H); cx += 140 + MARGIN;
+    Move(m_hComboHost, cx, cy, 180, 200); cx += 180 + MARGIN;
     Move(m_hLblPort,    cx, cy, 32, ROW_H); cx += 32 + 2;
     Move(m_hEditPort,    cx, cy, 55, ROW_H); cx += 55 + MARGIN;
     Move(m_hLblTimeout, cx, cy, 80, ROW_H); cx += 80 + 2;
@@ -807,6 +820,10 @@ void MainWindow::OnCommand(WORD id, WORD notify, HWND hCtrl)
         if (notify == EN_CHANGE && !m_ignoreEditChange) m_sendData.clear();
         break;
 
+    case IDC_COMBO_HOST:
+        if (notify == CBN_SELCHANGE) OnHostComboSelChange();
+        break;
+
     case IDC_BTN_REFRESHDIAG:
         RefreshDiagnostics();
         break;
@@ -954,21 +971,75 @@ void MainWindow::DoSaveLastRecv()
     MessageBoxW(m_hWnd, msg, L"Saved", MB_ICONINFORMATION);
 }
 
+// ============================================================
+//  Connection history helpers
+// ============================================================
+
+void MainWindow::PopulateHostCombo()
+{
+    SendMessage(m_hComboHost, CB_RESETCONTENT, 0, 0);
+    for (auto& e : m_connHistory)
+        SendMessage(m_hComboHost, CB_ADDSTRING, 0, (LPARAM)e.c_str());
+}
+
+void MainWindow::OnHostComboSelChange()
+{
+    // Defer parsing: Windows overwrites the combo edit text AFTER
+    // CBN_SELCHANGE returns, so we post a message to parse later.
+    PostMessage(m_hWnd, WM_PARSE_HOST_COMBO, 0, 0);
+}
+
+void MainWindow::DoParseComboParts()
+{
+    std::wstring text = Utils::GetWindowText(m_hComboHost);
+    auto pos = text.rfind(L':');
+    if (pos != std::wstring::npos && pos > 0 && pos < text.size() - 1) {
+        std::wstring host = text.substr(0, pos);
+        std::wstring port = text.substr(pos + 1);
+        int p = 0;
+        if (Utils::IsValidPort(port, p)) {
+            SetWindowTextW(m_hComboHost, host.c_str());
+            SetWindowTextW(m_hEditPort, port.c_str());
+        }
+    }
+}
+
 
 
 void MainWindow::DoConnect()
 {
     if (m_connected) return;
 
+    // Parse "host:port" from combo if the user typed/pasted a combined value
+    std::wstring hostW = Utils::GetWindowText(m_hComboHost);
+    auto colon = hostW.rfind(L':');
+    if (colon != std::wstring::npos && colon > 0 && colon < hostW.size() - 1) {
+        std::wstring maybePort = hostW.substr(colon + 1);
+        int p = 0;
+        if (Utils::IsValidPort(maybePort, p)) {
+            hostW = hostW.substr(0, colon);
+            SetWindowTextW(m_hComboHost, hostW.c_str());
+            SetWindowTextW(GetDlgItem(m_hWnd, IDC_EDIT_PORT), maybePort.c_str());
+        }
+    }
+
+    // Validate host/IP
+    if (!Utils::IsValidHostOrIP(hostW)) {
+        MessageBoxW(m_hWnd, L"Please enter a valid hostname or IP address.", L"Invalid host", MB_ICONWARNING);
+        SetFocus(m_hComboHost);
+        return;
+    }
+
+    // Validate port
+    std::wstring portW = Utils::GetWindowText(GetDlgItem(m_hWnd, IDC_EDIT_PORT));
+    int port = 0;
+    if (!Utils::IsValidPort(portW, port)) {
+        MessageBoxW(m_hWnd, L"Please enter a valid port number (1\u201365535).", L"Invalid port", MB_ICONWARNING);
+        SetFocus(GetDlgItem(m_hWnd, IDC_EDIT_PORT));
+        return;
+    }
+
     NetConfig cfg = BuildNetConfig();
-    if (cfg.host.empty()) {
-        MessageBoxW(m_hWnd, L"Please enter a host/IP address.", L"Missing input", MB_ICONWARNING);
-        return;
-    }
-    if (cfg.port <= 0 || cfg.port > 65535) {
-        MessageBoxW(m_hWnd, L"Please enter a valid port (1-65535).", L"Invalid port", MB_ICONWARNING);
-        return;
-    }
 
     if (!m_net) m_net = std::make_unique<TcpNetwork>(m_hWnd);
     m_connectTime = Utils::Now();
@@ -1134,7 +1205,7 @@ std::vector<BYTE> MainWindow::GetSendData()
 NetConfig MainWindow::BuildNetConfig()
 {
     NetConfig cfg;
-    cfg.host          = Utils::ToUTF8(Utils::GetWindowText(m_hEditIP));
+    cfg.host          = Utils::ToUTF8(Utils::GetWindowText(m_hComboHost));
     cfg.port          = Utils::GetDlgInt(m_hWnd, IDC_EDIT_PORT, 9000);
     cfg.timeoutSec    = Utils::GetDlgInt(m_hWnd, IDC_EDIT_TIMEOUT, 5);
     cfg.keepAlive     = Button_GetCheck(m_hChkKeepAlive) == BST_CHECKED;
@@ -1283,7 +1354,7 @@ void MainWindow::SetConnectionUI(bool connected)
     EnableWindow(m_hBtnDisconnect,  connected);
     EnableWindow(m_hBtnSend,        connected || Button_GetCheck(m_hChkAutoConnect) == BST_CHECKED);
     EnableWindow(m_hBtnCyclicStart, connected || Button_GetCheck(m_hChkAutoConnect) == BST_CHECKED);
-    EnableWindow(m_hEditIP,        !connected);
+    EnableWindow(m_hComboHost,    !connected);
     EnableWindow(m_hEditPort,      !connected);
     EnableWindow(m_hEditTimeout,   !connected);
     EnableWindow(m_hComboProtocol, !connected);
@@ -1293,15 +1364,15 @@ void MainWindow::SetConnectionUI(bool connected)
     if (connected) {
         SetWindowTextW(m_hStaticStatus, L"\u25CF Connected");
         // Build title: "TCP Client  –  ip:port"
-        std::wstring ip   = Utils::GetWindowText(m_hEditIP);
+        std::wstring ip   = Utils::GetWindowText(m_hComboHost);
         std::wstring port = Utils::GetWindowText(m_hEditPort);
         bool isUdp = (SendMessage(m_hComboProtocol, CB_GETCURSEL, 0, 0) == 1);
-        std::wstring title = std::wstring(isUdp ? L"UDP Client v26.3.1" : L"TCP Client v26.3.1")
+        std::wstring title = std::wstring(isUdp ? L"UDP Client v" TCPTOOLS_VERSION : L"TCP Client v" TCPTOOLS_VERSION)
                              + L"  \u2013  " + ip + L":" + port;
         SetWindowTextW(m_hWnd, title.c_str());
     } else {
         SetWindowTextW(m_hStaticStatus, L"\u25CF Disconnected");
-        SetWindowTextW(m_hWnd, L"TCP Client v26.3.1");
+        SetWindowTextW(m_hWnd, L"TCP Client v" TCPTOOLS_VERSION);
     }
     InvalidateRect(m_hStaticStatus, nullptr, TRUE);
 }
@@ -1314,6 +1385,16 @@ void MainWindow::OnNetConnected()
 {
     m_connectTime = Utils::Now();
     SetConnectionUI(true);
+
+    // Save connection to history
+    {
+        std::wstring host = Utils::GetWindowText(m_hComboHost);
+        std::wstring port = Utils::GetWindowText(m_hEditPort);
+        std::wstring entry = host + L":" + port;
+        Utils::SaveHistory(L"TcpClient", entry, m_connHistory);
+        PopulateHostCombo();
+        SetWindowTextW(m_hComboHost, host.c_str());
+    }
 
     // If the connection was triggered by auto-connect-before-send, fire the send now.
     if (m_pendingAutoSend) {
@@ -1333,7 +1414,7 @@ void MainWindow::OnNetConnected()
     le.type      = LogType::Connected;
     le.timestamp = Utils::NowTimestamp();
     le.preview   = std::wstring(L"[") + proto + L"] Connected to "
-                   + Utils::ToWide(Utils::ToUTF8(Utils::GetWindowText(m_hEditIP)))
+                   + Utils::ToWide(Utils::ToUTF8(Utils::GetWindowText(m_hComboHost)))
                    + L":" + Utils::GetWindowText(m_hEditPort);
     le.byteCount = 0;
     AddLogEntry(std::move(le));
@@ -1804,7 +1885,7 @@ void MainWindow::CreateTooltips()
     };
 
     // ---- Connection group ----
-    tip(m_hEditIP,           L"Server IP address or hostname to connect to.");
+    tip(m_hComboHost,        L"Server IP address or hostname. Select from recent connections or type a new one.");
     tip(m_hEditPort,         L"Server port number (1\u201365535).");
     tip(m_hEditTimeout,      L"Connection timeout in seconds. Enter 0 to wait indefinitely.");
     tip(m_hComboProtocol,    L"Protocol:\n  TCP \u2014 reliable, ordered stream connection.\n  UDP \u2014 fast, connectionless datagrams (no delivery guarantee).");

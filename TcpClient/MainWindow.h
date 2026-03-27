@@ -93,7 +93,7 @@ private:
     HFONT   m_hFontMono     {nullptr};   // mono font for recv
 
     // Connection panel
-    HWND    m_hEditIP       {nullptr};
+    HWND    m_hComboHost    {nullptr};
     HWND    m_hEditPort     {nullptr};
     HWND    m_hEditTimeout  {nullptr};
     HWND    m_hBtnConnect   {nullptr};
@@ -197,4 +197,10 @@ private:
 
     // Splitter ratios (fraction of client width for send pane)
     float   m_splitRatio    {0.5f};
+
+    // Connection history
+    std::vector<std::wstring> m_connHistory;
+    void    PopulateHostCombo();
+    void    OnHostComboSelChange();
+    void    DoParseComboParts();
 };

@@ -152,4 +152,85 @@ namespace Utils
         std::wostringstream ss; ss << std::fixed << std::setprecision(2) << bytes/(1024.0*1024.0) << L" MB"; return ss.str();
     }
 
+    // ---- Input validation ----------------------------------
+    inline bool IsValidPort(const std::wstring& s, int& portOut) {
+        if (s.empty()) return false;
+        for (wchar_t c : s) { if (c < L'0' || c > L'9') return false; }
+        int v = _wtoi(s.c_str());
+        if (v < 1 || v > 65535) return false;
+        portOut = v;
+        return true;
+    }
+
+    inline bool IsValidHostOrIP(const std::wstring& s) {
+        if (s.empty()) return false;
+        // Reject strings with spaces or control chars
+        for (wchar_t c : s) {
+            if (c <= 0x20 || c == 0x7F) return false;
+        }
+        // Must start and end with alphanumeric or digit (not '.' or '-')
+        wchar_t first = s.front(), last = s.back();
+        if (!iswalnum(first) && first != L'[') return false; // '[' for IPv6 bracket notation
+        if (!iswalnum(last) && last != L']') return false;
+        return true;
+    }
+
+    inline bool IsPortAvailable(int port, bool udp) {
+        WSADATA wsa;
+        bool needInit = (WSAStartup(MAKEWORD(2, 2), &wsa) == 0);
+
+        SOCKET s = socket(AF_INET, udp ? SOCK_DGRAM : SOCK_STREAM,
+                          udp ? IPPROTO_UDP : IPPROTO_TCP);
+        if (s == INVALID_SOCKET) {
+            if (needInit) WSACleanup();
+            return false;
+        }
+        sockaddr_in addr = {};
+        addr.sin_family      = AF_INET;
+        addr.sin_port        = htons((u_short)port);
+        addr.sin_addr.s_addr = INADDR_ANY;
+        bool ok = (bind(s, (sockaddr*)&addr, sizeof(addr)) != SOCKET_ERROR);
+        closesocket(s);
+        if (needInit) WSACleanup();
+        return ok;
+    }
+
+    // ---- Connection history ---------------------------------
+    inline std::wstring GetHistoryFilePath(const wchar_t* appName) {
+        wchar_t appData[MAX_PATH] = {};
+        if (!GetEnvironmentVariableW(L"APPDATA", appData, MAX_PATH)) return {};
+        std::wstring dir = std::wstring(appData) + L"\\TcpTools";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        return dir + L"\\" + appName + L"_history.txt";
+    }
+
+    inline std::vector<std::wstring> LoadHistory(const wchar_t* appName) {
+        std::vector<std::wstring> entries;
+        std::wstring path = GetHistoryFilePath(appName);
+        if (path.empty()) return entries;
+        std::wifstream f(path);
+        if (!f) return entries;
+        std::wstring line;
+        while (std::getline(f, line)) {
+            if (!line.empty()) entries.push_back(line);
+        }
+        return entries;
+    }
+
+    inline void SaveHistory(const wchar_t* appName, const std::wstring& entry,
+                            std::vector<std::wstring>& entries, int maxEntries = 10) {
+        // Remove duplicate if present
+        entries.erase(std::remove(entries.begin(), entries.end(), entry), entries.end());
+        // Insert at front (most recent first)
+        entries.insert(entries.begin(), entry);
+        // Limit size
+        if ((int)entries.size() > maxEntries) entries.resize(maxEntries);
+        // Write to file
+        std::wstring path = GetHistoryFilePath(appName);
+        if (path.empty()) return;
+        std::wofstream f(path, std::ios::trunc);
+        if (!f) return;
+        for (auto& e : entries) f << e << L"\n";
+    }
+
 } // namespace Utils

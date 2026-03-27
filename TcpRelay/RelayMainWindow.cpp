@@ -2,6 +2,7 @@
 #include "RelayMainWindow.h"
 #include "HexView.h"
 #include "resource.h"
+#include "../Version.h"
 
 // ============================================================
 //  RelayMainWindow implementation
@@ -34,7 +35,7 @@ HWND RelayMainWindow::Create(HINSTANCE hInst, int nCmdShow)
     s_instance = self;
 
     HWND hWnd = CreateWindowExW(
-        0, WndClassName, L"TCP/UDP Relay v26.3.1",
+        0, WndClassName, L"TCP/UDP Relay v" TCPTOOLS_VERSION,
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT, 1200, 800,
         nullptr, nullptr, hInst, self);
@@ -113,8 +114,8 @@ LRESULT RelayMainWindow::HandleMessage(HWND hWnd, UINT msg, WPARAM wParam, LPARA
     case WM_KEYDOWN:
         if (wParam == VK_F1) {
             MessageBoxW(hWnd,
-                L"TCP/UDP Relay v26.3.1\n\nCopyright \u00A9 2026 Bendik Eide.\nAll rights reserved.",
-                L"About TCP/UDP Relay v26.3.1", MB_OK | MB_ICONINFORMATION);
+                L"TCP/UDP Relay v" TCPTOOLS_VERSION L"\n\n" TCPTOOLS_COPYRIGHT,
+                L"About TCP/UDP Relay v" TCPTOOLS_VERSION, MB_OK | MB_ICONINFORMATION);
             return 0;
         }
         break;
@@ -180,6 +181,10 @@ LRESULT RelayMainWindow::HandleMessage(HWND hWnd, UINT msg, WPARAM wParam, LPARA
         OnRelayTargetConnecting();
         return 0;
 
+    case WM_PARSE_TARGET_COMBO:
+        DoParseComboParts();
+        return 0;
+
     case WM_DESTROY:
         if (m_network) m_network->StopRelay();
         if (m_hImgListLog) ImageList_Destroy(m_hImgListLog);
@@ -207,22 +212,30 @@ void RelayMainWindow::OnCreate(HWND hWnd)
     m_hEditListenPort = MakeEdit(hWnd, hI, IDC_EDIT_LISTEN_PORT, 88, y0, 55, 22, L"9001");
 
     MakeLabel(hWnd, hI, L"Target:", 155, y0 + 2, 45, 18);
-    m_hEditTargetIP = MakeEdit(hWnd, hI, IDC_EDIT_TARGET_IP, 200, y0, 115, 22, L"127.0.0.1");
-    MakeLabel(hWnd, hI, L":", 318, y0 + 2, 8, 18);
-    m_hEditTargetPort = MakeEdit(hWnd, hI, IDC_EDIT_TARGET_PORT, 328, y0, 55, 22, L"9002");
+    m_hComboTarget = CreateWindowExW(0, L"COMBOBOX", L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWN | CBS_AUTOHSCROLL,
+        200, y0, 155, 200, hWnd, (HMENU)(INT_PTR)IDC_COMBO_TARGET, hI, nullptr);
+    SetWindowTextW(m_hComboTarget, L"127.0.0.1");
+    MakeLabel(hWnd, hI, L":", 358, y0 + 2, 8, 18);
+    m_hEditTargetPort = MakeEdit(hWnd, hI, IDC_EDIT_TARGET_PORT, 368, y0, 55, 22, L"9002");
 
-    MakeLabel(hWnd, hI, L"Protocol:", 395, y0 + 2, 55, 18);
+    // Load target history and populate combo
+    m_targetHistory = Utils::LoadHistory(L"TcpRelay");
+    PopulateTargetCombo();
+    DoParseComboParts();
+
+    MakeLabel(hWnd, hI, L"Protocol:", 435, y0 + 2, 55, 18);
     m_hComboProtocol = CreateWindowExW(0, L"COMBOBOX", nullptr,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
-        452, y0, 70, 200, hWnd, (HMENU)IDC_COMBO_PROTOCOL, hI, nullptr);
+        492, y0, 70, 200, hWnd, (HMENU)IDC_COMBO_PROTOCOL, hI, nullptr);
     SendMessageW(m_hComboProtocol, CB_ADDSTRING, 0, (LPARAM)L"TCP");
     SendMessageW(m_hComboProtocol, CB_ADDSTRING, 0, (LPARAM)L"UDP");
     SendMessageW(m_hComboProtocol, CB_SETCURSEL, 0, 0);
 
-    MakeLabel(hWnd, hI, L"Timeout:", 535, y0 + 2, 52, 18);
-    m_hEditTimeout  = MakeEdit(hWnd, hI, IDC_EDIT_TIMEOUT, 588, y0, 35, 22, L"5");
-    MakeLabel(hWnd, hI, L"s", 626, y0 + 2, 10, 18);
-    m_hChkNoTimeout = MakeCheckbox(hWnd, hI, IDC_CHK_NO_TIMEOUT, 640, y0 + 2, 90, 18, L"No timeout", false);
+    MakeLabel(hWnd, hI, L"Timeout:", 575, y0 + 2, 52, 18);
+    m_hEditTimeout  = MakeEdit(hWnd, hI, IDC_EDIT_TIMEOUT, 628, y0, 35, 22, L"5");
+    MakeLabel(hWnd, hI, L"s", 666, y0 + 2, 10, 18);
+    m_hChkNoTimeout = MakeCheckbox(hWnd, hI, IDC_CHK_NO_TIMEOUT, 680, y0 + 2, 90, 18, L"No timeout", false);
 
     // ---- Row 1: Start/Stop + Status + Connection indicators ----
     int y1 = y0 + 28;
@@ -586,6 +599,10 @@ void RelayMainWindow::OnCommand(HWND hWnd, int id, int code, HWND hCtl)
             RefreshLogView();
         }
         break;
+
+    case IDC_COMBO_TARGET:
+        if (code == CBN_SELCHANGE) OnTargetComboSelChange();
+        break;
     }
 }
 
@@ -744,19 +761,90 @@ void RelayMainWindow::ClearLog()
     InvalidateRect(m_hListLog, nullptr, TRUE);
 }
 
+// ---- Connection history helpers --------------------------------
+
+void RelayMainWindow::PopulateTargetCombo()
+{
+    SendMessageW(m_hComboTarget, CB_RESETCONTENT, 0, 0);
+    for (auto& e : m_targetHistory)
+        SendMessageW(m_hComboTarget, CB_ADDSTRING, 0, (LPARAM)e.c_str());
+}
+
+void RelayMainWindow::OnTargetComboSelChange()
+{
+    // Defer parsing: Windows overwrites the combo edit text AFTER
+    // CBN_SELCHANGE returns, so we post a message to parse later.
+    PostMessageW(m_hWnd, WM_PARSE_TARGET_COMBO, 0, 0);
+}
+
+void RelayMainWindow::DoParseComboParts()
+{
+    std::wstring text = Utils::GetWindowText(m_hComboTarget);
+    auto pos = text.rfind(L':');
+    if (pos != std::wstring::npos && pos > 0 && pos < text.size() - 1) {
+        std::wstring host = text.substr(0, pos);
+        std::wstring port = text.substr(pos + 1);
+        int p = 0;
+        if (Utils::IsValidPort(port, p)) {
+            SetWindowTextW(m_hComboTarget, host.c_str());
+            SetWindowTextW(m_hEditTargetPort, port.c_str());
+        }
+    }
+}
+
 // ---- Actions ---------------------------------------------------
 
 void RelayMainWindow::DoStartRelay()
 {
-    int listenPort = Utils::GetDlgInt(m_hWnd, IDC_EDIT_LISTEN_PORT, 9001);
-    std::string targetIP = Utils::ToUTF8(Utils::GetWindowText(m_hEditTargetIP));
-    int targetPort = Utils::GetDlgInt(m_hWnd, IDC_EDIT_TARGET_PORT, 9002);
+    // Validate listen port
+    std::wstring listenPortW = Utils::GetWindowText(GetDlgItem(m_hWnd, IDC_EDIT_LISTEN_PORT));
+    int listenPort = 0;
+    if (!Utils::IsValidPort(listenPortW, listenPort)) {
+        MessageBoxW(m_hWnd, L"Please enter a valid listen port (1\u201365535).", L"Invalid port", MB_ICONWARNING);
+        SetFocus(GetDlgItem(m_hWnd, IDC_EDIT_LISTEN_PORT));
+        return;
+    }
+
+    // Parse "host:port" from combo if the user typed/pasted a combined value
+    std::wstring targetW = Utils::GetWindowText(m_hComboTarget);
+    auto colon = targetW.rfind(L':');
+    if (colon != std::wstring::npos && colon > 0 && colon < targetW.size() - 1) {
+        std::wstring maybePort = targetW.substr(colon + 1);
+        int p = 0;
+        if (Utils::IsValidPort(maybePort, p)) {
+            targetW = targetW.substr(0, colon);
+            SetWindowTextW(m_hComboTarget, targetW.c_str());
+            SetWindowTextW(GetDlgItem(m_hWnd, IDC_EDIT_TARGET_PORT), maybePort.c_str());
+        }
+    }
+
+    // Validate target host/IP
+    if (!Utils::IsValidHostOrIP(targetW)) {
+        MessageBoxW(m_hWnd, L"Please enter a valid target hostname or IP address.", L"Invalid target", MB_ICONWARNING);
+        SetFocus(m_hComboTarget);
+        return;
+    }
+    std::string targetIP = Utils::ToUTF8(targetW);
+
+    // Validate target port
+    std::wstring targetPortW = Utils::GetWindowText(GetDlgItem(m_hWnd, IDC_EDIT_TARGET_PORT));
+    int targetPort = 0;
+    if (!Utils::IsValidPort(targetPortW, targetPort)) {
+        MessageBoxW(m_hWnd, L"Please enter a valid target port (1\u201365535).", L"Invalid port", MB_ICONWARNING);
+        SetFocus(GetDlgItem(m_hWnd, IDC_EDIT_TARGET_PORT));
+        return;
+    }
+
     bool noTimeout = (SendMessageW(m_hChkNoTimeout, BM_GETCHECK, 0, 0) == BST_CHECKED);
     int timeout    = noTimeout ? 0 : Utils::GetDlgInt(m_hWnd, IDC_EDIT_TIMEOUT, 5);
     bool udpMode   = (SendMessageW(m_hComboProtocol, CB_GETCURSEL, 0, 0) == 1);
 
-    if (targetIP.empty()) {
-        MessageBoxW(m_hWnd, L"Please enter a target IP address.", L"Relay", MB_ICONWARNING);
+    // Check if listen port is already in use
+    if (!Utils::IsPortAvailable(listenPort, udpMode)) {
+        wchar_t msg[128];
+        swprintf_s(msg, L"Listen port %d is already in use.\nPlease choose a different port.", listenPort);
+        MessageBoxW(m_hWnd, msg, L"Port busy", MB_ICONWARNING);
+        SetFocus(GetDlgItem(m_hWnd, IDC_EDIT_LISTEN_PORT));
         return;
     }
 
@@ -768,6 +856,15 @@ void RelayMainWindow::DoStartRelay()
     }
 
     SetRelayUI(true);
+
+    // Save target to history
+    {
+        std::wstring entry = Utils::ToWide(targetIP) + L":" + std::to_wstring(targetPort);
+        Utils::SaveHistory(L"TcpRelay", entry, m_targetHistory);
+        PopulateTargetCombo();
+        SetWindowTextW(m_hComboTarget, Utils::ToWide(targetIP).c_str());
+    }
+
     std::wstring proto = udpMode ? L"UDP" : L"TCP";
     AddLogEntry(LogType::Info, L"-", 0,
                 L"[" + proto + L"] Starting relay: listen " + std::to_wstring(listenPort) +
@@ -917,7 +1014,7 @@ void RelayMainWindow::SetRelayUI(bool listening)
 
     // Disable config while running
     EnableWindow(m_hEditListenPort, !listening);
-    EnableWindow(m_hEditTargetIP,   !listening);
+    EnableWindow(m_hComboTarget,    !listening);
     EnableWindow(m_hEditTargetPort, !listening);
     EnableWindow(m_hComboProtocol,  !listening);
     EnableWindow(m_hChkNoTimeout,   !listening);
@@ -958,7 +1055,7 @@ void RelayMainWindow::UpdateStats()
     Utils::SetWindowText(m_hStatT2CBytes, L"T\u2192C bytes forwarded: " + Utils::FormatBytes(m_bytesT2C));
     Utils::SetWindowText(m_hStatT2CPkts,  L"T\u2192C packets: " + std::to_wstring(m_packetsT2C));
     Utils::SetWindowText(m_hStatClients,  L"Client: " + (m_clientAddr.empty() ? L"-" : m_clientAddr));
-    std::wstring tgt = Utils::GetWindowText(m_hEditTargetIP) + L":" + Utils::GetWindowText(m_hEditTargetPort);
+    std::wstring tgt = Utils::GetWindowText(m_hComboTarget) + L":" + Utils::GetWindowText(m_hEditTargetPort);
     Utils::SetWindowText(m_hStatTarget,   L"Target: " + tgt);
 }
 
@@ -1136,7 +1233,7 @@ void RelayMainWindow::OnRelayClientConn(const std::wstring& addr)
     m_clientAddr = addr;
     std::wstring proto = m_network ? m_network->GetProtocolStr() : L"TCP";
     bool targetOk = m_network && m_network->IsTargetConnected();
-    std::wstring tgt = Utils::GetWindowText(m_hEditTargetIP) + L":" + Utils::GetWindowText(m_hEditTargetPort);
+    std::wstring tgt = Utils::GetWindowText(m_hComboTarget) + L":" + Utils::GetWindowText(m_hEditTargetPort);
     Utils::SetWindowText(m_hStaticStatus,
         targetOk ? L"[" + proto + L"] Relaying: " + addr + L" \u2194 " + tgt
                  : L"[" + proto + L"] Client: " + addr + L" | Target: connecting...");
@@ -1168,7 +1265,7 @@ void RelayMainWindow::OnRelayClientDisconn()
 void RelayMainWindow::OnRelayTargetConn()
 {
     std::wstring proto = m_network ? m_network->GetProtocolStr() : L"TCP";
-    std::wstring tgt = Utils::GetWindowText(m_hEditTargetIP) + L":" + Utils::GetWindowText(m_hEditTargetPort);
+    std::wstring tgt = Utils::GetWindowText(m_hComboTarget) + L":" + Utils::GetWindowText(m_hEditTargetPort);
     m_targetAddr = tgt;
     Utils::SetWindowText(m_hStaticTargetInd, L"\u25CF Target: " + tgt);
     if (m_clientAddr.empty())
@@ -1217,15 +1314,15 @@ void RelayMainWindow::OnRelayTargetConnecting()
 void RelayMainWindow::UpdateTitle()
 {
     if (!m_isListening) {
-        SetWindowTextW(m_hWnd, L"TCP Relay v26.3.1");
+        SetWindowTextW(m_hWnd, L"TCP Relay v" TCPTOOLS_VERSION);
         return;
     }
     std::wstring lp  = Utils::GetWindowText(m_hEditListenPort);
-    std::wstring tip = Utils::GetWindowText(m_hEditTargetIP);
+    std::wstring tip = Utils::GetWindowText(m_hComboTarget);
     std::wstring tp  = Utils::GetWindowText(m_hEditTargetPort);
     bool targetOk = m_network && m_network->IsTargetConnected();
     bool clientOk = m_network && m_network->IsClientConnected();
-    std::wstring title = L"TCP Relay v26.3.1  \u2013  :";
+    std::wstring title = L"TCP Relay v" TCPTOOLS_VERSION L"  \u2013  :";
     title += lp + L" \u2192 " + tip + L":" + tp;
     if (clientOk && targetOk)
         title += L"  (Relaying)";
@@ -1344,7 +1441,7 @@ void RelayMainWindow::CreateTooltips()
 
     // ---- Config row ----
     tip(m_hEditListenPort, L"Port this relay listens on for incoming client connections.");
-    tip(m_hEditTargetIP,   L"IP address or hostname of the upstream server to forward traffic to.");
+    tip(m_hComboTarget,   L"IP address or hostname of the upstream server. Select from recent targets or type a new one.");
     tip(m_hEditTargetPort, L"Port on the upstream server.");
     tip(m_hComboProtocol,  L"Protocol:\n  TCP \u2014 reliable, ordered stream relay.\n  UDP \u2014 connectionless datagram relay.");
     tip(m_hEditTimeout,    L"Connection timeout in seconds when connecting to the target server.");

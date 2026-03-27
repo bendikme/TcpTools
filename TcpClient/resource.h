@@ -5,7 +5,7 @@
 #define IDI_APPICON             102
 
 // Connection controls
-#define IDC_EDIT_IP             1001
+#define IDC_COMBO_HOST          1001
 #define IDC_EDIT_PORT           1002
 #define IDC_EDIT_TIMEOUT        1003
 #define IDC_BTN_CONNECT         1004
@@ -97,3 +97,4 @@
 #define WM_NET_ERROR            (WM_APP + 4)
 #define WM_NET_SEND_COMPLETE    (WM_APP + 5)
 #define WM_NET_RECV_LATENCY     (WM_APP + 6)
+#define WM_PARSE_HOST_COMBO     (WM_APP + 20)
