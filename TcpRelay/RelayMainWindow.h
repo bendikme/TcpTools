@@ -69,6 +69,7 @@ private:
     void RefreshT2CView();
     void UpdateTitle();
     void CreateTooltips();
+    void PositionHelpButton();
 
     // ---- Network events ----
     void OnRelayListening(int port);
@@ -182,6 +183,8 @@ private:
     bool         m_hexModeC2T    {false};  // false = text view, true = hex view
     bool         m_hexModeT2C    {false};
     HWND         m_hTooltip      {nullptr};
+    HWND         m_hBtnHelp      {nullptr};
+    bool         m_tooltipsEnabled {false};
 
     // Connection history
     std::vector<std::wstring> m_targetHistory;

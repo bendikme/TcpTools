@@ -140,8 +140,54 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
     case WM_KEYDOWN:
         if (wParam == VK_F1) {
             MessageBoxW(hWnd,
-                L"TCP Client v" TCPTOOLS_VERSION L"\n\n" TCPTOOLS_COPYRIGHT,
-                L"About TCP Client v" TCPTOOLS_VERSION, MB_OK | MB_ICONINFORMATION);
+                L"TCP/UDP Client v" TCPTOOLS_VERSION L"\n"
+                TCPTOOLS_COPYRIGHT L"\n"
+                L"\n"
+                L"\u2500\u2500\u2500 GETTING STARTED \u2500\u2500\u2500\n"
+                L"\n"
+                L"1. Enter the server address and port at the top.\n"
+                L"You can type host:port (e.g. 192.168.1.10:502) "
+                L"and both fields are filled automatically.\n"
+                L"2. Choose TCP or UDP and set the timeout.\n"
+                L"3. Click Connect (or enable Auto-Connect).\n"
+                L"4. Type data in the Send editor and click Send.\n"
+                L"5. Incoming data appears in the Receive panel.\n"
+                L"\n"
+                L"\u2500\u2500\u2500 KEYBOARD SHORTCUTS \u2500\u2500\u2500\n"
+                L"\n"
+                L"\u2022 Ctrl+Enter \u2014 Send data\n"
+                L"\u2022 F1 \u2014 This help screen\n"
+                L"\n"
+                L"\u2500\u2500\u2500 FEATURES \u2500\u2500\u2500\n"
+                L"\n"
+                L"\u2022 Hex View \u2014 Send/receive data as hex bytes.\n"
+                L"\u2022 Framing \u2014 Auto-wrap payloads with STX/ETX, "
+                L"CR LF, LF, CR, NUL, or custom hex delimiters.\n"
+                L"\u2022 Cyclic Send \u2014 Repeat the payload at a timed "
+                L"interval (down to 1 ms) for stress testing.\n"
+                L"\u2022 Auto-Connect \u2014 Connect on demand when sending.\n"
+                L"\u2022 Auto-Disconnect \u2014 Drop after each send.\n"
+                L"\u2022 Keep-Alive \u2014 Detect broken connections early.\n"
+                L"\u2022 Load/Save \u2014 Load files into send editor, "
+                L"save received data to disk.\n"
+                L"\u2022 Connection History \u2014 Dropdown remembers recent "
+                L"host:port entries across sessions.\n"
+                L"\n"
+                L"\u2500\u2500\u2500 BOTTOM PANEL \u2500\u2500\u2500\n"
+                L"\n"
+                L"\u2022 Log \u2014 Full event history. Right-click to reload "
+                L"data or copy previews.\n"
+                L"\u2022 Diagnostics \u2014 Live socket info (buffers, Nagle, "
+                L"MTU, keep-alive).\n"
+                L"\u2022 Statistics \u2014 Timing, byte counts, latency, "
+                L"and throughput.\n"
+                L"\n"
+                L"\u2500\u2500\u2500 TIPS \u2500\u2500\u2500\n"
+                L"\n"
+                L"\u2022 Click the [?] button to enable help tooltips.\n"
+                L"\u2022 Command-line: TcpClient.exe [host] [port]\n"
+                L"\u2022 Config stored in: %APPDATA%\\TcpTools\\\n",
+                L"TCP/UDP Client \u2014 Help", MB_OK | MB_ICONINFORMATION);
             return 0;
         }
         break;
@@ -499,7 +545,13 @@ void MainWindow::OnCreate(HWND hWnd, HINSTANCE hInst,
     RECT rc; GetClientRect(hWnd, &rc);
     LayoutControls(rc.right, rc.bottom);
 
-    // Tooltips
+    // Help toggle button (top-right "?")
+    m_hBtnHelp = CreateWindowExW(0, L"BUTTON", L"?",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | BS_PUSHLIKE,
+        0,0,10,10, hWnd, (HMENU)(UINT_PTR)IDC_BTN_HELP, hInst, nullptr);
+    SendMessage(m_hBtnHelp, WM_SETFONT, (WPARAM)m_hFont, TRUE);
+
+    // Tooltips (start disabled)
     CreateTooltips();
 
     // Auto-connect after the window is visible (post so WM_CREATE returns first)
@@ -513,6 +565,12 @@ void MainWindow::OnCreate(HWND hWnd, HINSTANCE hInst,
 void MainWindow::OnSize(int w, int h)
 {
     LayoutControls(w, h);
+    PositionHelpButton();
+}
+
+void MainWindow::PositionHelpButton()
+{
+    // Positioned inside LayoutControls
 }
 
 void MainWindow::OnGetMinMaxInfo(MINMAXINFO* mm)
@@ -550,6 +608,7 @@ void MainWindow::LayoutControls(int W, int H)
     Move(m_hBtnConnect,    cx, cy, BTN_W,   ROW_H); cx += BTN_W + 4;
     Move(m_hBtnDisconnect, cx, cy, BTN_W,   ROW_H); cx += BTN_W + 2*MARGIN;
     Move(m_hStaticStatus,  cx, cy, 200, ROW_H);
+    Move(m_hBtnHelp, W - 2*MARGIN - 26, cy, 26, ROW_H);
 
     // Row 2: checkboxes
     cx = x + MARGIN + 2;
@@ -826,6 +885,11 @@ void MainWindow::OnCommand(WORD id, WORD notify, HWND hCtrl)
 
     case IDC_BTN_REFRESHDIAG:
         RefreshDiagnostics();
+        break;
+
+    case IDC_BTN_HELP:
+        m_tooltipsEnabled = (Button_GetCheck(m_hBtnHelp) == BST_CHECKED);
+        SendMessageW(m_hTooltip, TTM_ACTIVATE, m_tooltipsEnabled ? TRUE : FALSE, 0);
         break;
 
     case IDC_COMBO_LOGFILTER:
@@ -1871,7 +1935,11 @@ void MainWindow::CreateTooltips()
         CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
         m_hWnd, nullptr, m_hInst, nullptr);
     if (!m_hTooltip) return;
-    SendMessageW(m_hTooltip, TTM_SETMAXTIPWIDTH, 0, 360);
+    SendMessageW(m_hTooltip, TTM_SETMAXTIPWIDTH, 0, 420);
+    SendMessageW(m_hTooltip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 30000);
+    SendMessageW(m_hTooltip, TTM_SETDELAYTIME, TTDT_INITIAL,  1200);
+    SendMessageW(m_hTooltip, TTM_SETDELAYTIME, TTDT_RESHOW,    200);
+    SendMessageW(m_hTooltip, TTM_ACTIVATE, FALSE, 0);  // start disabled
 
     auto tip = [&](HWND ctrl, const wchar_t* text) {
         if (!ctrl) return;
@@ -1884,48 +1952,283 @@ void MainWindow::CreateTooltips()
         SendMessageW(m_hTooltip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
     };
 
-    // ---- Connection group ----
-    tip(m_hComboHost,        L"Server IP address or hostname. Select from recent connections or type a new one.");
-    tip(m_hEditPort,         L"Server port number (1\u201365535).");
-    tip(m_hEditTimeout,      L"Connection timeout in seconds. Enter 0 to wait indefinitely.");
-    tip(m_hComboProtocol,    L"Protocol:\n  TCP \u2014 reliable, ordered stream connection.\n  UDP \u2014 fast, connectionless datagrams (no delivery guarantee).");
-    tip(m_hBtnConnect,       L"Open a connection to the configured server.");
-    tip(m_hBtnDisconnect,    L"Close the current connection.");
-    tip(m_hChkKeepAlive,     L"Enable TCP keep-alive probes so broken connections are detected and reported early.");
-    tip(m_hChkAutoDisc,      L"Disconnect automatically after every send. Useful for testing request/response protocols where a fresh connection is needed each time.");
-    tip(m_hChkAutoConnect,   L"Connect automatically before sending if not already connected. The send is deferred until the connection is established.");
+    // ================================================================
+    //  CONNECTION GROUP
+    // ================================================================
+    tip(m_hComboHost,
+        L"Server address \u2014 IP or hostname of the remote server.\n\n"
+        L"You can type a new address or pick one from the dropdown, "
+        L"which stores your recent connections automatically.\n\n"
+        L"Supported formats:\n"
+        L"\u2022 IPv4 address: 192.168.1.10\n"
+        L"\u2022 IPv6 address: ::1 or [::1]\n"
+        L"\u2022 Hostname: myserver.local\n"
+        L"\u2022 host:port shortcut: 192.168.1.10:9001\n"
+        L"   (auto-fills both Host and Port fields)");
 
-    // ---- Send group ----
-    tip(m_hEditSend,         L"Type the data to send here. Press Ctrl+Enter to send without clicking the button.");
-    tip(m_hBtnSend,          L"Send the editor contents to the server.  [Shortcut: Ctrl+Enter]");
-    tip(m_hBtnLoadFile,      L"Load a binary or text file from disk into the send editor.");
-    tip(m_hBtnClearSend,     L"Clear the send editor.");
-    tip(m_hChkHexSend,       L"Hex View \u2014 enter and display send data as space-separated hex byte pairs (e.g.  48 65 6C 6C 6F).");
-    tip(m_hChkAutoClearSend, L"Clear the send editor automatically after each successful send.");
-    tip(m_hComboSep,         L"Framing \u2014 wraps the payload with a delimiter before sending:\n"
-                              L"  None     \u2014 no extra bytes added\n"
-                              L"  STX/ETX  \u2014 0x02 \u2026 0x03\n"
-                              L"  CR LF    \u2014 0x0D 0x0A\n"
-                              L"  LF / CR / NUL\n"
-                              L"  Custom   \u2014 enter your own prefix and suffix as hex bytes");
-    tip(m_hEditPreFix,       L"Custom framing prefix as hex bytes (e.g.  AA BB CC). Prepended before every send.");
-    tip(m_hEditSufFix,       L"Custom framing suffix as hex bytes (e.g.  0D 0A). Appended after every send.");
+    tip(m_hEditPort,
+        L"Server port number (1\u201365535).\n\n"
+        L"Common ports:\n"
+        L"\u2022 80 / 443 \u2014 HTTP / HTTPS\n"
+        L"\u2022 23 \u2014 Telnet\n"
+        L"\u2022 502 \u2014 Modbus TCP\n"
+        L"\u2022 9001\u201365535 \u2014 typical custom services");
 
-    // ---- Cyclic send ----
-    tip(m_hEditCyclicInterval, L"Cyclic send interval in seconds (minimum 0.001 s = 1 ms). Examples: 1.0, 0.5, 0.1.");
-    tip(m_hBtnCyclicStart,   L"Start / stop sending the current payload repeatedly at the configured interval.");
+    tip(m_hEditTimeout,
+        L"Connection timeout in seconds.\n\n"
+        L"How long to wait for the TCP handshake or first "
+        L"UDP response before giving up.\n\n"
+        L"\u2022 Enter 0 to wait indefinitely.\n"
+        L"\u2022 Typical values: 3\u201310 seconds.\n"
+        L"\u2022 Use a longer timeout for remote/VPN hosts.");
 
-    // ---- Receive group ----
-    tip(m_hEditRecv,         L"Data received from the server (read-only). New data is appended as it arrives.");
-    tip(m_hBtnClearRecv,     L"Clear the receive display.");
-    tip(m_hBtnCopyRecv,      L"Copy all received data to the clipboard.");
-    tip(m_hBtnSaveRecv,      L"Save the data from the last received transmission to a file.\nOnly the most recent send/receive cycle is kept.");
-    tip(m_hChkHexRecv,       L"Hex View \u2014 display received data as hexadecimal bytes.");
-    tip(m_hChkAutoClearRecv, L"Clear the receive display automatically before each incoming message.");
+    tip(m_hComboProtocol,
+        L"Network protocol to use for this connection.\n\n"
+        L"TCP \u2014 Transmission Control Protocol.\n"
+        L"Reliable, ordered, byte-stream delivery. "
+        L"Best for most application protocols.\n\n"
+        L"UDP \u2014 User Datagram Protocol.\n"
+        L"Fast, connectionless datagrams. "
+        L"No delivery guarantee or ordering. "
+        L"Use for DNS, SNMP, Syslog, game traffic, etc.");
 
-    // ---- Bottom panel ----
-    tip(m_hBtnClearLog,      L"Remove all entries from the history log.");
-    tip(m_hComboLogFilter,   L"Filter the log:\n  All | Data only | Connection events | Errors");
-    tip(m_hBtnRefreshDiag,   L"Refresh live socket diagnostics: buffer sizes, Nagle algorithm state, keep-alive, estimated MTU.");
-    tip(m_hBtnClearStats,    L"Reset all timing and byte-count statistics to zero.");
+    tip(m_hBtnConnect,
+        L"Open a connection to the server.\n\n"
+        L"Uses the Host, Port, Protocol, and Timeout fields. "
+        L"The connection is established in the background; "
+        L"the status bar shows progress and result.\n\n"
+        L"TIP: If \u2018Auto-Connect\u2019 is checked, you don\u2019t need "
+        L"to click this \u2014 it connects when you send data.");
+
+    tip(m_hBtnDisconnect,
+        L"Close the current connection gracefully.\n\n"
+        L"Sends a TCP FIN (or discards the UDP socket) "
+        L"and returns to the idle state.");
+
+    tip(m_hChkKeepAlive,
+        L"Enable TCP keep-alive probes.\n\n"
+        L"The OS sends periodic probe packets on an idle connection "
+        L"so that a broken link (cable unplugged, remote crash) "
+        L"is detected within seconds instead of waiting for the "
+        L"next send to fail.\n\n"
+        L"Recommended for long-lived connections.");
+
+    tip(m_hChkAutoDisc,
+        L"Auto-Disconnect after every send.\n\n"
+        L"The connection is closed immediately after each payload "
+        L"is transmitted. Useful for protocols that expect a fresh "
+        L"connection per request (e.g. some HTTP/1.0 or industrial "
+        L"protocols).\n\n"
+        L"Can be combined with Auto-Connect for fully automatic "
+        L"connect \u2192 send \u2192 disconnect cycles.");
+
+    tip(m_hChkAutoConnect,
+        L"Auto-Connect before sending.\n\n"
+        L"When checked, clicking Send (or pressing Ctrl+Enter) "
+        L"will automatically establish the connection first if "
+        L"the client is not already connected. The data is "
+        L"queued and transmitted as soon as the link is up.\n\n"
+        L"Combine with Auto-Disconnect for one-shot send cycles.");
+
+    tip(m_hStaticStatus,
+        L"Connection status indicator.\n\n"
+        L"Shows the current state of the connection:\n"
+        L"\u2022 Disconnected \u2014 no active connection\n"
+        L"\u2022 Connecting... \u2014 TCP handshake in progress\n"
+        L"\u2022 Connected \u2014 link is active and ready");
+
+    // ================================================================
+    //  SEND GROUP
+    // ================================================================
+    tip(m_hEditSend,
+        L"Send editor \u2014 type or paste the data to transmit.\n\n"
+        L"In text mode, type plain ASCII/UTF-8 text. "
+        L"In hex mode, enter space-separated hex pairs: "
+        L"48 65 6C 6C 6F (= \"Hello\").\n\n"
+        L"Keyboard shortcuts:\n"
+        L"\u2022 Ctrl+Enter \u2014 Send immediately\n"
+        L"\u2022 Ctrl+A \u2014 Select all text\n\n"
+        L"You can also load binary data from a file.");
+
+    tip(m_hBtnSend,
+        L"Send the current editor contents to the server.\n\n"
+        L"The payload is framed according to the Separator "
+        L"setting (prefix/suffix are added automatically).\n\n"
+        L"Shortcut: Ctrl+Enter");
+
+    tip(m_hBtnLoadFile,
+        L"Load a file from disk into the send editor.\n\n"
+        L"The entire file is read as raw bytes. If Hex View "
+        L"is active, data is shown as hex bytes; otherwise as text.\n\n"
+        L"Useful for sending binary protocols, captured packets, "
+        L"or template request files.");
+
+    tip(m_hBtnClearSend,
+        L"Clear the send editor and internal buffer.\n\n"
+        L"Both the text view and the hex view are reset.");
+
+    tip(m_hChkHexSend,
+        L"Toggle Hex View for the send editor.\n\n"
+        L"When checked, the editor displays and accepts data "
+        L"as space-separated hexadecimal byte pairs.\n"
+        L"Example: 48 65 6C 6C 6F = \"Hello\"\n\n"
+        L"Switching modes converts the current data between "
+        L"representations automatically.");
+
+    tip(m_hChkAutoClearSend,
+        L"Auto-clear the send editor after each send.\n\n"
+        L"When checked, the editor is emptied automatically "
+        L"after every successful transmission so you can "
+        L"immediately type a new message.");
+
+    tip(m_hComboSep,
+        L"Payload framing / delimiter.\n\n"
+        L"Wraps the data with a protocol-specific delimiter "
+        L"before it is transmitted:\n\n"
+        L"\u2022 None \u2014 raw data, no extra bytes\n"
+        L"\u2022 STX/ETX \u2014 0x02 ... 0x03 (industrial/POS)\n"
+        L"\u2022 CR LF \u2014 0x0D 0x0A (HTTP, SMTP, Telnet)\n"
+        L"\u2022 LF \u2014 0x0A (Unix-style)\n"
+        L"\u2022 CR \u2014 0x0D\n"
+        L"\u2022 NUL \u2014 0x00 (null-terminated)\n"
+        L"\u2022 Custom \u2014 your own prefix/suffix as hex");
+
+    tip(m_hEditPreFix,
+        L"Custom framing prefix (hex bytes).\n\n"
+        L"These bytes are prepended before every payload. "
+        L"Enter space-separated hex pairs, e.g. AA BB CC.\n\n"
+        L"Only active when Separator is set to \"Custom\".");
+
+    tip(m_hEditSufFix,
+        L"Custom framing suffix (hex bytes).\n\n"
+        L"These bytes are appended after every payload. "
+        L"Enter space-separated hex pairs, e.g. 0D 0A.\n\n"
+        L"Only active when Separator is set to \"Custom\".");
+
+    // ================================================================
+    //  CYCLIC SEND
+    // ================================================================
+    tip(m_hEditCyclicInterval,
+        L"Cyclic send interval in seconds.\n\n"
+        L"The current payload is sent repeatedly at this "
+        L"interval until you stop it.\n\n"
+        L"Minimum: 0.001 s (1 ms).\n"
+        L"Examples: 1.0, 0.5, 0.1, 0.01.\n\n"
+        L"WARNING: Very short intervals can flood the server.");
+
+    tip(m_hBtnCyclicStart,
+        L"Start / Stop cyclic (periodic) sending.\n\n"
+        L"When started, the current send-editor payload is "
+        L"transmitted repeatedly at the configured interval. "
+        L"The counter shows how many sends have been executed.\n\n"
+        L"Click again to stop the cycle.\n\n"
+        L"TIP: Combine with Auto-Connect and Auto-Disconnect "
+        L"to test connection cycling under load.");
+
+    tip(m_hStaticCyclicCount,
+        L"Cyclic send counter.\n\n"
+        L"Shows the number of payloads sent during the "
+        L"current cyclic send session. Resets to zero "
+        L"when a new cycle starts.");
+
+    // ================================================================
+    //  RECEIVE GROUP
+    // ================================================================
+    tip(m_hEditRecv,
+        L"Receive display (read-only).\n\n"
+        L"Incoming data from the server appears here in real time. "
+        L"New data is appended as it arrives.\n\n"
+        L"Switch between text and hex view with the Hex View "
+        L"checkbox. Use Copy or Save to export the data.");
+
+    tip(m_hBtnClearRecv,
+        L"Clear the receive display and internal buffer.\n\n"
+        L"Both the text view and the hex view are reset. "
+        L"The log history is NOT affected.");
+
+    tip(m_hBtnCopyRecv,
+        L"Copy all received data to the clipboard.\n\n"
+        L"Copies the entire contents of the receive display "
+        L"(text or hex, whichever is active).");
+
+    tip(m_hBtnSaveRecv,
+        L"Save received data to a file.\n\n"
+        L"Writes the raw bytes from the most recent send/receive "
+        L"cycle to a file on disk. Only the last transmission is "
+        L"kept \u2014 earlier data is overwritten when new data arrives.\n\n"
+        L"Useful for capturing binary responses or saving server "
+        L"output for offline analysis.");
+
+    tip(m_hChkHexRecv,
+        L"Toggle Hex View for the receive display.\n\n"
+        L"When checked, incoming data is shown as hexadecimal "
+        L"bytes with an ASCII sidebar. When unchecked, data is "
+        L"displayed as text.\n\n"
+        L"Switching modes re-renders all accumulated data.");
+
+    tip(m_hChkAutoClearRecv,
+        L"Auto-clear the receive display on new data.\n\n"
+        L"When checked, the display is cleared automatically "
+        L"each time new data arrives, so you only see the latest "
+        L"message. Useful for request/response testing.");
+
+    // ================================================================
+    //  BOTTOM PANEL
+    // ================================================================
+    tip(m_hTabBottom,
+        L"Bottom panel tabs.\n\n"
+        L"\u2022 Log \u2014 chronological history of all events "
+        L"(connections, sends, receives, errors). "
+        L"Right-click entries to reload or copy.\n\n"
+        L"\u2022 Diagnostics \u2014 live socket information: buffer sizes, "
+        L"Nagle state, keep-alive, MTU estimate.\n\n"
+        L"\u2022 Statistics \u2014 timing and byte counters for the "
+        L"current session.\n\n"
+        L"Press F1 for a complete help guide.");
+
+    tip(m_hBtnClearLog,
+        L"Clear all log entries.\n\n"
+        L"Removes every entry from the history log. "
+        L"This cannot be undone.");
+
+    tip(m_hComboLogFilter,
+        L"Filter which log entries are displayed.\n\n"
+        L"\u2022 All \u2014 show everything\n"
+        L"\u2022 Data only \u2014 only sent/received payloads\n"
+        L"\u2022 Connection \u2014 connect/disconnect events\n"
+        L"\u2022 Errors \u2014 only error messages\n\n"
+        L"The underlying log data is preserved; switching "
+        L"filters does not delete entries.");
+
+    tip(m_hBtnRefreshDiag,
+        L"Refresh socket diagnostics.\n\n"
+        L"Queries the active socket for live information:\n"
+        L"\u2022 Send/receive buffer sizes (SO_SNDBUF/SO_RCVBUF)\n"
+        L"\u2022 Nagle algorithm (TCP_NODELAY) state\n"
+        L"\u2022 Keep-alive probe status\n"
+        L"\u2022 Estimated path MTU (if available)\n\n"
+        L"Only available while a connection is active.");
+
+    tip(m_hBtnClearStats,
+        L"Reset all statistics to zero.\n\n"
+        L"Clears all timing values and byte counters:\n"
+        L"\u2022 Connection time\n"
+        L"\u2022 Send/Receive timestamps\n"
+        L"\u2022 Bytes sent/received\n"
+        L"\u2022 Latency and throughput\n"
+        L"\u2022 Cumulative totals");
+
+    tip(m_hListLog,
+        L"Event log \u2014 chronological history of all activity.\n\n"
+        L"Each row shows timestamp, direction, size, and preview.\n\n"
+        L"Right-click an entry for options:\n"
+        L"\u2022 Reload to Send/Receive\n"
+        L"\u2022 Copy Preview\n"
+        L"\u2022 Clear Log");
+
+    tip(m_hBtnHelp,
+        L"Toggle help tooltips on/off.\n\n"
+        L"When active, hover over any control to see a detailed "
+        L"description of its function.\n\n"
+        L"Press F1 for the full help guide.");
 }

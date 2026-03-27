@@ -86,5 +86,7 @@
 #define WM_NET_ERROR            (WM_APP + 4)
 #define WM_NET_SEND_COMPLETE    (WM_APP + 5)
 #define WM_NET_RECV_LATENCY     (WM_APP + 8)   // latency data from recv thread
+#define IDC_BTN_HELP            1110
+
 #define WM_NET_LISTENING        (WM_APP + 6)   // server started listening
 #define WM_NET_STOPPED          (WM_APP + 7)   // server stopped

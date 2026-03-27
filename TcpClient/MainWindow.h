@@ -77,6 +77,7 @@ private:
     void              RefreshDiagnostics();
     void              RefreshLogView();
     void              CreateTooltips();
+    void              PositionHelpButton();
 
     // ---- Layout ------------------------------------------------
     void LayoutControls(int w, int h);
@@ -186,6 +187,8 @@ private:
     bool                        m_hexRecvMode  {false};
     bool                        m_ignoreEditChange {false}; // suppress EN_CHANGE during programmatic edits
     HWND                        m_hTooltip         {nullptr};
+    HWND                        m_hBtnHelp         {nullptr};
+    bool                        m_tooltipsEnabled  {false};
     bool                        m_connected    {false};
     bool                        m_autoConnect     {false};
     bool                        m_pendingAutoSend   {false}; // set when auto-connect is triggered before send

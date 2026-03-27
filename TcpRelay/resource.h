@@ -85,4 +85,6 @@
 #define WM_RELAY_ERROR              (WM_APP + 8)
 #define WM_RELAY_STOPPED            (WM_APP + 9)
 #define WM_RELAY_TARGET_CONNECTING  (WM_APP + 10)  // target is trying to reconnect
+#define IDC_BTN_HELP                1100
+
 #define WM_PARSE_TARGET_COMBO       (WM_APP + 20)

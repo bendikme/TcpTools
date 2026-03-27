@@ -114,8 +114,58 @@ LRESULT RelayMainWindow::HandleMessage(HWND hWnd, UINT msg, WPARAM wParam, LPARA
     case WM_KEYDOWN:
         if (wParam == VK_F1) {
             MessageBoxW(hWnd,
-                L"TCP/UDP Relay v" TCPTOOLS_VERSION L"\n\n" TCPTOOLS_COPYRIGHT,
-                L"About TCP/UDP Relay v" TCPTOOLS_VERSION, MB_OK | MB_ICONINFORMATION);
+                L"TCP/UDP Relay v" TCPTOOLS_VERSION L"\n"
+                TCPTOOLS_COPYRIGHT L"\n"
+                L"\n"
+                L"\u2500\u2500\u2500 GETTING STARTED \u2500\u2500\u2500\n"
+                L"\n"
+                L"1. Set the Listen Port (local port for clients).\n"
+                L"2. Enter the Target address and port (upstream "
+                L"server to forward traffic to). You can type "
+                L"host:port and both fields auto-fill.\n"
+                L"3. Choose TCP or UDP.\n"
+                L"4. Click Start Relay.\n"
+                L"5. The relay listens for a client, connects to "
+                L"the target, and forwards data both ways.\n"
+                L"\n"
+                L"\u2500\u2500\u2500 DATA FLOW \u2500\u2500\u2500\n"
+                L"\n"
+                L"Client \u2192 [Relay] \u2192 Target (C\u2192T)\n"
+                L"Target \u2192 [Relay] \u2192 Client (T\u2192C)\n\n"
+                L"Each direction can be:\n"
+                L"\u2022 Auto-forwarded \u2014 data passes through "
+                L"instantly (real-time proxy).\n"
+                L"\u2022 Manual \u2014 data is buffered. You can inspect "
+                L"it, then Forward or Drop it. This acts as a "
+                L"man-in-the-middle for debugging.\n"
+                L"\n"
+                L"\u2500\u2500\u2500 KEYBOARD SHORTCUTS \u2500\u2500\u2500\n"
+                L"\n"
+                L"\u2022 F1 \u2014 This help screen\n"
+                L"\n"
+                L"\u2500\u2500\u2500 FEATURES \u2500\u2500\u2500\n"
+                L"\n"
+                L"\u2022 Hex View \u2014 Display relayed data as hex.\n"
+                L"\u2022 Manual buffering \u2014 Pause, inspect, forward "
+                L"or drop packets in each direction.\n"
+                L"\u2022 Protocol support \u2014 TCP and UDP relay.\n"
+                L"\u2022 Target History \u2014 Dropdown remembers recent "
+                L"target host:port entries across sessions.\n"
+                L"\n"
+                L"\u2500\u2500\u2500 BOTTOM PANEL \u2500\u2500\u2500\n"
+                L"\n"
+                L"\u2022 Log \u2014 Full event history with direction, "
+                L"size, and hex preview per entry.\n"
+                L"\u2022 Diagnostics \u2014 Live socket info for listen, "
+                L"client, and target sockets.\n"
+                L"\u2022 Statistics \u2014 Byte and packet counters for "
+                L"both C\u2192T and T\u2192C directions.\n"
+                L"\n"
+                L"\u2500\u2500\u2500 TIPS \u2500\u2500\u2500\n"
+                L"\n"
+                L"\u2022 Click the [?] button to enable help tooltips.\n"
+                L"\u2022 Config stored in: %APPDATA%\\TcpTools\\\n",
+                L"TCP/UDP Relay \u2014 Help", MB_OK | MB_ICONINFORMATION);
             return 0;
         }
         break;
@@ -436,6 +486,13 @@ void RelayMainWindow::OnCreate(HWND hWnd)
     RECT rc; GetClientRect(hWnd, &rc);
     OnSize(hWnd, rc.right, rc.bottom);
     SwitchBottomTab(0); // ensure log tab is visible by default
+
+    // Help toggle button (top-right "?")
+    m_hBtnHelp = CreateWindowExW(0, L"BUTTON", L"?",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | BS_PUSHLIKE,
+        0,0,10,10, hWnd, (HMENU)(UINT_PTR)IDC_BTN_HELP, hI, nullptr);
+    SendMessageW(m_hBtnHelp, WM_SETFONT, (WPARAM)hFont, TRUE);
+
     CreateTooltips();
 }
 
@@ -537,11 +594,23 @@ void RelayMainWindow::OnSize(HWND hWnd, int cx, int cy)
     Move(m_hBtnRefreshDiag, tx + 10, ty + th - 34,  90,      ROW_H);
 
     if (dwp) EndDeferWindowPos(dwp);
+    PositionHelpButton();
     RedrawWindow(hWnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
     // Re-apply tab visibility so that controls get a fresh SW_SHOW/SW_HIDE after
     // every resize.  Without this, the tab's WS_CLIPSIBLINGS paint can race
     // against the repositioned list and leave a stale clip region.
     SwitchBottomTab(m_bottomTab);
+}
+
+void RelayMainWindow::PositionHelpButton()
+{
+    if (!m_hBtnHelp || !m_hWnd) return;
+    RECT rc;
+    GetClientRect(m_hWnd, &rc);
+    // Place at end of config row 0, right-aligned
+    SetWindowPos(m_hBtnHelp, HWND_TOP,
+        rc.right - 8 - 26, 10, 26, 22,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW);
 }
 
 // ---- OnCommand -------------------------------------------------
@@ -578,6 +647,11 @@ void RelayMainWindow::OnCommand(HWND hWnd, int id, int code, HWND hCtl)
 
     case IDC_BTN_REFRESHDIAG:
         RefreshDiagnostics();
+        break;
+
+    case IDC_BTN_HELP:
+        m_tooltipsEnabled = (SendMessageW(m_hBtnHelp, BM_GETCHECK, 0, 0) == BST_CHECKED);
+        SendMessageW(m_hTooltip, TTM_ACTIVATE, m_tooltipsEnabled ? TRUE : FALSE, 0);
         break;
 
     case IDC_CHK_AUTO_C2T:
@@ -1426,7 +1500,11 @@ void RelayMainWindow::CreateTooltips()
         CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
         m_hWnd, nullptr, m_hInst, nullptr);
     if (!m_hTooltip) return;
-    SendMessageW(m_hTooltip, TTM_SETMAXTIPWIDTH, 0, 360);
+    SendMessageW(m_hTooltip, TTM_SETMAXTIPWIDTH, 0, 420);
+    SendMessageW(m_hTooltip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 30000);
+    SendMessageW(m_hTooltip, TTM_SETDELAYTIME, TTDT_INITIAL,  1200);
+    SendMessageW(m_hTooltip, TTM_SETDELAYTIME, TTDT_RESHOW,    200);
+    SendMessageW(m_hTooltip, TTM_ACTIVATE, FALSE, 0);
 
     auto tip = [&](HWND ctrl, const wchar_t* text) {
         if (!ctrl) return;
@@ -1439,33 +1517,252 @@ void RelayMainWindow::CreateTooltips()
         SendMessageW(m_hTooltip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
     };
 
-    // ---- Config row ----
-    tip(m_hEditListenPort, L"Port this relay listens on for incoming client connections.");
-    tip(m_hComboTarget,   L"IP address or hostname of the upstream server. Select from recent targets or type a new one.");
-    tip(m_hEditTargetPort, L"Port on the upstream server.");
-    tip(m_hComboProtocol,  L"Protocol:\n  TCP \u2014 reliable, ordered stream relay.\n  UDP \u2014 connectionless datagram relay.");
-    tip(m_hEditTimeout,    L"Connection timeout in seconds when connecting to the target server.");
-    tip(m_hChkNoTimeout,   L"Disable timeout \u2014 the relay waits indefinitely when connecting to the target.");
-    tip(m_hBtnStart,       L"Start the relay: begin listening for clients and forward to the target server.");
-    tip(m_hBtnStop,        L"Stop the relay and close all active connections.");
+    // ================================================================
+    //  CONFIGURATION ROW
+    // ================================================================
+    tip(m_hEditListenPort,
+        L"Listen port (1\u201365535).\n\n"
+        L"The relay binds to this local port and waits "
+        L"for an incoming client connection. All data from "
+        L"the client is forwarded to the target server "
+        L"and vice-versa.\n\n"
+        L"NOTE: Ports below 1024 may need admin rights. "
+        L"A port already in use will be rejected.");
 
-    // ---- Client\u2192Target panel ----
-    tip(m_hChkAutoC2T,     L"Auto-forward C\u2192T \u2014 Client\u2192Target data is forwarded immediately without buffering.\n"
-                            L"Uncheck to manually inspect, forward, or drop each packet.");
-    tip(m_hBtnFwdC2T,      L"Manually forward the buffered Client\u2192Target data to the target server.");
-    tip(m_hBtnDropC2T,     L"Discard the buffered Client\u2192Target data. Nothing will be sent to the target.");
-    tip(m_hChkHexC2T,      L"Show Client\u2192Target data as hexadecimal bytes instead of plain text.");
+    tip(m_hComboTarget,
+        L"Target server address \u2014 IP or hostname.\n\n"
+        L"The upstream server the relay forwards data to. "
+        L"Pick from recent targets in the dropdown or "
+        L"type a new one.\n\n"
+        L"Supported formats:\n"
+        L"\u2022 IPv4 address: 192.168.1.10\n"
+        L"\u2022 IPv6 address: ::1 or [::1]\n"
+        L"\u2022 Hostname: myserver.local\n"
+        L"\u2022 host:port shortcut: 192.168.1.10:9002\n"
+        L"   (auto-fills both Target and Port fields)");
 
-    // ---- Target\u2192Client panel ----
-    tip(m_hChkAutoT2C,     L"Auto-forward T\u2192C \u2014 Target\u2192Client data is forwarded immediately without buffering.\n"
-                            L"Uncheck to manually inspect, forward, or drop each packet.");
-    tip(m_hBtnFwdT2C,      L"Manually forward the buffered Target\u2192Client data to the client.");
-    tip(m_hBtnDropT2C,     L"Discard the buffered Target\u2192Client data. Nothing will be sent to the client.");
-    tip(m_hChkHexT2C,      L"Show Target\u2192Client data as hexadecimal bytes instead of plain text.");
+    tip(m_hEditTargetPort,
+        L"Target server port (1\u201365535).\n\n"
+        L"The port on the upstream server that the relay "
+        L"connects to when forwarding traffic.\n\n"
+        L"Common ports:\n"
+        L"\u2022 80 / 443 \u2014 HTTP / HTTPS\n"
+        L"\u2022 502 \u2014 Modbus TCP\n"
+        L"\u2022 9001\u201365535 \u2014 typical custom services");
 
-    // ---- Bottom panel ----
-    tip(m_hBtnClearLog,    L"Remove all entries from the relay log.");
-    tip(m_hComboFilter,    L"Filter the log:\n  All | Data only | Connection events | Errors");
-    tip(m_hBtnRefreshDiag, L"Refresh live socket diagnostics for the listen, client, and target sockets.");
-    tip(m_hBtnClearStats,  L"Reset all traffic byte and packet counters to zero.");
+    tip(m_hComboProtocol,
+        L"Network protocol for the relay.\n\n"
+        L"TCP \u2014 Transmission Control Protocol.\n"
+        L"Reliable, ordered byte-stream relay. Both client "
+        L"and target connections use TCP.\n\n"
+        L"UDP \u2014 User Datagram Protocol.\n"
+        L"Connectionless datagram relay. Each UDP datagram "
+        L"is forwarded as-is.");
+
+    tip(m_hEditTimeout,
+        L"Connection timeout in seconds.\n\n"
+        L"How long to wait when connecting to the target "
+        L"server before giving up.\n\n"
+        L"\u2022 Typical values: 3\u201310 seconds.\n"
+        L"\u2022 Use a longer timeout for remote/VPN hosts.\n\n"
+        L"Check \u2018No timeout\u2019 to wait indefinitely.");
+
+    tip(m_hChkNoTimeout,
+        L"Disable timeout.\n\n"
+        L"When checked, the relay waits indefinitely for "
+        L"the target server to respond. The timeout field "
+        L"is ignored.\n\n"
+        L"Useful when the target server has variable or "
+        L"very long startup times.");
+
+    tip(m_hBtnStart,
+        L"Start the relay.\n\n"
+        L"Binds to the listen port and begins accepting "
+        L"client connections. When a client connects, the "
+        L"relay also connects to the target server and "
+        L"begins forwarding data in both directions.\n\n"
+        L"The listen port must be free \u2014 if another process "
+        L"is using it, an error is displayed. "
+        L"The target address and port are validated first.");
+
+    tip(m_hBtnStop,
+        L"Stop the relay.\n\n"
+        L"Closes the listening socket, disconnects both "
+        L"client and target connections, and returns to "
+        L"the idle state. The listen port is released for "
+        L"other applications.");
+
+    tip(m_hStaticStatus,
+        L"Relay status indicator.\n\n"
+        L"Shows the current state:\n"
+        L"\u2022 Idle \u2014 not running\n"
+        L"\u2022 Listening on :port \u2014 waiting for a client\n"
+        L"\u2022 Relaying \u2014 both sides connected, data is "
+        L"being forwarded");
+
+    tip(m_hStaticClientInd,
+        L"Client connection indicator.\n\n"
+        L"Shows whether an incoming client is connected "
+        L"and its IP address. A filled circle (\u25CF) means "
+        L"connected; an empty circle (\u25CB) means idle.");
+
+    tip(m_hStaticTargetInd,
+        L"Target connection indicator.\n\n"
+        L"Shows whether the relay has an active connection "
+        L"to the upstream target server. A filled circle "
+        L"(\u25CF) means connected; empty (\u25CB) means idle.");
+
+    // ================================================================
+    //  CLIENT \u2192 TARGET PANEL
+    // ================================================================
+    tip(m_hChkAutoC2T,
+        L"Auto-forward Client \u2192 Target.\n\n"
+        L"When checked, data from the client is forwarded "
+        L"to the target server immediately, in real time.\n\n"
+        L"When unchecked, incoming client data is buffered "
+        L"and held until you manually click Forward or Drop. "
+        L"This lets you inspect, modify, or discard packets "
+        L"before they reach the server \u2014 useful for debugging "
+        L"and protocol analysis (man-in-the-middle mode).");
+
+    tip(m_hBtnFwdC2T,
+        L"Forward buffered Client \u2192 Target data.\n\n"
+        L"Sends all data currently held in the C\u2192T buffer "
+        L"to the target server. The buffer is cleared "
+        L"after forwarding.\n\n"
+        L"Only active when Auto-forward is unchecked and "
+        L"data has been buffered.");
+
+    tip(m_hBtnDropC2T,
+        L"Drop buffered Client \u2192 Target data.\n\n"
+        L"Discards all data in the C\u2192T buffer without "
+        L"sending anything to the target server.\n\n"
+        L"Use this to silently block client requests "
+        L"or test how the server handles missing data.");
+
+    tip(m_hStaticBufC2T,
+        L"Client \u2192 Target buffer status.\n\n"
+        L"Shows the number of bytes and packets currently "
+        L"buffered (waiting to be forwarded or dropped). "
+        L"Only accumulates when auto-forward is off.");
+
+    tip(m_hChkHexC2T,
+        L"Toggle Hex View for Client \u2192 Target data.\n\n"
+        L"When checked, data is displayed as hexadecimal "
+        L"bytes with an ASCII sidebar. When unchecked, "
+        L"data is shown as plain text.\n\n"
+        L"Switching modes re-renders the current data.");
+
+    tip(m_hEditTextC2T,
+        L"Client \u2192 Target data view (read-only).\n\n"
+        L"Shows the latest data received from the client. "
+        L"In auto-forward mode, each packet is displayed "
+        L"briefly as it passes through. In manual mode, "
+        L"the full buffered content is shown.");
+
+    // ================================================================
+    //  TARGET \u2192 CLIENT PANEL
+    // ================================================================
+    tip(m_hChkAutoT2C,
+        L"Auto-forward Target \u2192 Client.\n\n"
+        L"When checked, data from the target server is "
+        L"forwarded to the client immediately, in real time.\n\n"
+        L"When unchecked, incoming target data is buffered "
+        L"and held until you click Forward or Drop. "
+        L"This lets you inspect, modify, or discard server "
+        L"responses before they reach the client.");
+
+    tip(m_hBtnFwdT2C,
+        L"Forward buffered Target \u2192 Client data.\n\n"
+        L"Sends all data currently held in the T\u2192C buffer "
+        L"to the client. The buffer is cleared after "
+        L"forwarding.\n\n"
+        L"Only active when Auto-forward is unchecked and "
+        L"data has been buffered.");
+
+    tip(m_hBtnDropT2C,
+        L"Drop buffered Target \u2192 Client data.\n\n"
+        L"Discards all data in the T\u2192C buffer without "
+        L"sending anything to the client.\n\n"
+        L"Use this to silently suppress server responses "
+        L"or test how the client handles missing replies.");
+
+    tip(m_hStaticBufT2C,
+        L"Target \u2192 Client buffer status.\n\n"
+        L"Shows the number of bytes and packets currently "
+        L"buffered (waiting to be forwarded or dropped). "
+        L"Only accumulates when auto-forward is off.");
+
+    tip(m_hChkHexT2C,
+        L"Toggle Hex View for Target \u2192 Client data.\n\n"
+        L"When checked, data is displayed as hexadecimal "
+        L"bytes with an ASCII sidebar. When unchecked, "
+        L"data is shown as plain text.\n\n"
+        L"Switching modes re-renders the current data.");
+
+    tip(m_hEditTextT2C,
+        L"Target \u2192 Client data view (read-only).\n\n"
+        L"Shows the latest data received from the target "
+        L"server. In auto-forward mode, each packet is "
+        L"displayed briefly as it passes through. In manual "
+        L"mode, the full buffered content is shown.");
+
+    // ================================================================
+    //  BOTTOM PANEL
+    // ================================================================
+    tip(m_hTab,
+        L"Bottom panel tabs.\n\n"
+        L"\u2022 Log \u2014 chronological history of all relay events "
+        L"(connections, data, errors). Right-click entries to "
+        L"copy.\n\n"
+        L"\u2022 Diagnostics \u2014 live socket information for the "
+        L"listen, client, and target sockets.\n\n"
+        L"\u2022 Statistics \u2014 traffic byte and packet counters "
+        L"for both directions.\n\n"
+        L"Press F1 for a complete help guide.");
+
+    tip(m_hBtnClearLog,
+        L"Clear all log entries.\n\n"
+        L"Removes every entry from the relay log. "
+        L"This cannot be undone.");
+
+    tip(m_hComboFilter,
+        L"Filter which log entries are displayed.\n\n"
+        L"\u2022 All \u2014 show everything\n"
+        L"\u2022 Data only \u2014 only relayed data packets\n"
+        L"\u2022 Events \u2014 connect/disconnect events\n"
+        L"\u2022 Errors \u2014 only error messages\n\n"
+        L"The underlying log data is preserved; switching "
+        L"filters does not delete entries.");
+
+    tip(m_hBtnRefreshDiag,
+        L"Refresh socket diagnostics.\n\n"
+        L"Queries all active sockets (listen, client, target) "
+        L"for live information:\n"
+        L"\u2022 Send/receive buffer sizes\n"
+        L"\u2022 Nagle algorithm state\n"
+        L"\u2022 Connection state per socket\n\n"
+        L"Only available while the relay is running.");
+
+    tip(m_hBtnClearStats,
+        L"Reset all statistics to zero.\n\n"
+        L"Clears all traffic counters:\n"
+        L"\u2022 Bytes C\u2192T / T\u2192C\n"
+        L"\u2022 Packets C\u2192T / T\u2192C\n"
+        L"\u2022 Client connection count\n"
+        L"\u2022 Target connection status");
+
+    tip(m_hListLog,
+        L"Relay event log \u2014 chronological activity history.\n\n"
+        L"Each row shows: sequence, time, direction (C\u2192T or "
+        L"T\u2192C), size, and a hex preview of the data.\n\n"
+        L"Right-click an entry for options:\n"
+        L"\u2022 Copy Preview\n"
+        L"\u2022 Clear Log");
+
+    tip(m_hBtnHelp,
+        L"Toggle help tooltips on/off.\n\n"
+        L"When active, hover over any control to see a detailed "
+        L"description of its function.\n\n"
+        L"Press F1 for the full help guide.");
 }
