@@ -2,6 +2,8 @@
 #include "pch.h"
 #include "Utils.h"
 
+namespace Server {
+
 // ============================================================
 //  ServerNetwork - Winsock2 TCP/UDP server (listen / accept / send / recv)
 //
@@ -117,3 +119,5 @@ private:
     CycleStats         m_stats;
     std::mutex         m_statsMutex;
 };
+
+} // namespace Server

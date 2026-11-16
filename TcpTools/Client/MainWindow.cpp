@@ -1,6 +1,9 @@
 #include "pch.h"
 #include "MainWindow.h"
-#include "../Version.h"
+#include "ToolHost.h"
+#include "Version.h"
+
+namespace Client {
 
 // ============================================================
 //  Subclass proc for Send edit - intercepts Ctrl+Enter
@@ -64,27 +67,23 @@ bool MainWindow::RegisterClass(HINSTANCE hInst)
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
     wc.lpszClassName = ClassName();
-    wc.hIcon         = LoadIconW(hInst, L"IDI_APPICON");
-    wc.hIconSm       = wc.hIcon;
     return RegisterClassExW(&wc) != 0;
 }
 
-HWND MainWindow::Create(HINSTANCE hInst, int nCmdShow,
+HWND MainWindow::Create(HINSTANCE hInst, HWND parent,
                         const std::wstring& defaultIP, int defaultPort, bool autoConnect)
 {
     struct Params { std::wstring ip; int port; bool autoConnect; };
     auto* p = new Params{ defaultIP, defaultPort, autoConnect };
 
     HWND hWnd = CreateWindowExW(
-        0, ClassName(),
-        L"TCP Client v" TCPTOOLS_VERSION,
-        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
-        CW_USEDEFAULT, CW_USEDEFAULT, 1180, 820,
-        nullptr, nullptr, hInst, p);
+        TOOL_PAGE_EXSTYLE, ClassName(),
+        L"TCP Client",
+        TOOL_PAGE_STYLE,
+        0, 0, 1180, 820,
+        parent, nullptr, hInst, p);
 
     if (!hWnd) { delete p; return nullptr; }
-    ShowWindow(hWnd, nCmdShow);
-    UpdateWindow(hWnd);
     return hWnd;
 }
 
@@ -121,7 +120,6 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
     }
     case WM_DESTROY:
         if (self) { self->OnDestroy(); delete self; SetWindowLongPtrW(hWnd, 0, 0); }
-        PostQuitMessage(0);
         return 0;
 
     case WM_SIZE:
@@ -129,16 +127,12 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
             self->OnSize(LOWORD(lParam), HIWORD(lParam));
         return 0;
 
-    case WM_GETMINMAXINFO:
-        if (self) self->OnGetMinMaxInfo((MINMAXINFO*)lParam);
-        return 0;
-
     case WM_COMMAND:
         if (self) self->OnCommand(LOWORD(wParam), HIWORD(wParam), (HWND)lParam);
         return 0;
 
-    case WM_KEYDOWN:
-        if (wParam == VK_F1) {
+    case WM_TOOL_HELP:
+        {
             MessageBoxW(hWnd,
                 L"TCP/UDP Client v" TCPTOOLS_VERSION L"\n"
                 TCPTOOLS_COPYRIGHT L"\n"
@@ -185,12 +179,12 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
                 L"\u2500\u2500\u2500 TIPS \u2500\u2500\u2500\n"
                 L"\n"
                 L"\u2022 Click the [?] button to enable help tooltips.\n"
-                L"\u2022 Command-line: TcpClient.exe [host] [port]\n"
+                L"\u2022 Command line: TcpTools.exe /tab:client /ip:<host> "
+                L"/port:<n> [/autoconnect]\n"
                 L"\u2022 Config stored in: %APPDATA%\\TcpTools\\\n",
                 L"TCP/UDP Client \u2014 Help", MB_OK | MB_ICONINFORMATION);
             return 0;
         }
-        break;
 
     case WM_NOTIFY:
         if (self) self->OnNotify((NMHDR*)lParam);
@@ -2231,4 +2225,14 @@ void MainWindow::CreateTooltips()
         L"When active, hover over any control to see a detailed "
         L"description of its function.\n\n"
         L"Press F1 for the full help guide.");
+}
+
+} // namespace Client
+
+// ---- Tools factory (see Tools.h) ---------------------------------
+#include "Tools.h"
+bool Tools::RegisterClientClass(HINSTANCE hInst) { return Client::MainWindow::RegisterClass(hInst); }
+HWND Tools::CreateClient(HINSTANCE hInst, HWND parent, const std::wstring& host, int port, bool autoConnect)
+{
+    return Client::MainWindow::Create(hInst, parent, host, port, autoConnect);
 }

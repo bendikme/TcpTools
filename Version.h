@@ -2,6 +2,10 @@
 
 // ============================================================
 //  TcpTools version  –  change ONLY here
+//  (year.month.patch; the release tag is v<version>)
 // ============================================================
-#define TCPTOOLS_VERSION      L"26.3.2"
-#define TCPTOOLS_COPYRIGHT    L"Copyright \u00A9 2026 Bendik Eide.\nAll rights reserved."
+#define TCPTOOLS_VERSION      L"26.11.0"
+#define TCPTOOLS_VERSION_RC   26,11,0,0
+#define TCPTOOLS_VERSION_STR  "26.11.0"
+#define TCPTOOLS_COPYRIGHT    L"Copyright © 2026 Bendik Eide.\nAll rights reserved."
+#define TCPTOOLS_COPYRIGHT_RC "Copyright (C) 2026 Bendik Eide. All rights reserved."

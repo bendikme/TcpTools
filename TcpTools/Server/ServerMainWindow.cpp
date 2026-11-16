@@ -1,6 +1,9 @@
 #include "pch.h"
 #include "ServerMainWindow.h"
-#include "../Version.h"
+#include "ToolHost.h"
+#include "Version.h"
+
+namespace Server {
 
 // ============================================================
 //  Subclass proc for Send edit - intercepts Ctrl+Enter
@@ -59,12 +62,10 @@ bool ServerMainWindow::RegisterClass(HINSTANCE hInst)
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
     wc.lpszClassName = ClassName();
-    wc.hIcon         = LoadIconW(hInst, L"IDI_APPICON");
-    wc.hIconSm       = wc.hIcon;
     return RegisterClassExW(&wc) != 0;
 }
 
-HWND ServerMainWindow::Create(HINSTANCE hInst, int nCmdShow,
+HWND ServerMainWindow::Create(HINSTANCE hInst, HWND parent,
                                int defaultPort, bool autoStart, bool echoMode,
                                const std::wstring& logFile)
 {
@@ -73,14 +74,12 @@ HWND ServerMainWindow::Create(HINSTANCE hInst, int nCmdShow,
     auto* p = new Params{ defaultPort, autoStart, echoMode, logFile };
 
     HWND hWnd = CreateWindowExW(
-        0, ClassName(), L"TCP Server v" TCPTOOLS_VERSION,
-        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
-        CW_USEDEFAULT, CW_USEDEFAULT, 1180, 820,
-        nullptr, nullptr, hInst, p); // pass params via lpCreateParams
+        TOOL_PAGE_EXSTYLE, ClassName(), L"TCP Server",
+        TOOL_PAGE_STYLE,
+        0, 0, 1180, 820,
+        parent, nullptr, hInst, p); // pass params via lpCreateParams
 
     if (!hWnd) { delete p; return nullptr; }
-    ShowWindow(hWnd, nCmdShow);
-    UpdateWindow(hWnd);
     return hWnd;
 }
 
@@ -118,21 +117,17 @@ LRESULT CALLBACK ServerMainWindow::WndProc(HWND hWnd, UINT msg, WPARAM wParam, L
     }
     case WM_DESTROY:
         if (self) { self->OnDestroy(); delete self; SetWindowLongPtrW(hWnd, 0, 0); }
-        PostQuitMessage(0);
         return 0;
     case WM_SIZE:
         if (self && wParam != SIZE_MINIMIZED)
             self->OnSize(LOWORD(lParam), HIWORD(lParam));
         return 0;
-    case WM_GETMINMAXINFO:
-        if (self) self->OnGetMinMaxInfo((MINMAXINFO*)lParam);
-        return 0;
     case WM_COMMAND:
         if (self) self->OnCommand(LOWORD(wParam), HIWORD(wParam), (HWND)lParam);
         return 0;
 
-    case WM_KEYDOWN:
-        if (wParam == VK_F1) {
+    case WM_TOOL_HELP:
+        {
             MessageBoxW(hWnd,
                 L"TCP/UDP Server v" TCPTOOLS_VERSION L"\n"
                 TCPTOOLS_COPYRIGHT L"\n"
@@ -1885,4 +1880,14 @@ void ServerMainWindow::CreateTooltips()
         L"When active, hover over any control to see a detailed "
         L"description of its function.\n\n"
         L"Press F1 for the full help guide.");
+}
+
+} // namespace Server
+
+// ---- Tools factory (see Tools.h) ---------------------------------
+#include "Tools.h"
+bool Tools::RegisterServerClass(HINSTANCE hInst) { return Server::ServerMainWindow::RegisterClass(hInst); }
+HWND Tools::CreateServer(HINSTANCE hInst, HWND parent, int port, bool autoStart, bool echoMode, const std::wstring& logFile)
+{
+    return Server::ServerMainWindow::Create(hInst, parent, port, autoStart, echoMode, logFile);
 }

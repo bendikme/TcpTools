@@ -2,13 +2,12 @@
 #include "RelayMainWindow.h"
 #include "HexView.h"
 #include "resource.h"
-#include "../Version.h"
+#include "ToolHost.h"
+#include "Version.h"
 
 // ============================================================
 //  RelayMainWindow implementation
 // ============================================================
-
-RelayMainWindow* RelayMainWindow::s_instance = nullptr;
 
 // ---- Registration + Creation -----------------------------------
 
@@ -23,36 +22,44 @@ bool RelayMainWindow::RegisterClass(HINSTANCE hInst)
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wc.lpszClassName = WndClassName;
     wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
-    wc.hIcon         = LoadIconW(hInst, L"IDI_APPICON");
-    wc.hIconSm       = wc.hIcon;
     return RegisterClassExW(&wc) != 0;
 }
 
-HWND RelayMainWindow::Create(HINSTANCE hInst, int nCmdShow)
+HWND RelayMainWindow::Create(HINSTANCE hInst, HWND parent)
 {
+    // The object belongs to its window: WM_NCCREATE stores it in the
+    // window extra bytes, WM_NCDESTROY deletes it. Several relay
+    // pages can exist side by side.
     auto* self = new RelayMainWindow();
     self->m_hInst = hInst;
-    s_instance = self;
 
-    HWND hWnd = CreateWindowExW(
-        0, WndClassName, L"TCP/UDP Relay v" TCPTOOLS_VERSION,
-        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-        CW_USEDEFAULT, CW_USEDEFAULT, 1200, 800,
-        nullptr, nullptr, hInst, self);
-    if (!hWnd) { delete self; s_instance = nullptr; return nullptr; }
-
-    ShowWindow(hWnd, nCmdShow);
-    UpdateWindow(hWnd);
-    return hWnd;
+    return CreateWindowExW(
+        TOOL_PAGE_EXSTYLE, WndClassName, L"TCP Relay",
+        TOOL_PAGE_STYLE,
+        0, 0, 1200, 800,
+        parent, nullptr, hInst, self);
 }
 
 // ---- WndProc dispatcher ----------------------------------------
 
 LRESULT CALLBACK RelayMainWindow::WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-    RelayMainWindow* self = s_instance;
-    if (self) return self->HandleMessage(hWnd, msg, wParam, lParam);
-    return DefWindowProcW(hWnd, msg, wParam, lParam);
+    RelayMainWindow* self;
+    if (msg == WM_NCCREATE) {
+        self = static_cast<RelayMainWindow*>(((CREATESTRUCTW*)lParam)->lpCreateParams);
+        SetWindowLongPtrW(hWnd, 0, (LONG_PTR)self);
+    } else {
+        self = reinterpret_cast<RelayMainWindow*>(GetWindowLongPtrW(hWnd, 0));
+    }
+    if (!self) return DefWindowProcW(hWnd, msg, wParam, lParam);
+
+    if (msg == WM_NCDESTROY) {
+        LRESULT r = DefWindowProcW(hWnd, msg, wParam, lParam);
+        SetWindowLongPtrW(hWnd, 0, 0);
+        delete self;
+        return r;
+    }
+    return self->HandleMessage(hWnd, msg, wParam, lParam);
 }
 
 // ---- Helper: create a label + edit pair ------------------------
@@ -111,8 +118,8 @@ LRESULT RelayMainWindow::HandleMessage(HWND hWnd, UINT msg, WPARAM wParam, LPARA
         OnCommand(hWnd, LOWORD(wParam), HIWORD(wParam), (HWND)lParam);
         return 0;
 
-    case WM_KEYDOWN:
-        if (wParam == VK_F1) {
+    case WM_TOOL_HELP:
+        {
             MessageBoxW(hWnd,
                 L"TCP/UDP Relay v" TCPTOOLS_VERSION L"\n"
                 TCPTOOLS_COPYRIGHT L"\n"
@@ -240,7 +247,6 @@ LRESULT RelayMainWindow::HandleMessage(HWND hWnd, UINT msg, WPARAM wParam, LPARA
         if (m_hImgListLog) ImageList_Destroy(m_hImgListLog);
         if (m_hTooltip) { DestroyWindow(m_hTooltip); m_hTooltip = nullptr; }
         if (m_hFontMono) { DeleteObject(m_hFontMono); m_hFontMono = nullptr; }
-        PostQuitMessage(0);
         return 0;
     }
     return DefWindowProcW(hWnd, msg, wParam, lParam);
@@ -1766,3 +1772,8 @@ void RelayMainWindow::CreateTooltips()
         L"description of its function.\n\n"
         L"Press F1 for the full help guide.");
 }
+
+// ---- Tools factory (see Tools.h) ---------------------------------
+#include "Tools.h"
+bool Tools::RegisterRelayClass(HINSTANCE hInst) { return RelayMainWindow::RegisterClass(hInst); }
+HWND Tools::CreateRelay(HINSTANCE hInst, HWND parent) { return RelayMainWindow::Create(hInst, parent); }

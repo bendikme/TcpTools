@@ -104,6 +104,65 @@ namespace Utils
         return true;
     }
 
+    // Bytes -> "48 65 6C 6C 6F", `perLine` bytes per CR LF line (0 = one line).
+    inline std::wstring BytesToHexText(const std::vector<BYTE>& data, size_t perLine = 16) {
+        static const wchar_t digits[] = L"0123456789ABCDEF";
+        std::wstring out;
+        out.reserve(data.size() * 3 + (perLine ? data.size() / perLine * 2 : 0));
+        for (size_t i = 0; i < data.size(); ++i) {
+            if (i) {
+                if (perLine && i % perLine == 0) out += L"\r\n";
+                else                             out += L' ';
+            }
+            out += digits[data[i] >> 4];
+            out += digits[data[i] & 0x0F];
+        }
+        return out;
+    }
+
+    // ---- Text for EDIT controls ----------------------------
+    // Bytes -> text an EDIT control can show: decoded as UTF-8 (invalid bytes
+    // become U+FFFD), every line end (CR LF, lone CR, lone LF) shown as a line
+    // break, and NUL / other control characters shown as '.', so that nothing
+    // cuts the text short. For display only: it does not round-trip.
+    inline std::wstring BytesToDisplayText(const BYTE* data, size_t len) {
+        if (!data || len == 0) return {};
+        if (len > (size_t)INT_MAX) len = (size_t)INT_MAX;
+        int n = MultiByteToWideChar(CP_UTF8, 0, (const char*)data, (int)len, nullptr, 0);
+        if (n <= 0) return {};
+        std::wstring w((size_t)n, 0);
+        MultiByteToWideChar(CP_UTF8, 0, (const char*)data, (int)len, w.data(), n);
+        std::wstring out;
+        out.reserve(w.size() + 16);
+        for (size_t i = 0; i < w.size(); ++i) {
+            wchar_t c = w[i];
+            if (c == L'\r') {
+                out += L"\r\n";
+                if (i + 1 < w.size() && w[i + 1] == L'\n') ++i;
+            }
+            else if (c == L'\n')            out += L"\r\n";
+            else if (c == L'\t')            out += c;
+            else if (c < 0x20 || c == 0x7F) out += L'.';
+            else                            out += c;
+        }
+        return out;
+    }
+    inline std::wstring BytesToDisplayText(const std::vector<BYTE>& data) {
+        return BytesToDisplayText(data.data(), data.size());
+    }
+
+    // True when the bytes are valid UTF-8 text without control characters other
+    // than TAB / CR / LF - i.e. an EDIT control can show and return them unchanged
+    // (as long as line ends are CR LF).
+    inline bool LooksLikeText(const std::vector<BYTE>& data) {
+        if (data.empty()) return true;
+        if (data.size() > (size_t)INT_MAX) return false;
+        for (BYTE b : data)
+            if ((b < 0x20 && b != '\t' && b != '\r' && b != '\n') || b == 0x7F) return false;
+        return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, (const char*)data.data(),
+                                   (int)data.size(), nullptr, 0) > 0;
+    }
+
     // ---- File dialog ---------------------------------------
     inline bool OpenFileDialog(HWND owner, std::wstring& pathOut) {
         wchar_t buf[MAX_PATH] = {};
@@ -135,13 +194,6 @@ namespace Utils
         return true;
     }
 
-    // ---- DPI helpers ---------------------------------------
-    inline int ScaleDPI(HWND hWnd, int pixels) {
-        HDC hdc  = GetDC(hWnd);
-        int dpi  = GetDeviceCaps(hdc, LOGPIXELSX);
-        ReleaseDC(hWnd, hdc);
-        return MulDiv(pixels, dpi, 96);
-    }
 
     // ---- Prettify bytes ------------------------------------
     inline std::wstring FormatBytes(size_t bytes) {
@@ -164,11 +216,13 @@ namespace Utils
 
     inline bool IsValidHostOrIP(const std::wstring& s) {
         if (s.empty()) return false;
+        // Reject strings with spaces or control chars
         for (wchar_t c : s) {
             if (c <= 0x20 || c == 0x7F) return false;
         }
+        // Must start and end with alphanumeric or digit (not '.' or '-')
         wchar_t first = s.front(), last = s.back();
-        if (!iswalnum(first) && first != L'[') return false;
+        if (!iswalnum(first) && first != L'[') return false; // '[' for IPv6 bracket notation
         if (!iswalnum(last) && last != L']') return false;
         return true;
     }
@@ -217,9 +271,13 @@ namespace Utils
 
     inline void SaveHistory(const wchar_t* appName, const std::wstring& entry,
                             std::vector<std::wstring>& entries, int maxEntries = 10) {
+        // Remove duplicate if present
         entries.erase(std::remove(entries.begin(), entries.end(), entry), entries.end());
+        // Insert at front (most recent first)
         entries.insert(entries.begin(), entry);
+        // Limit size
         if ((int)entries.size() > maxEntries) entries.resize(maxEntries);
+        // Write to file
         std::wstring path = GetHistoryFilePath(appName);
         if (path.empty()) return;
         std::wofstream f(path, std::ios::trunc);
@@ -228,3 +286,65 @@ namespace Utils
     }
 
 } // namespace Utils
+
+// ============================================================
+//  DPI - the app is system-DPI aware (app.manifest). Layout code
+//  is written in 96-DPI units ("logical" pixels) and converted
+//  with Dpi::Scale when a window is positioned or a font made.
+// ============================================================
+namespace Dpi
+{
+    // DPI of the system (primary display at logon).
+    inline int System() {
+        static const int dpi = [] {
+            HDC hdc = GetDC(nullptr);
+            int d = hdc ? GetDeviceCaps(hdc, LOGPIXELSX) : 96;
+            if (hdc) ReleaseDC(nullptr, hdc);
+            return d > 0 ? d : 96;
+        }();
+        return dpi;
+    }
+
+    // DPI the UI is laid out for. Normally the system DPI; the
+    // environment variable TCPTOOLS_DPI (96..480) overrides it so a
+    // scaled layout can be checked on a 100 % display.
+    inline int Get() {
+        static const int dpi = [] {
+            wchar_t buf[16] = {};
+            if (GetEnvironmentVariableW(L"TCPTOOLS_DPI", buf, 16)) {
+                int v = _wtoi(buf);
+                if (v >= 96 && v <= 480) return v;
+            }
+            return System();
+        }();
+        return dpi;
+    }
+
+    inline int Scale(int logical)  { return MulDiv(logical, Get(), 96); }   // 96-DPI units -> pixels
+    inline int Unscale(int pixels) { return MulDiv(pixels, 96, Get()); }    // pixels -> 96-DPI units
+
+    // The system message font (Segoe UI 9 pt), sized for Get().
+    inline HFONT CreateUIFont(bool bold = false) {
+        NONCLIENTMETRICSW ncm = {};
+        ncm.cbSize = sizeof(ncm);
+        SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
+        LOGFONTW lf = ncm.lfMessageFont;
+        lf.lfHeight = MulDiv(lf.lfHeight, Get(), System());   // only differs under TCPTOOLS_DPI
+        if (bold) lf.lfWeight = FW_SEMIBOLD;
+        return CreateFontIndirectW(&lf);
+    }
+
+    // Fixed-pitch font (Consolas, else Courier New); height in 96-DPI pixels.
+    inline HFONT CreateMonoFont(int logicalHeight = 13) {
+        LOGFONTW lf = {};
+        lf.lfHeight         = -Scale(logicalHeight);
+        lf.lfWeight         = FW_NORMAL;
+        lf.lfPitchAndFamily = FIXED_PITCH | FF_MODERN;
+        lf.lfCharSet        = DEFAULT_CHARSET;
+        lf.lfQuality        = CLEARTYPE_QUALITY;
+        wcscpy_s(lf.lfFaceName, L"Consolas");
+        HFONT f = CreateFontIndirectW(&lf);
+        if (!f) { wcscpy_s(lf.lfFaceName, L"Courier New"); f = CreateFontIndirectW(&lf); }
+        return f;
+    }
+} // namespace Dpi

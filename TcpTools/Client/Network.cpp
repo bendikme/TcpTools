@@ -2,6 +2,8 @@
 #include "Network.h"
 #include "resource.h"
 
+namespace Client {
+
 // ============================================================
 //  Helpers
 // ============================================================
@@ -328,3 +330,5 @@ bool TcpNetwork::Send(const std::vector<BYTE>& raw, const NetConfig& cfg)
     }
     return true;
 }
+
+} // namespace Client

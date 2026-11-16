@@ -2,6 +2,8 @@
 #include "ServerNetwork.h"
 #include "resource.h"
 
+namespace Server {
+
 // ============================================================
 //  Helpers
 // ============================================================
@@ -430,3 +432,5 @@ bool ServerNetwork::Send(const std::vector<BYTE>& raw, const NetConfig& cfg)
 
     return true;
 }
+
+} // namespace Server

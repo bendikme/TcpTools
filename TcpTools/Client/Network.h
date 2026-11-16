@@ -2,6 +2,8 @@
 #include "pch.h"
 #include "Utils.h"
 
+namespace Client {
+
 // ============================================================
 //  Network layer - Winsock2 TCP/UDP client (worker threads)
 //
@@ -114,3 +116,5 @@ private:
     std::mutex         m_statsMutex;
     bool               m_udpMode    {false};
 };
+
+} // namespace Client

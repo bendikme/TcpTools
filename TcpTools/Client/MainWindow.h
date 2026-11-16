@@ -5,6 +5,8 @@
 #include "Utils.h"
 #include "resource.h"
 
+namespace Client {
+
 // ============================================================
 //  Log entry
 // ============================================================
@@ -27,7 +29,8 @@ class MainWindow
 {
 public:
     static bool  RegisterClass(HINSTANCE hInst);
-    static HWND  Create(HINSTANCE hInst, int nCmdShow,
+    // Creates the client as a child page of `parent` (the tab frame).
+    static HWND  Create(HINSTANCE hInst, HWND parent,
                         const std::wstring& defaultIP   = L"127.0.0.1",
                         int                 defaultPort = 9001,
                         bool                autoConnect = false);
@@ -207,3 +210,5 @@ private:
     void    OnHostComboSelChange();
     void    DoParseComboParts();
 };
+
+} // namespace Client

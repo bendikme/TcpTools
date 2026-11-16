@@ -11,11 +11,11 @@ class RelayMainWindow
 {
 public:
     static bool RegisterClass(HINSTANCE hInst);
-    static HWND Create(HINSTANCE hInst, int nCmdShow);
+    // Creates the relay as a child page of `parent` (the tab frame).
+    static HWND Create(HINSTANCE hInst, HWND parent);
 
 private:
     static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
-    static RelayMainWindow* s_instance;
     static constexpr const wchar_t* WndClassName = L"TcpRelayMainWindow";
 
 public:

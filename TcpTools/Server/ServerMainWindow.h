@@ -5,6 +5,8 @@
 #include "Utils.h"
 #include "resource.h"
 
+namespace Server {
+
 // ============================================================
 //  Log entry
 // ============================================================
@@ -27,7 +29,8 @@ class ServerMainWindow
 {
 public:
     static bool  RegisterClass(HINSTANCE hInst);
-    static HWND  Create(HINSTANCE hInst, int nCmdShow,
+    // Creates the server as a child page of `parent` (the tab frame).
+    static HWND  Create(HINSTANCE hInst, HWND parent,
                         int defaultPort = 9001, bool autoStart = false, bool echoMode = false,
                         const std::wstring& logFile = {});
     static const wchar_t* ClassName() { return L"TcpServerMainWnd"; }
@@ -186,3 +189,5 @@ private:
     std::vector<std::wstring>      m_portHistory;
     void    PopulatePortCombo();
 };
+
+} // namespace Server
