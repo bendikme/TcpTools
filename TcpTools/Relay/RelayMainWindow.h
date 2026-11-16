@@ -2,6 +2,7 @@
 #include "pch.h"
 #include "Utils.h"
 #include "RelayNetwork.h"
+#include "TextView.h"
 #include "HandoffQueue.h"
 
 // ============================================================

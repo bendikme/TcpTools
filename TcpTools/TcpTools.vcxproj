@@ -109,6 +109,7 @@
     <ClInclude Include="Tools.h" />
     <ClInclude Include="AppFrame.h" />
     <ClInclude Include="Common\HexView.h" />
+    <ClInclude Include="Common\TextView.h" />
     <ClInclude Include="Common\Utils.h" />
     <ClInclude Include="Common\ToolHost.h" />
     <ClInclude Include="Common\NetAddr.h" />
@@ -130,6 +131,7 @@
     <ClCompile Include="main.cpp" />
     <ClCompile Include="AppFrame.cpp" />
     <ClCompile Include="Common\HexView.cpp" />
+    <ClCompile Include="Common\TextView.cpp" />
     <ClCompile Include="Client\MainWindow.cpp" />
     <ClCompile Include="Client\Network.cpp" />
     <ClCompile Include="Server\ServerMainWindow.cpp" />

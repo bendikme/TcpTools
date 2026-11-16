@@ -46,7 +46,7 @@ Connects to a TCP server or sends UDP datagrams.
 - Send editor in text or **hex** (`48 65 6C 6C 6F`); load a file (binary files are sent byte-exact).
 - Framing: none, STX/ETX, CR LF, LF, CR, NUL, or a custom prefix/suffix in hex.
 - Auto-connect before a send, auto-disconnect after the reply, keep-alive, cyclic send down to 1 ms.
-- Receive view as text or hex dump, copy, save to file.
+- Receive view as text or hex dump - both show megabytes at once - with select, copy and save to file.
 - Log of every event with timing, socket diagnostics, statistics (latency, throughput, totals).
 
 ### Server
@@ -135,7 +135,7 @@ The version is in `Version.h` only (`year.month.patch`); a release is tagged `v<
 | `TcpTools/main.cpp`       | entry point, command line, message loop                              |
 | `TcpTools/AppFrame.*`     | the main window: tab strip, pages, shortcuts, window placement       |
 | `TcpTools/Tools.h`        | how the frame creates a tool page                                    |
-| `TcpTools/Common/`        | shared code: `HexView` (hex dump control), `Utils.h` (strings, hex, DPI, history), `NetAddr.h` (IPv4/IPv6 addresses, listen, lookup, connect), `HandoffQueue.h` (network thread → window), `ToolHost.h` (page ↔ frame contract) |
+| `TcpTools/Common/`        | shared code: `HexView` (hex dump control), `TextView` (received text, draws only what is visible), `Utils.h` (strings, hex, DPI, history), `NetAddr.h` (IPv4/IPv6 addresses, listen, lookup, connect), `HandoffQueue.h` (network thread → window), `ToolHost.h` (page ↔ frame contract) |
 | `TcpTools/Client/`        | the client page and its network class (namespace `Client`)           |
 | `TcpTools/Server/`        | the server page and its network class (namespace `Server`)           |
 | `TcpTools/Relay/`         | the relay page and its network class                                 |

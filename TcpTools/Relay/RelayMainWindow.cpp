@@ -322,8 +322,8 @@ void RelayMainWindow::OnCreate(HWND hWnd)
     // C2T HexView (hidden by default) + text view (shown by default) + hex toggle
     m_hHexC2T = HexView::Create(hWnd, 0, 0, 10, 10, IDC_STATIC_HEX_C2T, hI);
     ShowWindow(m_hHexC2T, SW_HIDE);  // text view is default
-    m_hEditTextC2T = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-        WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
+    m_hEditTextC2T = CreateWindowExW(WS_EX_CLIENTEDGE, TextView::ClassName(), L"",
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL,
         0, 0, 10, 10, hWnd, (HMENU)IDC_EDIT_TEXT_C2T, hI, nullptr);
     m_hChkHexC2T = MakeCheckbox(hWnd, hI, IDC_CHK_HEX_C2T, 0, 0, 80, 20, L"Hex View", false);
 
@@ -344,8 +344,8 @@ void RelayMainWindow::OnCreate(HWND hWnd)
     // T2C HexView (hidden by default) + text view (shown by default) + hex toggle
     m_hHexT2C = HexView::Create(hWnd, 0, 0, 10, 10, IDC_STATIC_HEX_T2C, hI);
     ShowWindow(m_hHexT2C, SW_HIDE);  // text view is default
-    m_hEditTextT2C = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-        WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
+    m_hEditTextT2C = CreateWindowExW(WS_EX_CLIENTEDGE, TextView::ClassName(), L"",
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL,
         0, 0, 10, 10, hWnd, (HMENU)IDC_EDIT_TEXT_T2C, hI, nullptr);
     m_hChkHexT2C = MakeCheckbox(hWnd, hI, IDC_CHK_HEX_T2C, 0, 0, 80, 20, L"Hex View", false);
 
@@ -467,10 +467,6 @@ void RelayMainWindow::OnCreate(HWND hWnd)
     m_hBtnRefreshDiag = MakeButton(hWnd, hI, IDC_BTN_REFRESHDIAG, 0, 0, 80, 22, L"Refresh");
     ShowWindow(m_hStaticDiagInfo, SW_HIDE);
     ShowWindow(m_hBtnRefreshDiag, SW_HIDE);
-
-    // A multi-line EDIT stops accepting text at 32 KB unless told otherwise.
-    SendMessageW(m_hEditTextC2T, EM_SETLIMITTEXT, 0x7FFFFFFE, 0);
-    SendMessageW(m_hEditTextT2C, EM_SETLIMITTEXT, 0x7FFFFFFE, 0);
 
     // Default font
     HFONT hFont = m_hFontUI;
@@ -1171,7 +1167,7 @@ void RelayMainWindow::ShowViews(bool c2t)
     } else {
         ShowWindow(hex,  SW_HIDE);
         ShowWindow(edit, SW_SHOW);
-        SetWindowTextW(edit, Utils::BytesToDisplayText(v).c_str());
+        TextView::SetText(edit, Utils::BytesToDisplayText(v));
     }
     (c2t ? m_viewStaleC2T : m_viewStaleT2C) = false;
 }
@@ -1196,10 +1192,7 @@ void RelayMainWindow::AppendView(bool c2t, const BYTE* data, size_t len)
     } else {
         std::wstring s = Utils::BytesToDisplayText(data, len);
         if (s.empty()) return;
-        HWND edit = c2t ? m_hEditTextC2T : m_hEditTextT2C;
-        int textLen = GetWindowTextLengthW(edit);
-        SendMessageW(edit, EM_SETSEL, textLen, textLen);
-        SendMessageW(edit, EM_REPLACESEL, FALSE, (LPARAM)s.c_str());
+        TextView::AppendText(c2t ? m_hEditTextC2T : m_hEditTextT2C, s);
     }
 }
 

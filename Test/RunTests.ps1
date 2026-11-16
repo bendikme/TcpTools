@@ -29,7 +29,8 @@ param(
     [int]    $Port     = 9901,
     [string] $Config   = "Debug",
     [string] $Exe      = "",       # test this TcpTools.exe instead of bin\<Config>\TcpTools.exe
-    [int]    $MaxLagMs = 1500      # how long the window may take to react after a 1 MB burst
+    [int]    $MaxLagMs = 1500      # how long the window may take to react to a click, and to show
+                                   # 512 KB of text, after a burst
 )
 
 Set-StrictMode -Version Latest
@@ -40,6 +41,7 @@ $EXE  = if ($Exe) { $Exe } else { Join-Path $ROOT "bin\$Config\TcpTools.exe" }
 # The port is part of the names so that two test runs do not share their files.
 $LOG  = Join-Path $env:TEMP "TcpTools_test_recv_$Port.bin"
 $LOG2 = Join-Path $env:TEMP "TcpTools_test_recv_udp_$Port.bin"
+$script:prevLen = -1
 $script:PASS = 0
 $script:FAIL = 0
 
@@ -226,6 +228,24 @@ try {
     Assert-True ($reacted -and $lag -le $MaxLagMs) "Server: window reacts within $MaxLagMs ms after a 1 MB burst" "took $lag ms"
     [void][W32]::PostMessage($chk, [W32]::BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero)
     [void](Wait-Until { [int][W32]::SendMessage($chk, [W32]::BM_GETCHECK, [IntPtr]::Zero, [IntPtr]::Zero) -eq 0 } 30000)
+
+    # The text view must show a burst at once, not seconds later. 512 KB of text
+    # lines; the view shows each LF as CR LF, so its length is known exactly.
+    $S_BTN_CLEARRECV = 1021
+    $recvView = Get-Ctl $pgServer $C_EDIT_RECV
+    function Get-ViewLength { [int][W32]::SendMessage($recvView, [W32]::WM_GETTEXTLENGTH, [IntPtr]::Zero, [IntPtr]::Zero) }
+    $script:prevLen = -1                                 # let the megabyte above settle first
+    [void](Wait-Until { $n = Get-ViewLength; $same = ($n -eq $script:prevLen); $script:prevLen = $n; $same } 30000)
+    Click $pgServer $S_BTN_CLEARRECV
+    [void](Wait-Until { (Get-ViewLength) -eq 0 } 10000)
+    $t7 = New-Object byte[] (512 * 1024)
+    for ($i = 0; $i -lt $t7.Length; $i++) { $t7[$i] = if ($i % 80 -eq 79) { 10 } else { 65 + ($i % 26) } }
+    $wantLen = $t7.Length + [int][Math]::Floor($t7.Length / 80)
+    Assert-Equal (Send-Recv -Data $t7 -ToPort $ServerPort -ReadMs 15000) $t7 "Echo: 512 KB of text lines"; $expectedLog.AddRange($t7)
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $shown = Wait-Until { (Get-ViewLength) -eq $wantLen } 30000
+    $took = $sw.ElapsedMilliseconds
+    Assert-True ($shown -and $took -le $MaxLagMs) "Server: 512 KB of text is in the Receive view within $MaxLagMs ms" ("took $took ms, view length " + (Get-ViewLength) + " of $wantLen")
 
     # -------------------------------------------------------------------------
     Write-Host "`n2. Server log file" -ForegroundColor Cyan

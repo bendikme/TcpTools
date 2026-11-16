@@ -344,11 +344,11 @@ void ServerMainWindow::OnCreate(HWND hWnd, HINSTANCE hInst,
     // --- Receive group ---
     m_hGrpRecv    = MakeGroupBox(IDC_GRP_RECEIVE, L" Receive ", 0,0,10,10);
     m_hChkHexRecv = MakeCheck(IDC_CHK_HEXVIEW_RECV, L"Hex View", 0,0,10,10);
-    m_hEditRecv   = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-        WS_CHILD|WS_VISIBLE|WS_VSCROLL|WS_TABSTOP|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY,
+    // A TextView, not an EDIT: it shows a megabyte at once (see TextView.h).
+    m_hEditRecv   = CreateWindowExW(WS_EX_CLIENTEDGE, TextView::ClassName(), L"",
+        WS_CHILD|WS_VISIBLE|WS_VSCROLL|WS_TABSTOP,
         0,0,10,10, hWnd, (HMENU)(UINT_PTR)IDC_EDIT_RECV, hInst, nullptr);
     SendMessage(m_hEditRecv, WM_SETFONT, (WPARAM)m_hFontMono, TRUE);
-    SendMessage(m_hEditRecv, EM_SETLIMITTEXT, 0, 0); // no character limit
     m_hHexRecv = HexView::Create(hWnd, 0,0,10,10, IDC_STATIC_HEXRECV, hInst);
     ShowWindow(m_hHexRecv, SW_HIDE);
     m_hBtnClearRecv = MakeButton(IDC_BTN_CLEARRECV, L"Clear",    0,0,10,10);
@@ -723,7 +723,7 @@ void ServerMainWindow::OnCommand(WORD id, WORD notify, HWND /*hCtrl*/)
         m_recvData.clear();
         m_lastRecvData.clear();
         ResetRecvTextState();
-        SetWindowTextW(m_hEditRecv, L"");
+        TextView::Clear(m_hEditRecv);
         HexView::ClearData(m_hHexRecv);
         m_textStale = m_hexStale = false;
         break;
@@ -1200,27 +1200,14 @@ void ServerMainWindow::AppendReceiveText(const std::vector<BYTE>& data, bool flu
     if (bytes.size() <= off) return;
     m_recvLastCR = (bytes.back() == '\r');
 
-    std::wstring ws = Utils::BytesToDisplayText(bytes.data() + off, bytes.size() - off);
-    int len = GetWindowTextLengthW(m_hEditRecv);
-    // No repaint while the text changes, and no undo record: a read-only view has no
-    // use for it, and it makes every append slower as the text grows.
-    SendMessage(m_hEditRecv, WM_SETREDRAW, FALSE, 0);
-    SendMessage(m_hEditRecv, EM_SETSEL, (WPARAM)len, (LPARAM)len);
-    SendMessage(m_hEditRecv, EM_REPLACESEL, FALSE, (LPARAM)ws.c_str());
-    SendMessage(m_hEditRecv, EM_EMPTYUNDOBUFFER, 0, 0);
-    SendMessage(m_hEditRecv, WM_SETREDRAW, TRUE, 0);
-    SendMessage(m_hEditRecv, EM_SCROLLCARET, 0, 0);
-    InvalidateRect(m_hEditRecv, nullptr, FALSE);
+    TextView::AppendText(m_hEditRecv, Utils::BytesToDisplayText(bytes.data() + off, bytes.size() - off));
 }
 
 void ServerMainWindow::RebuildTextView()
 {
     ResetRecvTextState();
-    SetWindowTextW(m_hEditRecv, Utils::BytesToDisplayText(m_recvData).c_str());
+    TextView::SetText(m_hEditRecv, Utils::BytesToDisplayText(m_recvData));
     m_recvLastCR = !m_recvData.empty() && m_recvData.back() == '\r';
-    int len = GetWindowTextLengthW(m_hEditRecv);
-    SendMessage(m_hEditRecv, EM_SETSEL, (WPARAM)len, (LPARAM)len);
-    SendMessage(m_hEditRecv, EM_SCROLLCARET, 0, 0);
 }
 
 // Replaces the visible view with the whole of m_recvData; the other one is rebuilt when shown.
@@ -1614,7 +1601,7 @@ void ServerMainWindow::OnNetDataRun(std::vector<NetEvent*>& run)
         m_recvData.clear();
         m_lastRecvData.clear();
         ResetRecvTextState();
-        SetWindowTextW(m_hEditRecv, L"");
+        TextView::Clear(m_hEditRecv);
         HexView::ClearData(m_hHexRecv);
         m_textStale = m_hexStale = false;
     }

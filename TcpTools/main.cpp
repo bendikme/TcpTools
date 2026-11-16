@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "AppFrame.h"
 #include "HexView.h"
+#include "TextView.h"
 #include "Tools.h"
 #include "Utils.h"
 
@@ -95,6 +96,7 @@ int WINAPI wWinMain(
 
     int exitCode = 1;
     if (!HexView::RegisterClass(hInstance) ||
+        !TextView::RegisterClass(hInstance) ||
         !Tools::RegisterClientClass(hInstance) ||
         !Tools::RegisterServerClass(hInstance) ||
         !Tools::RegisterRelayClass(hInstance) ||

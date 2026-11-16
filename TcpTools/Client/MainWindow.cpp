@@ -363,12 +363,11 @@ void MainWindow::OnCreate(HWND hWnd, HINSTANCE hInst,
     // --- Receive group ---
     m_hGrpRecv    = MakeGroupBox(IDC_GRP_RECEIVE, L" Receive ", 0,0,10,10);
     m_hChkHexRecv = MakeCheck(IDC_CHK_HEXVIEW_RECV, L"Hex View", 0,0,10,10);
-    m_hEditRecv   = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP |
-        ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
+    // A TextView, not an EDIT: it shows a megabyte at once (see TextView.h).
+    m_hEditRecv   = CreateWindowExW(WS_EX_CLIENTEDGE, TextView::ClassName(), L"",
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP,
         0,0,10,10, hWnd, (HMENU)(UINT_PTR)IDC_EDIT_RECV, hInst, nullptr);
     SendMessage(m_hEditRecv, WM_SETFONT, (WPARAM)m_hFontMono, TRUE);
-    SendMessage(m_hEditRecv, EM_SETLIMITTEXT, 0, 0); // no character limit
 
     m_hHexRecv = HexView::Create(hWnd, 0,0,10,10, IDC_STATIC_HEXRECV, hInst);
     ShowWindow(m_hHexRecv, SW_HIDE);
@@ -1468,7 +1467,7 @@ void MainWindow::RebuildRecvText()
     m_recvPending.assign(m_recvData.begin() + complete, m_recvData.end());
     std::wstring text = Utils::BytesToDisplayText(m_recvData.data(), complete);
     m_recvPrevCR = complete > 0 && m_recvData[complete - 1] == '\r';
-    SetWindowTextW(m_hEditRecv, text.c_str());
+    TextView::SetText(m_hEditRecv, text);
     m_recvTextStale = false;
 }
 
@@ -1478,7 +1477,7 @@ void MainWindow::ClearRecv()
     m_recvPending.clear();
     m_recvPrevCR = false;
     m_recvTextStale = m_recvHexStale = false;
-    SetWindowTextW(m_hEditRecv, L"");
+    TextView::Clear(m_hEditRecv);
     HexView::ClearData(m_hHexRecv);
 }
 
@@ -1488,8 +1487,7 @@ void MainWindow::FlushRecvPending()
     if (m_recvPending.empty() || m_hexRecvMode) return;
     std::wstring t = Utils::BytesToDisplayText(m_recvPending);
     m_recvPending.clear();
-    SendMessage(m_hEditRecv, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
-    SendMessage(m_hEditRecv, EM_REPLACESEL, FALSE, (LPARAM)t.c_str());
+    TextView::AppendText(m_hEditRecv, t);
 }
 
 // m_recvData already contains `data`; this brings the visible view along and
@@ -1516,8 +1514,7 @@ void MainWindow::AppendReceiveData(const std::vector<BYTE>& data)
     if (m_recvPrevCR && complete > 0 && bytes[0] == '\n') off = 1;   // CR LF split over two chunks
     if (complete > off) {
         std::wstring ws = Utils::BytesToDisplayText(bytes.data() + off, complete - off);
-        SendMessage(m_hEditRecv, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
-        SendMessage(m_hEditRecv, EM_REPLACESEL, FALSE, (LPARAM)ws.c_str());
+        TextView::AppendText(m_hEditRecv, ws);
         m_recvPrevCR = bytes[complete - 1] == '\r';
     } else if (complete > 0) {
         m_recvPrevCR = false;

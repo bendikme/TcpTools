@@ -2,6 +2,7 @@
 #include "pch.h"
 #include "ServerNetwork.h"
 #include "HexView.h"
+#include "TextView.h"
 #include "Utils.h"
 #include "resource.h"
 
