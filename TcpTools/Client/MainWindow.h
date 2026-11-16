@@ -53,29 +53,42 @@ private:
 
     // ---- Network message handlers ------------------------------
     void OnNetConnected();
-    void OnNetDisconnected();
+    void OnNetDisconnected(bool neverConnected);
     void OnNetDataReceived(size_t len, BYTE* pData);   // takes ownership of pData
     void OnNetSendComplete(size_t bytesSent, CycleStats* pStats);
     void OnNetError(int wsaErr, std::wstring* pMsg);
+    void OnCyclicMessage(size_t count, bool final, uint32_t gen);
+    void OnNetLatency(double latMs);
 
     // ---- UI Actions --------------------------------------------
-    void DoConnect();
+    bool DoConnect();
     void DoDisconnect();
     void DoSend();
     void DoLoadFile();
     void DoReloadLogEntry(int idx);
     void DoSaveLastRecv();    // save last transmission to file
+    void DoCyclicToggle();
+    void DoSendHexToggle();
 
     // ---- UI Helpers --------------------------------------------
-    void SetConnectionUI(bool connected);
+    enum ConnState { CS_IDLE, CS_CONNECTING, CS_CONNECTED };
+    void SetConnectionUI(ConnState st);
+    void UpdateSendEnable();
     void UpdateStats(const CycleStats& s);
     void ClearStats();
     void AddLogEntry(LogEntry&& e);
-    void AppendReceiveText(const std::vector<BYTE>& data);
-    std::vector<BYTE> GetSendData();   // reads send textbox or hex area
-    NetConfig         BuildNetConfig();
+    void ClearLog();
+    void AppendReceiveData(const std::vector<BYTE>& data);
+    void RebuildRecvText();
+    void ClearRecv();
+    void FlushRecvPending();
+    bool GetSendData(std::vector<BYTE>& out);   // payload per the send-editor rules
+    void SetSendEditorText(const std::wstring& text);
+    void SetSendHexMode(bool hex);
+    void LoadPayloadIntoEditor(const std::vector<BYTE>& bytes, const std::wstring& name);
+    void ClearSendEditor();
+    bool BuildNetConfig(NetConfig& cfg, bool forSend);
     SeparatorMode     GetSeparatorMode();
-    void              RefreshSendView();
     void              RefreshRecvView();
     void              RefreshDiagnostics();
     void              RefreshLogView();
@@ -110,8 +123,7 @@ private:
 
     // Send panel
     HWND    m_hEditSend     {nullptr};
-    HWND    m_hHexSend      {nullptr};   // HexView
-    HWND    m_hBtnSend      {nullptr};
+    HWND    m_hBtnSend     {nullptr};
     HWND    m_hBtnLoadFile  {nullptr};
     HWND    m_hBtnClearSend {nullptr};
     HWND    m_hChkHexSend   {nullptr};
@@ -154,7 +166,8 @@ private:
     HWND    m_hBtnCyclicStart     {nullptr};
     HWND    m_hLblCyclic          {nullptr};
     HWND    m_hStaticCyclicCount  {nullptr};
-    bool                        m_cyclicRunning {false};
+    bool                        m_cyclicRunning {false};   // thread started and not yet reaped
+    uint32_t                    m_cyclicGen     {0};       // identifies the current run in WM_CYCLIC_UPDATE
     std::atomic<bool>           m_cyclicStop    {false};
     std::atomic<uint32_t>       m_cyclicCount   {0};
     std::thread                 m_cyclicThread;
@@ -183,9 +196,17 @@ private:
     std::unique_ptr<TcpNetwork> m_net;
     std::vector<LogEntry>       m_log;
     std::vector<int>            m_logVisible;   // indices into m_log passing current filter
-    std::vector<BYTE>           m_sendData;      // current data loaded / typed
-    std::vector<BYTE>           m_recvData;      // accumulated received data (all sessions)
+    std::vector<BYTE>           m_sendData;      // bytes pinned by Load File / log reload; empty = editor text is the payload
+    std::vector<BYTE>           m_recvData;      // received data, newest kept (RECV_MAX)
     std::vector<BYTE>           m_lastRecvData;  // only last transmission (reset on each Send)
+    std::vector<BYTE>           m_recvPending;   // incomplete UTF-8 tail not yet shown in the text view
+    bool                        m_recvPrevCR   {false};  // text view ended with a CR (swallow a following LF)
+    bool                        m_recvTextStale{false};  // text view lags m_recvData (hex view was in front)
+    bool                        m_recvHexStale {false};  // hex view lags m_recvData (text view was in front)
+    size_t                      m_logBase      {0};      // entries dropped from the front (keeps "#" stable)
+    size_t                      m_logBytes     {0};      // payload bytes held by m_log
+    std::wstring                m_lastError;             // shown in the status line after the session ends
+    bool                        m_sessionActive{false};  // connecting or connected
     bool                        m_hexSendMode  {false};
     bool                        m_hexRecvMode  {false};
     bool                        m_ignoreEditChange {false}; // suppress EN_CHANGE during programmatic edits

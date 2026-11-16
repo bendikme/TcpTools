@@ -67,6 +67,13 @@ private:
     void SwitchBottomTab(int tab);
     void RefreshC2TView();
     void RefreshT2CView();
+    void ShowViews(bool c2t);
+    void AppendView(bool c2t, const BYTE* data, size_t len);
+    bool FlushHeld(bool c2t);
+    void DiscardHeld(bool c2t, const wchar_t* why);
+    void DrainNetworkMessages();
+    void ResetSessionUI();
+    void UpdateStatusText();
     void UpdateTitle();
     void CreateTooltips();
     void PositionHelpButton();
@@ -78,6 +85,7 @@ private:
     void OnRelayTargetConn();
     void OnRelayTargetDisconn();
     void OnRelayTargetConnecting();
+    void OnRelayData(bool c2t, const BYTE* data, int len, bool forwarded);
     void OnRelayClientData(const BYTE* data, int len, bool forwarded);
     void OnRelayTargetData(const BYTE* data, int len, bool forwarded);
     void OnRelayError(int err, const std::wstring& msg);
@@ -133,6 +141,7 @@ private:
 
     // Fonts
     HFONT m_hFontMono       {nullptr};
+    HFONT m_hFontUI         {nullptr};
 
     // Statistics labels
     HWND m_hStatC2TBytes    {nullptr};
@@ -162,11 +171,17 @@ private:
     int                   m_filterIndex {0}; // 0=All
     int                   m_bottomTab   {0}; // 0=Log, 1=Diagnostics, 2=Statistics
 
-    // Buffers (pending data when paused)
-    std::vector<BYTE>     m_bufferC2T;
-    std::vector<BYTE>     m_bufferT2C;
-    int                   m_bufC2TPackets {0};
-    int                   m_bufT2CPackets {0};
+    // Held packets (not forwarded yet), one entry per received chunk /
+    // datagram so UDP datagram boundaries survive manual forwarding.
+    std::deque<std::vector<BYTE>> m_pendC2T;
+    std::deque<std::vector<BYTE>> m_pendT2C;
+    size_t                m_pendBytesC2T  {0};
+    size_t                m_pendBytesT2C  {0};
+
+    // Data shown in the text / hex view of each direction: the traffic seen,
+    // newest last, capped (RELAY_VIEW_CAP). Both views show the same bytes.
+    std::vector<BYTE>     m_viewC2T;
+    std::vector<BYTE>     m_viewT2C;
 
     // Statistics
     size_t m_bytesC2T       {0};
@@ -178,6 +193,12 @@ private:
     std::wstring m_clientAddr;
     std::wstring m_targetAddr;   // stored when target connects
     bool         m_isListening    {false};
+    bool         m_clientUp       {false};  // as told by the network events
+    bool         m_targetUp       {false};
+    std::wstring m_lastError;
+    std::wstring m_proto {L"TCP"}; // protocol of the current / last relay
+    std::wstring m_targetText;    // "host:port" of the running relay
+    std::wstring m_listenText;
 
     // View mode flags for data panels
     bool         m_hexModeC2T    {false};  // false = text view, true = hex view

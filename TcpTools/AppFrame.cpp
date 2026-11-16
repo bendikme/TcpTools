@@ -114,6 +114,9 @@ LRESULT CALLBACK AppFrame::WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
         LRESULT r = DefWindowProcW(hWnd, msg, wParam, lParam);
         SetWindowLongPtrW(hWnd, 0, 0);
         delete self;
+        // Only now: every page has been destroyed and has stopped its threads
+        // (pages go between the frame's WM_DESTROY and this message).
+        PostQuitMessage(0);
         return r;
     }
     return self->HandleMessage(msg, wParam, lParam);
@@ -155,6 +158,14 @@ LRESULT AppFrame::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam)
         return 0;
     }
 
+    case WM_TOOL_EVENT:
+        OnToolEvent((HWND)lParam, (int)wParam);
+        return 0;
+
+    case WM_TIMER:
+        if (wParam == IDT_UNREAD_LABELS) { FlushUnreadLabels(); return 0; }
+        break;
+
     case WM_FRAME_PAGE_TITLE:
     {
         int i = FindPage((HWND)lParam);
@@ -191,12 +202,12 @@ LRESULT AppFrame::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam)
         return 0;
 
     case WM_DESTROY:
+        KillTimer(m_hWnd, IDT_UNREAD_LABELS);
         // The pages are child windows: Windows destroys them right after
         // this message, and each one stops its own network threads.
         if (m_hStateImages) { TabCtrl_SetImageList(m_hTabs, nullptr); ImageList_Destroy(m_hStateImages); m_hStateImages = nullptr; }
         if (m_hFont) { DeleteObject(m_hFont); m_hFont = nullptr; }
-        PostQuitMessage(0);
-        return 0;
+        return 0;                       // the quit message is posted in WM_NCDESTROY
     }
     return DefWindowProcW(m_hWnd, msg, wParam, lParam);
 }
@@ -293,7 +304,11 @@ void AppFrame::OnNotify(NMHDR* nm)
             const wchar_t* state = p.state == TOOL_ACTIVE  ? L"connected"
                                  : p.state == TOOL_WAITING ? L"waiting"
                                  :                           L"idle";
-            text = PageLabel(p) + L"  (" + state + L")\nRight-click for the tab menu.";
+            text = PageLabel(p) + L"  (" + state + L")";
+            if (p.unread > 0)
+                text += L"\n" + std::to_wstring(p.unread) + L" new log event" + (p.unread == 1 ? L"" : L"s")
+                      + L" since this tab was last in front.";
+            text += L"\nRight-click for the tab menu.";
         } else {
             text = L"New tab (Ctrl+T): another client, server or relay.";
         }
@@ -399,6 +414,13 @@ void AppFrame::ActivatePage(int index, bool setFocus)
     Page& p = m_pages[index];
     TabCtrl_SetCurSel(m_hTabs, index);
 
+    // The tab is in front now: what it counted has been seen.
+    if (p.unread != 0 || p.labelDirty) {
+        p.unread = 0;
+        p.labelDirty = false;
+        UpdateTabItem(index);
+    }
+
     RECT page = PageRect();
     SetWindowPos(p.hwnd, HWND_TOP, page.left, page.top,
                  page.right - page.left, page.bottom - page.top, SWP_SHOWWINDOW);
@@ -434,6 +456,42 @@ std::wstring AppFrame::PageLabel(const Page& p) const
     return s;
 }
 
+// The tab text: the label plus, for a tab that is not in front, the number of
+// log events it has had since it was last looked at - "Server  (12)".
+static std::wstring TabText(const std::wstring& label, int unread)
+{
+    if (unread <= 0) return label;
+    return label + (unread > 999 ? std::wstring(L"  (999+)")
+                                 : L"  (" + std::to_wstring(unread) + L")");
+}
+
+void AppFrame::OnToolEvent(HWND page, int count)
+{
+    int i = FindPage(page);
+    if (i < 0 || i == m_active || count <= 0) return;
+    Page& p = m_pages[i];
+    p.unread = (p.unread > INT_MAX - count) ? INT_MAX : p.unread + count;
+    // A busy tool logs thousands of events a second: only count here and let
+    // a timer repaint the tab a few times a second.
+    if (!p.labelDirty) {
+        p.labelDirty = true;
+        SetTimer(m_hWnd, IDT_UNREAD_LABELS, 200, nullptr);
+    }
+}
+
+void AppFrame::FlushUnreadLabels()
+{
+    KillTimer(m_hWnd, IDT_UNREAD_LABELS);
+    bool any = false;
+    for (int i = 0; i < (int)m_pages.size(); ++i) {
+        if (!m_pages[i].labelDirty) continue;
+        m_pages[i].labelDirty = false;
+        UpdateTabItem(i);
+        any = true;
+    }
+    if (any) OnSize();                             // wider labels can wrap the tab row
+}
+
 // A page titles itself "TCP Client v1.2.3  –  host:port": everything after
 // the dash is the detail shown on its tab.
 void AppFrame::UpdatePageTitle(int index)
@@ -454,7 +512,7 @@ void AppFrame::UpdatePageTitle(int index)
 
 void AppFrame::UpdateTabItem(int index)
 {
-    std::wstring label = PageLabel(m_pages[index]);
+    std::wstring label = TabText(PageLabel(m_pages[index]), m_pages[index].unread);
     TCITEMW ti = {};
     ti.mask    = TCIF_TEXT | TCIF_IMAGE;
     ti.pszText = (LPWSTR)label.c_str();
@@ -539,7 +597,8 @@ void AppFrame::ShowAbout()
         L"client, server or relay; Ctrl+W or a middle-click closes a tab.\n"
         L"• Ctrl+Tab / Ctrl+Shift+Tab switch tabs.\n"
         L"• The dot on a tab shows its state: grey idle, amber waiting "
-        L"(listening or connecting), green connected.\n"
+        L"(listening or connecting), green connected. A number in brackets "
+        L"counts a tab's log events since it was last in front.\n"
         L"• F1 opens the help of the tab in front.\n"
         L"\n"
         L"Command line:\n"

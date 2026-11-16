@@ -32,25 +32,24 @@ static constexpr int BTN_W     = 90;
 static constexpr int LABEL_W   = 50;
 static constexpr int GRP_TITLE = 18; // group-box title clearance
 
-static HFONT CreateUIFont()
+// Caps that keep memory bounded on a long-running session.
+static constexpr size_t RECV_MAX        = 8u * 1024 * 1024;    // received bytes kept; newest half survives a trim
+static constexpr size_t LAST_RECV_MAX   = 32u * 1024 * 1024;   // "Save last transmission"
+static constexpr size_t LOG_MAX_ENTRIES = 20000;               // oldest 10 % dropped when exceeded
+static constexpr size_t LOG_MAX_BYTES   = 64u * 1024 * 1024;   // payload bytes held by the log
+static constexpr size_t FILE_MAX        = 64u * 1024 * 1024;   // Load File limit
+static constexpr size_t HEX_EDIT_MAX    = 1u * 1024 * 1024;    // largest payload edited as hex text
+static constexpr size_t TEXT_SHOW_MAX   = 8u * 1024 * 1024;    // largest payload shown in the text editor
+
+// Drops the oldest half once `v` exceeds `maxBytes`. True when it trimmed.
+static bool TrimNewestHalf(std::vector<BYTE>& v, size_t maxBytes)
 {
-    NONCLIENTMETRICSW ncm = {};
-    ncm.cbSize = sizeof(ncm);
-    SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
-    return CreateFontIndirectW(&ncm.lfMessageFont);
+    if (v.size() <= maxBytes) return false;
+    v.erase(v.begin(), v.end() - (std::ptrdiff_t)(maxBytes / 2));
+    return true;
 }
-static HFONT CreateMonoUI()
-{
-    LOGFONTW lf = {};
-    lf.lfHeight         = -13;
-    lf.lfWeight         = FW_NORMAL;
-    lf.lfPitchAndFamily = FIXED_PITCH | FF_MODERN;
-    lf.lfCharSet        = DEFAULT_CHARSET;
-    wcscpy_s(lf.lfFaceName, L"Consolas");
-    HFONT f = CreateFontIndirectW(&lf);
-    if (!f) { wcscpy_s(lf.lfFaceName, L"Courier New"); f = CreateFontIndirectW(&lf); }
-    return f;
-}
+
+static const wchar_t* ProtoLabel(bool udp) { return udp ? L"UDP" : L"TCP"; }
 
 // ============================================================
 //  RegisterClass / Create
@@ -142,8 +141,9 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
                 L"1. Enter the server address and port at the top.\n"
                 L"You can type host:port (e.g. 192.168.1.10:502) "
                 L"and both fields are filled automatically.\n"
-                L"2. Choose TCP or UDP and set the timeout.\n"
-                L"3. Click Connect (or enable Auto-Connect).\n"
+                L"2. Choose TCP or UDP and set the timeout (IPv4 only).\n"
+                L"3. Click Connect (or enable Auto-Connect). Disconnect "
+                L"also cancels a connection attempt in progress.\n"
                 L"4. Type data in the Send editor and click Send.\n"
                 L"5. Incoming data appears in the Receive panel.\n"
                 L"\n"
@@ -151,19 +151,23 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
                 L"\n"
                 L"\u2022 Ctrl+Enter \u2014 Send data\n"
                 L"\u2022 F1 \u2014 This help screen\n"
+                L"\u2022 Ctrl+T / Ctrl+W / Ctrl+Tab \u2014 new tab / close tab / next tab\n"
                 L"\n"
                 L"\u2500\u2500\u2500 FEATURES \u2500\u2500\u2500\n"
                 L"\n"
-                L"\u2022 Hex View \u2014 Send/receive data as hex bytes.\n"
+                L"\u2022 Hex \u2014 Edit the data to send as hex byte pairs; "
+                L"Hex View (Receive) shows received data as hex.\n"
                 L"\u2022 Framing \u2014 Auto-wrap payloads with STX/ETX, "
                 L"CR LF, LF, CR, NUL, or custom hex delimiters.\n"
                 L"\u2022 Cyclic Send \u2014 Repeat the payload at a timed "
                 L"interval (down to 1 ms) for stress testing.\n"
                 L"\u2022 Auto-Connect \u2014 Connect on demand when sending.\n"
-                L"\u2022 Auto-Disconnect \u2014 Drop after each send.\n"
-                L"\u2022 Keep-Alive \u2014 Detect broken connections early.\n"
-                L"\u2022 Load/Save \u2014 Load files into send editor, "
-                L"save received data to disk.\n"
+                L"\u2022 Auto-Disconnect \u2014 Drop the connection right after "
+                L"each send (a response not yet received is lost).\n"
+                L"\u2022 Keep-Alive \u2014 Detect broken TCP connections early.\n"
+                L"\u2022 Load/Save \u2014 Load a file (up to 64 MB) as the data to "
+                L"send, exactly as it is on disk; save the last received "
+                L"transmission to disk.\n"
                 L"\u2022 Connection History \u2014 Dropdown remembers recent "
                 L"host:port entries across sessions.\n"
                 L"\n"
@@ -202,7 +206,7 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
         if (self) self->OnNetConnected();
         return 0;
     case WM_NET_DISCONNECTED:
-        if (self) self->OnNetDisconnected();
+        if (self) self->OnNetDisconnected(wParam != 0);
         return 0;
     case WM_NET_DATA_RECEIVED:
         if (self) self->OnNetDataReceived((size_t)wParam, (BYTE*)lParam);
@@ -217,21 +221,7 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
         if (self) {
             // Reconstruct int64 latency (microseconds) from lo32/hi32
             int64_t latUs = (int64_t)(DWORD)wParam | ((int64_t)(DWORD)lParam << 32);
-            double latMs = latUs / 1000.0;
-            // Find last Sent entry and store latency
-            for (int i = (int)self->m_log.size() - 1; i >= 0; --i) {
-                if (self->m_log[i].type == LogType::Sent) {
-                    self->m_log[i].latencyMs = latMs;
-                    // Find this entry's virtual row and invalidate it
-                    for (int v = (int)self->m_logVisible.size() - 1; v >= 0; --v) {
-                        if (self->m_logVisible[v] == i) {
-                            ListView_RedrawItems(self->m_hListLog, v, v);
-                            break;
-                        }
-                    }
-                    break;
-                }
-            }
+            self->OnNetLatency(latUs / 1000.0);
         }
         return 0;
     case WM_CTLCOLORSTATIC:
@@ -243,11 +233,8 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
     }
 
     case WM_CYCLIC_UPDATE:
-        if (self) {
-            wchar_t cbuf[64];
-            swprintf_s(cbuf, L"Sent: %u", (unsigned)wParam);
-            SetWindowTextW(self->m_hStaticCyclicCount, cbuf);
-        }
+        // lParam = (run id << 1) | final
+        if (self) self->OnCyclicMessage((size_t)wParam, (lParam & 1) != 0, (uint32_t)((uint64_t)lParam >> 1));
         return 0;
 
     case WM_PARSE_HOST_COMBO:
@@ -310,8 +297,8 @@ void MainWindow::OnCreate(HWND hWnd, HINSTANCE hInst,
                           const std::wstring& defaultIP, int defaultPort, bool autoConnect)
 {
     m_autoConnect = autoConnect;
-    m_hFont     = CreateUIFont();
-    m_hFontMono = CreateMonoUI();
+    m_hFont     = Dpi::CreateUIFont();
+    m_hFontMono = Dpi::CreateMonoFont(13);
 
     // --- Connection group (placeholder pos; real pos set in LayoutControls) ---
     m_hGrpConn     = MakeGroupBox(IDC_GRP_CONNECTION, L" Connection ", 0,0,10,10);
@@ -376,7 +363,7 @@ void MainWindow::OnCreate(HWND hWnd, HINSTANCE hInst,
     ShowWindow(m_hEditPreFix, SW_HIDE); ShowWindow(m_hEditSufFix, SW_HIDE);
     ShowWindow(m_hLblPre, SW_HIDE);    ShowWindow(m_hLblSuf, SW_HIDE);
 
-    m_hChkHexSend   = MakeCheck(IDC_CHK_HEXVIEW,    L"Hex View", 0,0,10,10);
+    m_hChkHexSend   = MakeCheck(IDC_CHK_HEXVIEW,    L"Hex", 0,0,10,10);
     m_hEditSend     = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL |
         ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN,
@@ -384,9 +371,6 @@ void MainWindow::OnCreate(HWND hWnd, HINSTANCE hInst,
     SendMessage(m_hEditSend, WM_SETFONT, (WPARAM)m_hFontMono, TRUE);
     SetWindowSubclass(m_hEditSend, SendEditSubclassProc, 1, 0);
     SendMessage(m_hEditSend, EM_SETLIMITTEXT, 0, 0); // no character limit
-
-    m_hHexSend = HexView::Create(hWnd, 0,0,10,10, IDC_STATIC_HEXVIEW, hInst);
-    ShowWindow(m_hHexSend, SW_HIDE);
 
     m_hBtnSend      = MakeButton(IDC_BTN_SEND,      L"Send",       0,0,10,10);
     m_hBtnLoadFile  = MakeButton(IDC_BTN_LOADFILE,  L"Load File",  0,0,10,10);
@@ -475,7 +459,8 @@ void MainWindow::OnCreate(HWND hWnd, HINSTANCE hInst,
 
     // Log icons (ImageList)
     {
-        m_hImgListLog = ImageList_Create(16, 16, ILC_COLOR32 | ILC_MASK, 8, 0);
+        const int icon = Dpi::Scale(16);
+        m_hImgListLog = ImageList_Create(icon, icon, ILC_COLOR32 | ILC_MASK, 8, 0);
         // Create icons for each LogType via GDI (colored circles)
         struct { COLORREF color; const wchar_t* glyph; } iconDefs[] = {
             { RGB(0,160,0),   L"\x25CF" },  // Connected  (green circle)
@@ -486,13 +471,13 @@ void MainWindow::OnCreate(HWND hWnd, HINSTANCE hInst,
             { RGB(128,128,128), L"\x2139" }, // Info (gray info)
         };
         HDC hdc = GetDC(hWnd);
-        HFONT hIconFont = CreateFontW(14, 0, 0, 0, FW_NORMAL, 0,0,0,
+        HFONT hIconFont = CreateFontW(Dpi::Scale(14), 0, 0, 0, FW_NORMAL, 0,0,0,
             DEFAULT_CHARSET, 0,0, CLEARTYPE_QUALITY, 0, L"Segoe UI Symbol");
         for (auto& def : iconDefs) {
             HDC mem = CreateCompatibleDC(hdc);
-            HBITMAP bmp = CreateCompatibleBitmap(hdc, 16, 16);
+            HBITMAP bmp = CreateCompatibleBitmap(hdc, icon, icon);
             SelectObject(mem, bmp);
-            RECT r = {0,0,16,16};
+            RECT r = {0,0,icon,icon};
             HBRUSH bg = CreateSolidBrush(GetSysColor(COLOR_WINDOW));
             FillRect(mem, &r, bg);
             DeleteObject(bg);
@@ -513,7 +498,7 @@ void MainWindow::OnCreate(HWND hWnd, HINSTANCE hInst,
     LVCOLUMNW col = {}; col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT;
     col.fmt = LVCFMT_LEFT;
     auto addCol = [&](const wchar_t* hdr, int w) {
-        col.pszText = (LPWSTR)hdr; col.cx = w;
+        col.pszText = (LPWSTR)hdr; col.cx = Dpi::Scale(w);
         ListView_InsertColumn(m_hListLog, 999, &col);
     };
     addCol(L"#",       75);
@@ -538,6 +523,8 @@ void MainWindow::OnCreate(HWND hWnd, HINSTANCE hInst,
     // Initial layout
     RECT rc; GetClientRect(hWnd, &rc);
     LayoutControls(rc.right, rc.bottom);
+    LONG_PTR st = GetWindowLongPtrW(m_hStaticStatus, GWL_STYLE);
+    SetWindowLongPtrW(m_hStaticStatus, GWL_STYLE, st | SS_ENDELLIPSIS);
 
     // Help toggle button (top-right "?")
     m_hBtnHelp = CreateWindowExW(0, L"BUTTON", L"?",
@@ -572,14 +559,22 @@ void MainWindow::OnGetMinMaxInfo(MINMAXINFO* mm)
     mm->ptMinTrackSize = { 900, 650 };
 }
 
-void MainWindow::LayoutControls(int W, int H)
+// wPx/hPx are client pixels. All arithmetic below is in 96-DPI units; Move()
+// scales to pixels.
+void MainWindow::LayoutControls(int wPx, int hPx)
 {
     if (!m_hComboHost) return; // not yet created
 
-    HDWP hdwp = BeginDeferWindowPos(54);
+    const int W = Dpi::Unscale(wPx), H = Dpi::Unscale(hPx);
+
+    // A resized CBS_DROPDOWN combo re-selects the first history entry that starts
+    // with its text; put back what the user had.
+    const std::wstring hostText = Utils::GetWindowText(m_hComboHost);
+
+    HDWP hdwp = BeginDeferWindowPos(96);
     auto Move = [&](HWND hw, int x, int y, int w, int h) {
         if (hw && hdwp)
-            hdwp = DeferWindowPos(hdwp, hw, nullptr, x, y, w, h,
+            hdwp = DeferWindowPos(hdwp, hw, nullptr, Dpi::Scale(x), Dpi::Scale(y), Dpi::Scale(w), Dpi::Scale(h),
                                   SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
     };
 
@@ -601,8 +596,9 @@ void MainWindow::LayoutControls(int W, int H)
     Move(m_hComboProtocol, cx, cy, 55, 200); cx += 55 + MARGIN;
     Move(m_hBtnConnect,    cx, cy, BTN_W,   ROW_H); cx += BTN_W + 4;
     Move(m_hBtnDisconnect, cx, cy, BTN_W,   ROW_H); cx += BTN_W + 2*MARGIN;
-    Move(m_hStaticStatus,  cx, cy, 200, ROW_H);
-    Move(m_hBtnHelp, W - 2*MARGIN - 26, cy, 26, ROW_H);
+    const int helpX = W - 2*MARGIN - 26;
+    Move(m_hStaticStatus,  cx, cy, std::max(100, helpX - cx - 4), ROW_H);
+    Move(m_hBtnHelp, helpX, cy, 26, ROW_H);
 
     // Row 2: checkboxes
     cx = x + MARGIN + 2;
@@ -630,7 +626,7 @@ void MainWindow::LayoutControls(int W, int H)
     // Separator controls row
     int comboX = sx;
     Move(m_hComboSep, comboX, sy, 120, 200); comboX += 124;
-    Move(m_hChkHexSend, comboX, sy, 90, ROW_H); comboX += 94;
+    Move(m_hChkHexSend, comboX, sy, 50, ROW_H); comboX += 54;
     Move(m_hLblPre, comboX, sy, 80, ROW_H);
     Move(m_hEditPreFix, comboX+82, sy, 80, ROW_H);
     Move(m_hLblSuf, comboX+170, sy, 80, ROW_H);
@@ -640,7 +636,6 @@ void MainWindow::LayoutControls(int W, int H)
     // Send text/hex area
     int sendAreaH = midH - GRP_TITLE - ROW_H - 4 - ROW_H - 6 - ROW_H - 4 - MARGIN;
     Move(m_hEditSend, sx, sy, sendCtrlW, sendAreaH);
-    Move(m_hHexSend,  sx, sy, sendCtrlW, sendAreaH);
     sy += sendAreaH + 4;
 
     // Send buttons row 1
@@ -680,13 +675,13 @@ void MainWindow::LayoutControls(int W, int H)
     int tabH = H - y - MARGIN;
     if (tabH < 80) tabH = 80;
     Move(m_hTabBottom, x, y, W - 2*MARGIN, tabH);
-    // Get tab client area
-    RECT tabRc = { 0, 0, W - 2*MARGIN, tabH };
+    // Tab client area: AdjustRect works in pixels, convert back to layout units
+    RECT tabRc = { 0, 0, Dpi::Scale(W - 2*MARGIN), Dpi::Scale(tabH) };
     TabCtrl_AdjustRect(m_hTabBottom, FALSE, &tabRc);
-    int tx = x + tabRc.left;
-    int ty = y + tabRc.top;
-    int tw = tabRc.right - tabRc.left;
-    int th = tabRc.bottom - tabRc.top;
+    int tx = x + Dpi::Unscale(tabRc.left);
+    int ty = y + Dpi::Unscale(tabRc.top);
+    int tw = Dpi::Unscale(tabRc.right - tabRc.left);
+    int th = Dpi::Unscale(tabRc.bottom - tabRc.top);
 
     // Log content (tab 0)
     Move(m_hComboLogFilter, tx + 2, ty + 2, 120, 200);
@@ -724,6 +719,8 @@ void MainWindow::LayoutControls(int W, int H)
     }
 
     if (hdwp) EndDeferWindowPos(hdwp);
+    if (Utils::GetWindowText(m_hComboHost) != hostText)
+        SetWindowTextW(m_hComboHost, hostText.c_str());
     RedrawWindow(m_hWnd, nullptr, nullptr,
         RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
 }
@@ -765,12 +762,13 @@ void MainWindow::SwitchBottomTab(int tab)
 
 void MainWindow::OnDestroy()
 {
-    if (m_cyclicRunning) {
-        m_cyclicStop = true;
-        if (m_cyclicThread.joinable()) m_cyclicThread.join();
-        m_cyclicRunning = false;
-    }
+    // Stop the cyclic thread: the session is shut down first so a send blocked
+    // on the socket returns, then the thread is joined before `this` goes away.
+    m_cyclicStop = true;
     if (m_net) m_net->Disconnect();
+    if (m_cyclicThread.joinable()) m_cyclicThread.join();
+    m_cyclicRunning = false;
+    m_net.reset();
     if (m_hImgListLog) ImageList_Destroy(m_hImgListLog);
     if (m_hTooltip) { DestroyWindow(m_hTooltip); m_hTooltip = nullptr; }
     if (m_hFont)     DeleteObject(m_hFont);
@@ -791,15 +789,11 @@ void MainWindow::OnCommand(WORD id, WORD notify, HWND hCtrl)
     case IDC_BTN_LOADFILE:   DoLoadFile();   break;
 
     case IDC_BTN_CLEARSEND:
-        SetWindowTextW(m_hEditSend, L"");
-        HexView::ClearData(m_hHexSend);
-        m_sendData.clear();
+        ClearSendEditor();
         break;
 
     case IDC_BTN_CLEARRECV:
-        SetWindowTextW(m_hEditRecv, L"");
-        HexView::ClearData(m_hHexRecv);
-        m_recvData.clear();
+        ClearRecv();
         break;
 
     case IDC_BTN_COPYRECV:
@@ -822,15 +816,11 @@ void MainWindow::OnCommand(WORD id, WORD notify, HWND hCtrl)
         break;
 
     case IDC_BTN_CLEARLOG:
-        m_log.clear();
-        m_logVisible.clear();
-        ListView_SetItemCountEx(m_hListLog, 0, 0);
-        InvalidateRect(m_hListLog, nullptr, TRUE);
+        ClearLog();
         break;
 
     case IDC_CHK_HEXVIEW:
-        m_hexSendMode = Button_GetCheck(m_hChkHexSend) == BST_CHECKED;
-        RefreshSendView();
+        DoSendHexToggle();
         break;
 
     case IDC_CHK_HEXVIEW_RECV:
@@ -864,7 +854,7 @@ void MainWindow::OnCommand(WORD id, WORD notify, HWND hCtrl)
         break;
 
     case IDC_CHK_AUTOCONNECT:
-        SetConnectionUI(m_connected);
+        UpdateSendEnable();
         break;
 
     case IDC_EDIT_SEND:
@@ -894,102 +884,135 @@ void MainWindow::OnCommand(WORD id, WORD notify, HWND hCtrl)
         break;
 
     case IDC_BTN_CYCLIC_START:
-    {
-        if (m_cyclicRunning) {
-            // Stop cyclic sending
-            m_cyclicStop = true;
-            if (m_cyclicThread.joinable()) m_cyclicThread.join();
-            m_cyclicRunning = false;
-            SetWindowTextW(m_hBtnCyclicStart, L"Start Cyclic");
-
-            // Log summary
-            LogEntry sle;
-            sle.type = LogType::Info;
-            sle.timestamp = Utils::NowTimestamp();
-            sle.preview = L"Cyclic send stopped (" + std::to_wstring(m_cyclicCount.load()) + L" sends)";
-            AddLogEntry(std::move(sle));
-        } else {
-            if (!m_connected) {
-                if (Button_GetCheck(m_hChkAutoConnect) == BST_CHECKED) {
-                    // Auto-connect then fire cyclic — same pattern as DoSend.
-                    if (!m_pendingCyclicStart) {
-                        m_pendingCyclicStart = true;
-                        DoConnect();
-                    }
-                } else {
-                    MessageBoxW(m_hWnd, L"Not connected.", L"Not connected", MB_ICONWARNING);
-                }
-                break;
-            }
-            // Parse interval
-            wchar_t buf[32] = {};
-            GetWindowTextW(m_hEditCyclicInterval, buf, 32);
-            double sec = _wtof(buf);
-            if (sec < 0.001) sec = 0.001;
-            auto intervalUs = std::chrono::microseconds((long long)(sec * 1000000.0 + 0.5));
-
-            // Pre-build data and config
-            std::vector<BYTE> data = GetSendData();
-            if (data.empty()) {
-                MessageBoxW(m_hWnd, L"Nothing to send.", L"Empty data", MB_ICONWARNING);
-                break;
-            }
-            NetConfig cfg = BuildNetConfig();
-
-            m_cyclicStop  = false;
-            m_cyclicCount = 0;
-            m_cyclicRunning = true;
-            SetWindowTextW(m_hBtnCyclicStart, L"Stop Cyclic");
-            SetWindowTextW(m_hStaticCyclicCount, L"Sent: 0");
-
-            // Log start
-            LogEntry sle;
-            sle.type = LogType::Info;
-            sle.timestamp = Utils::NowTimestamp();
-            {
-                wchar_t ibuf[64];
-                swprintf_s(ibuf, L"Cyclic send started (interval: %.3f s)", sec);
-                sle.preview = ibuf;
-            }
-            AddLogEntry(std::move(sle));
-
-            HWND hWnd = m_hWnd;
-            m_cyclicThread = std::thread([this, data, cfg, intervalUs, hWnd]() {
-                using clock = std::chrono::steady_clock;
-                auto next = clock::now();
-                auto lastUI = next;
-                while (!m_cyclicStop.load(std::memory_order_relaxed)) {
-                    if (!m_net || !m_net->IsConnected()) break;
-                    if (!m_net->Send(data, cfg)) break;   // send failed (disconnected)
-                    m_cyclicCount.fetch_add(1, std::memory_order_relaxed);
-                    next += intervalUs;
-
-                    // Throttled UI update every 100ms
-                    auto now = clock::now();
-                    if (now - lastUI >= std::chrono::milliseconds(100)) {
-                        PostMessage(hWnd, WM_CYCLIC_UPDATE,
-                                    (WPARAM)m_cyclicCount.load(std::memory_order_relaxed), 0);
-                        lastUI = now;
-                    }
-
-                    // Sleep with periodic stop-check (max 10ms)
-                    while (!m_cyclicStop.load(std::memory_order_relaxed)) {
-                        auto remain = next - clock::now();
-                        if (remain <= std::chrono::microseconds(0)) break;
-                        if (remain > std::chrono::milliseconds(10))
-                            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                        else
-                            std::this_thread::sleep_for(remain);
-                    }
-                }
-                // Final UI update
-                PostMessage(hWnd, WM_CYCLIC_UPDATE,
-                            (WPARAM)m_cyclicCount.load(std::memory_order_relaxed), 0);
-            });
-        }
+        DoCyclicToggle();
         break;
     }
+}
+
+// ============================================================
+//  Cyclic send
+// ============================================================
+
+void MainWindow::DoCyclicToggle()
+{
+    if (m_cyclicRunning) {
+        // Stop without waiting: the thread may be inside a send that only ends with
+        // its timeout. It reports back with WM_CYCLIC_UPDATE (final) and is joined there.
+        if (!m_cyclicStop) {
+            m_cyclicStop = true;
+            SetWindowTextW(m_hBtnCyclicStart, L"Stopping...");
+            UpdateSendEnable();
+        }
+        return;
     }
+
+    if (!m_connected) {
+        if (Button_GetCheck(m_hChkAutoConnect) == BST_CHECKED) {
+            // Auto-connect then start cyclic - same pattern as DoSend.
+            m_pendingCyclicStart = true;
+            if (!m_sessionActive && !DoConnect()) m_pendingCyclicStart = false;
+        } else {
+            MessageBoxW(m_hWnd, L"Not connected.", L"Not connected", MB_ICONWARNING);
+        }
+        return;
+    }
+
+    // Interval in seconds; accept a decimal comma
+    wchar_t buf[32] = {};
+    GetWindowTextW(m_hEditCyclicInterval, buf, 32);
+    for (wchar_t* c = buf; *c; ++c) if (*c == L',') *c = L'.';
+    double sec = wcstod(buf, nullptr);
+    if (!(sec >= 0.001)) sec = 0.001;
+    if (sec > 86400.0)   sec = 86400.0;
+    auto intervalUs = std::chrono::microseconds((long long)(sec * 1000000.0 + 0.5));
+
+    std::vector<BYTE> data;
+    if (!GetSendData(data)) return;
+    if (data.empty()) {
+        MessageBoxW(m_hWnd, L"Nothing to send.", L"Empty data", MB_ICONWARNING);
+        return;
+    }
+    NetConfig cfg;
+    if (!BuildNetConfig(cfg, true)) return;
+
+    if (m_cyclicThread.joinable()) m_cyclicThread.join();   // finished (final message was handled)
+    m_cyclicStop    = false;
+    m_cyclicCount   = 0;
+    m_cyclicRunning = true;
+    const uint32_t gen = ++m_cyclicGen;
+    SetWindowTextW(m_hBtnCyclicStart, L"Stop Cyclic");
+    SetWindowTextW(m_hStaticCyclicCount, L"Sent: 0");
+
+    LogEntry sle;
+    sle.type = LogType::Info;
+    sle.timestamp = Utils::NowTimestamp();
+    {
+        wchar_t ibuf[64];
+        swprintf_s(ibuf, L"Cyclic send started (interval: %.3f s)", sec);
+        sle.preview = ibuf;
+    }
+    AddLogEntry(std::move(sle));
+
+    // The thread uses m_net and the members below; it is joined before either is
+    // destroyed (OnCyclicMessage, OnDestroy).
+    HWND hWnd = m_hWnd;
+    m_cyclicThread = std::thread([this, data, cfg, intervalUs, hWnd, gen]() {
+        using clock = std::chrono::steady_clock;
+        const LPARAM tag = (LPARAM)((uint64_t)(gen & 0x7FFFFFFF) << 1);
+        auto next = clock::now();
+        auto lastUI = next;
+        while (!m_cyclicStop.load(std::memory_order_relaxed)) {
+            if (!m_net->IsConnected()) break;
+            if (!m_net->Send(data, cfg)) break;   // send failed (disconnected)
+            m_cyclicCount.fetch_add(1, std::memory_order_relaxed);
+            auto now = clock::now();
+            next += intervalUs;
+            if (next < now) next = now;           // don't burst to catch up after a slow send
+
+            // Throttled UI update every 100ms
+            if (now - lastUI >= std::chrono::milliseconds(100)) {
+                PostMessage(hWnd, WM_CYCLIC_UPDATE,
+                            (WPARAM)m_cyclicCount.load(std::memory_order_relaxed), tag);
+                lastUI = now;
+            }
+
+            // Sleep with periodic stop-check (max 10ms)
+            while (!m_cyclicStop.load(std::memory_order_relaxed)) {
+                auto remain = next - clock::now();
+                if (remain <= std::chrono::microseconds(0)) break;
+                if (remain > std::chrono::milliseconds(10))
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                else
+                    std::this_thread::sleep_for(remain);
+            }
+        }
+        PostMessage(hWnd, WM_CYCLIC_UPDATE,
+                    (WPARAM)m_cyclicCount.load(std::memory_order_relaxed), tag | 1);
+    });
+}
+
+void MainWindow::OnCyclicMessage(size_t count, bool final, uint32_t gen)
+{
+    if (gen != (m_cyclicGen & 0x7FFFFFFF)) return;   // message of an earlier run
+    wchar_t cbuf[64];
+    swprintf_s(cbuf, L"Sent: %u", (unsigned)count);
+    SetWindowTextW(m_hStaticCyclicCount, cbuf);
+    if (!final) return;
+
+    // The thread has posted its last message and is returning.
+    if (m_cyclicThread.joinable()) m_cyclicThread.join();
+    const bool byUser = m_cyclicStop.load();
+    m_cyclicRunning = false;
+    m_cyclicStop = false;
+    SetWindowTextW(m_hBtnCyclicStart, L"Start Cyclic");
+    UpdateSendEnable();
+
+    LogEntry sle;
+    sle.type = LogType::Info;
+    sle.timestamp = Utils::NowTimestamp();
+    sle.preview = std::wstring(L"Cyclic send ") + (byUser ? L"stopped" : L"ended (connection lost or send failed)")
+                  + L" (" + std::to_wstring(count) + L" sends)";
+    AddLogEntry(std::move(sle));
 }
 
 // ============================================================
@@ -1017,12 +1040,14 @@ void MainWindow::DoSaveLastRecv()
     if (!GetSaveFileNameW(&ofn)) return;
 
     std::ofstream f(buf, std::ios::binary);
+    if (f) {
+        f.write(reinterpret_cast<const char*>(m_lastRecvData.data()), (std::streamsize)m_lastRecvData.size());
+        f.close();
+    }
     if (!f) {
         MessageBoxW(m_hWnd, L"Cannot write to the selected file.", L"Save error", MB_ICONERROR);
         return;
     }
-    f.write(reinterpret_cast<const char*>(m_lastRecvData.data()), m_lastRecvData.size());
-    f.close();
 
     wchar_t msg[MAX_PATH + 64];
     swprintf_s(msg, L"Saved %zu bytes to:\n%s", m_lastRecvData.size(), buf);
@@ -1035,9 +1060,12 @@ void MainWindow::DoSaveLastRecv()
 
 void MainWindow::PopulateHostCombo()
 {
+    // CB_RESETCONTENT clears the edit text; keep what the user has typed.
+    const std::wstring text = Utils::GetWindowText(m_hComboHost);
     SendMessage(m_hComboHost, CB_RESETCONTENT, 0, 0);
     for (auto& e : m_connHistory)
         SendMessage(m_hComboHost, CB_ADDSTRING, 0, (LPARAM)e.c_str());
+    SetWindowTextW(m_hComboHost, text.c_str());
 }
 
 void MainWindow::OnHostComboSelChange()
@@ -1062,11 +1090,68 @@ void MainWindow::DoParseComboParts()
     }
 }
 
+// ============================================================
+//  Hex text <-> bytes (the send editor in hex mode)
+// ============================================================
 
-
-void MainWindow::DoConnect()
+// Whitespace-separated or contiguous hex digits. On failure `err` says what is wrong.
+static bool ParseHexText(const std::wstring& text, std::vector<BYTE>& out, std::wstring& err)
 {
-    if (m_connected) return;
+    out.clear();
+    int hi = -1;
+    size_t digits = 0;
+    for (size_t i = 0; i < text.size(); ++i) {
+        wchar_t c = text[i];
+        if (c == L' ' || c == L'\t' || c == L'\r' || c == L'\n') continue;
+        int v;
+        if      (c >= L'0' && c <= L'9') v = c - L'0';
+        else if (c >= L'a' && c <= L'f') v = c - L'a' + 10;
+        else if (c >= L'A' && c <= L'F') v = c - L'A' + 10;
+        else {
+            err = L"'" + std::wstring(1, c) + L"' at character " + std::to_wstring(i + 1)
+                  + L" is not a hex digit (use 0-9 and A-F).";
+            return false;
+        }
+        ++digits;
+        if (hi < 0) hi = v;
+        else { out.push_back((BYTE)(hi << 4 | v)); hi = -1; }
+    }
+    if (hi >= 0) {
+        err = L"The number of hex digits is odd (" + std::to_wstring(digits)
+              + L"): every byte needs two digits, e.g. 48 65 6C 6C 6F.";
+        return false;
+    }
+    return true;
+}
+
+// Index of the first byte of an incomplete UTF-8 sequence at the end, else size.
+static size_t Utf8CompleteLength(const std::vector<BYTE>& v)
+{
+    size_t n = v.size();
+    for (size_t k = 1; k <= 3 && k <= n; ++k) {
+        BYTE b = v[n - k];
+        if ((b & 0xC0) == 0x80) continue;               // continuation byte
+        size_t need = b >= 0xF0 ? 4 : b >= 0xE0 ? 3 : b >= 0xC0 ? 2 : 1;
+        return need > k ? n - k : n;
+    }
+    return n;
+}
+
+static std::wstring MakePreview(const BYTE* d, size_t n)
+{
+    std::wstring prev;
+    for (size_t i = 0; i < std::min((size_t)80, n); ++i)
+        prev += (d[i] >= 0x20 && d[i] < 0x7F) ? (wchar_t)d[i] : L'.';
+    return prev;
+}
+
+// ============================================================
+//  DoConnect / DoDisconnect
+// ============================================================
+
+bool MainWindow::DoConnect()
+{
+    if (m_sessionActive) return false;
 
     // Parse "host:port" from combo if the user typed/pasted a combined value
     std::wstring hostW = Utils::GetWindowText(m_hComboHost);
@@ -1077,48 +1162,66 @@ void MainWindow::DoConnect()
         if (Utils::IsValidPort(maybePort, p)) {
             hostW = hostW.substr(0, colon);
             SetWindowTextW(m_hComboHost, hostW.c_str());
-            SetWindowTextW(GetDlgItem(m_hWnd, IDC_EDIT_PORT), maybePort.c_str());
+            SetWindowTextW(m_hEditPort, maybePort.c_str());
         }
     }
 
     // Validate host/IP
     if (!Utils::IsValidHostOrIP(hostW)) {
-        MessageBoxW(m_hWnd, L"Please enter a valid hostname or IP address.", L"Invalid host", MB_ICONWARNING);
+        MessageBoxW(m_hWnd, L"Please enter a valid hostname or IPv4 address.", L"Invalid host", MB_ICONWARNING);
         SetFocus(m_hComboHost);
-        return;
+        return false;
     }
 
     // Validate port
-    std::wstring portW = Utils::GetWindowText(GetDlgItem(m_hWnd, IDC_EDIT_PORT));
+    std::wstring portW = Utils::GetWindowText(m_hEditPort);
     int port = 0;
     if (!Utils::IsValidPort(portW, port)) {
-        MessageBoxW(m_hWnd, L"Please enter a valid port number (1\u201365535).", L"Invalid port", MB_ICONWARNING);
-        SetFocus(GetDlgItem(m_hWnd, IDC_EDIT_PORT));
-        return;
+        MessageBoxW(m_hWnd, L"Please enter a valid port number (1–65535).", L"Invalid port", MB_ICONWARNING);
+        SetFocus(m_hEditPort);
+        return false;
     }
 
-    NetConfig cfg = BuildNetConfig();
+    // Validate timeout: whole seconds, 0 = no limit
+    std::wstring toW = Utils::GetWindowText(m_hEditTimeout);
+    bool toOk = !toW.empty() && toW.size() <= 5;
+    for (wchar_t c : toW) if (c < L'0' || c > L'9') toOk = false;
+    if (toOk && _wtoi(toW.c_str()) > 3600) toOk = false;
+    if (!toOk) {
+        MessageBoxW(m_hWnd, L"The timeout must be a whole number of seconds from 0 to 3600 (0 = no limit).",
+                    L"Invalid timeout", MB_ICONWARNING);
+        SetFocus(m_hEditTimeout);
+        return false;
+    }
+
+    NetConfig cfg;
+    if (!BuildNetConfig(cfg, false)) return false;
 
     if (!m_net) m_net = std::make_unique<TcpNetwork>(m_hWnd);
     m_connectTime = Utils::Now();
-
-    SetWindowTextW(m_hStaticStatus, L"\u25CC Connecting...");
-    InvalidateRect(m_hStaticStatus, nullptr, TRUE);
-    EnableWindow(m_hBtnConnect, FALSE);
-    m_net->Connect(cfg);
+    m_lastError.clear();
+    if (!m_net->Connect(cfg)) {
+        MessageBoxW(m_hWnd, L"A previous connection is still closing. Try again in a moment.",
+                    L"Connect", MB_ICONWARNING);
+        return false;
+    }
+    SetConnectionUI(CS_CONNECTING);
+    return true;
 }
 
 void MainWindow::DoDisconnect()
 {
-    // Stop cyclic send first so it doesn't keep firing on a closed socket
-    if (m_cyclicRunning) {
-        m_cyclicStop = true;
-        if (m_cyclicThread.joinable()) m_cyclicThread.join();
-        m_cyclicRunning = false;
-        SetWindowTextW(m_hBtnCyclicStart, L"Start Cyclic");
-    }
+    m_pendingAutoSend    = false;
+    m_pendingCyclicStart = false;
+    // The cyclic thread notices the stop flag / the closed session by itself and
+    // reports back with WM_CYCLIC_UPDATE; nothing here waits for it.
+    if (m_cyclicRunning) m_cyclicStop = true;
     if (m_net) m_net->Disconnect();
-    // UI update via WM_NET_DISCONNECTED
+    if (m_sessionActive) {
+        SetWindowTextW(m_hStaticStatus, L"◌ Disconnecting...");
+        EnableWindow(m_hBtnDisconnect, FALSE);
+    }
+    // The UI is reset by WM_NET_DISCONNECTED.
 }
 
 // ============================================================
@@ -1127,32 +1230,28 @@ void MainWindow::DoDisconnect()
 
 void MainWindow::DoSend()
 {
-    // Auto-connect if enabled and not connected.
-    // Don't post a retry message — that causes an infinite re-entry loop while the
-    // async connect is in flight.  Instead, set a flag; OnNetConnected() will call
-    // DoSend() exactly once after the connection is established.
+    // Auto-connect if enabled and not connected. A flag instead of a retry message:
+    // OnNetConnected() calls DoSend() exactly once when the connection is up.
     if (!m_connected && Button_GetCheck(m_hChkAutoConnect) == BST_CHECKED) {
-        if (!m_pendingAutoSend) {
-            m_pendingAutoSend = true;
-            DoConnect();
-        }
+        m_pendingAutoSend = true;
+        if (!m_sessionActive && !DoConnect()) m_pendingAutoSend = false;
         return;
     }
     if (!m_connected) {
         MessageBoxW(m_hWnd, L"Not connected.", L"Not connected", MB_ICONWARNING);
         return;
     }
-    std::vector<BYTE> data = GetSendData();
+    std::vector<BYTE> data;
+    if (!GetSendData(data)) return;
     if (data.empty()) {
         MessageBoxW(m_hWnd, L"Nothing to send.", L"Empty data", MB_ICONWARNING);
         return;
     }
 
-    NetConfig cfg = BuildNetConfig();
+    NetConfig cfg;
+    if (!BuildNetConfig(cfg, true)) return;
 
-    // Determine protocol label
-    bool isUdp = cfg.udpMode;
-    const wchar_t* proto = isUdp ? L"UDP" : L"TCP";
+    const wchar_t* proto = ProtoLabel(cfg.udpMode);
 
     // Save to log immediately as "Sent" entry
     LogEntry le;
@@ -1160,19 +1259,10 @@ void MainWindow::DoSend()
     le.timestamp = Utils::NowTimestamp();
     le.data      = data;
     le.byteCount = data.size();
-    // Preview: first 80 printable chars
-    std::wstring prev;
-    for (size_t i = 0; i < std::min((size_t)80, data.size()); ++i) {
-        BYTE b = data[i];
-        prev += (b >= 0x20 && b < 0x7F) ? (wchar_t)b : L'.';
-    }
-    le.preview = std::wstring(L"[") + proto + L"] " + prev + L" [" + std::to_wstring(data.size()) + L" B]";
+    le.preview   = std::wstring(L"[") + proto + L"] " + MakePreview(data.data(), data.size())
+                   + L" [" + std::to_wstring(data.size()) + L" B]";
     m_lastRecvData.clear();   // reset last-transmission tracker
-    if (Button_GetCheck(m_hChkAutoClearRecv) == BST_CHECKED) {
-        m_recvData.clear();
-        SetWindowTextW(m_hEditRecv, L"");
-        HexView::ClearData(m_hHexRecv);
-    }
+    if (Button_GetCheck(m_hChkAutoClearRecv) == BST_CHECKED) ClearRecv();
 
     // Queue the send (non-blocking; send worker posts WM_NET_SEND_COMPLETE)
     if (m_net) m_net->QueueSend(std::move(data), cfg);
@@ -1180,10 +1270,110 @@ void MainWindow::DoSend()
     AddLogEntry(std::move(le));
 
     // Auto-clear send window after sending
-    if (Button_GetCheck(m_hChkAutoClearSend) == BST_CHECKED) {
-        SetWindowTextW(m_hEditSend, L"");
-        HexView::ClearData(m_hHexSend);
+    if (Button_GetCheck(m_hChkAutoClearSend) == BST_CHECKED) ClearSendEditor();
+}
+
+// ============================================================
+//  Send editor
+// ============================================================
+
+void MainWindow::SetSendEditorText(const std::wstring& text)
+{
+    // Programmatic change: must not drop the pinned bytes (see EN_CHANGE).
+    m_ignoreEditChange = true;
+    SetWindowTextW(m_hEditSend, text.c_str());
+    m_ignoreEditChange = false;
+}
+
+void MainWindow::SetSendHexMode(bool hex)
+{
+    m_hexSendMode = hex;
+    Button_SetCheck(m_hChkHexSend, hex ? BST_CHECKED : BST_UNCHECKED);
+}
+
+void MainWindow::ClearSendEditor()
+{
+    SetSendEditorText(L"");
+    m_sendData.clear();
+}
+
+// Payload per the editor rules:
+//  text mode - the pinned bytes if there are any, else the editor text as UTF-8
+//  hex mode  - the hex pairs in the editor
+bool MainWindow::GetSendData(std::vector<BYTE>& out)
+{
+    out.clear();
+    std::wstring ws = Utils::GetWindowText(m_hEditSend);
+    if (m_hexSendMode) {
+        std::wstring err;
+        if (!ParseHexText(ws, out, err)) {
+            out.clear();
+            MessageBoxW(m_hWnd, (L"The hex data cannot be sent.\n\n" + err).c_str(), L"Invalid hex", MB_ICONWARNING);
+            SetFocus(m_hEditSend);
+            return false;
+        }
+        return true;
+    }
+    if (!m_sendData.empty()) { out = m_sendData; return true; }
+    std::string s = Utils::ToUTF8(ws);
+    out.assign(s.begin(), s.end());
+    return true;
+}
+
+// Shows `bytes` in the editor (Load File, log reload) and pins them so they are
+// sent exactly as given until the user edits the text.
+void MainWindow::LoadPayloadIntoEditor(const std::vector<BYTE>& bytes, const std::wstring& name)
+{
+    const bool text     = Utils::LooksLikeText(bytes);
+    const bool fitsHex  = bytes.size() <= HEX_EDIT_MAX;
+    const bool fitsText = text && bytes.size() <= TEXT_SHOW_MAX;
+
+    std::wstring shown;
+    if (m_hexSendMode && fitsHex) {
+        shown = Utils::BytesToHexText(bytes);
+    } else if (fitsText) {
+        SetSendHexMode(false);
+        shown = Utils::BytesToDisplayText(bytes);
+    } else if (fitsHex) {                      // small binary: hex is the only readable view
+        SetSendHexMode(true);
+        shown = Utils::BytesToHexText(bytes);
+    } else {
+        SetSendHexMode(false);
+        shown = L"[" + (name.empty() ? std::wstring(text ? L"Text data" : L"Binary data") : (text ? L"File " : L"Binary file ") + name)
+                + L", " + std::to_wstring(bytes.size()) + L" bytes - sent exactly as loaded]";
+    }
+    SetSendEditorText(shown);
+    m_sendData = bytes;
+}
+
+void MainWindow::DoSendHexToggle()
+{
+    const bool wantHex = Button_GetCheck(m_hChkHexSend) == BST_CHECKED;
+    if (wantHex == m_hexSendMode) return;
+
+    std::vector<BYTE> bytes;
+    if (!GetSendData(bytes)) {             // hex -> text with invalid hex: stay in hex
+        Button_SetCheck(m_hChkHexSend, m_hexSendMode ? BST_CHECKED : BST_UNCHECKED);
+        return;
+    }
+    if (wantHex) {
+        if (bytes.size() > HEX_EDIT_MAX) {
+            Button_SetCheck(m_hChkHexSend, BST_UNCHECKED);
+            MessageBoxW(m_hWnd, L"This data is larger than 1 MB and cannot be edited as hex. "
+                        L"It can still be sent as it is.", L"Hex", MB_ICONINFORMATION);
+            return;
+        }
+        m_hexSendMode = true;
+        SetSendEditorText(Utils::BytesToHexText(bytes));
         m_sendData.clear();
+    } else {
+        m_hexSendMode = false;
+        std::wstring shown = Utils::BytesToDisplayText(bytes);
+        SetSendEditorText(shown);
+        // Keep the exact bytes when the text view cannot reproduce them.
+        std::string back = Utils::ToUTF8(shown);
+        if (back.size() == bytes.size() && std::equal(back.begin(), back.end(), bytes.begin())) m_sendData.clear();
+        else                                                                                  m_sendData = bytes;
     }
 }
 
@@ -1197,87 +1387,56 @@ void MainWindow::DoLoadFile()
     if (!Utils::OpenFileDialog(m_hWnd, path)) return;
 
     std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f) { MessageBoxW(m_hWnd, L"Cannot open file.", L"Error", MB_ICONERROR); return; }
+    if (!f) { MessageBoxW(m_hWnd, L"Cannot open the file.", L"Load File", MB_ICONERROR); return; }
 
-    auto sz = f.tellg();
-    f.seekg(0);
-    m_sendData.resize((size_t)sz);
-    f.read((char*)m_sendData.data(), sz);
-    f.close();
-
-    // Update both text and hex views
-    // Text view: attempt UTF-8 decode
-    std::string raw(m_sendData.begin(), m_sendData.end());
-    std::wstring wide = Utils::ToWide(raw);
-    // Set hex view BEFORE the editor text so EN_CHANGE clearing m_sendData
-    // doesn't wipe the data we just stored for the hex view.
-    HexView::SetData(m_hHexSend, m_sendData);
-    m_ignoreEditChange = true;
-    SetWindowTextW(m_hEditSend, wide.c_str());
-    m_ignoreEditChange = false;
-
-    // Show appropriate view
-    RefreshSendView();
-
-    // Log
-    LogEntry le;
-    le.type      = LogType::Sent;       // will be overridden when actually sent
-    le.timestamp = Utils::NowTimestamp();
-    le.data      = m_sendData;
-    le.byteCount = m_sendData.size();
-    le.preview   = L"[File loaded: " + path.substr(path.find_last_of(L"\\/") + 1) + L"]";
-    // We don't add to log here - only when user clicks Send
-}
-
-// ============================================================
-//  GetSendData
-// ============================================================
-
-std::vector<BYTE> MainWindow::GetSendData()
-{
-    if (m_hexSendMode) {
-        // Parse hex from edit
-        std::wstring ws = Utils::GetWindowText(m_hEditSend);
-        std::string s = Utils::ToUTF8(ws);
-        // Remove whitespace
-        std::string clean;
-        for (char c : s) if (c != ' ' && c != '\t' && c != '\r' && c != '\n') clean += c;
-        std::vector<BYTE> out;
-        if (!Utils::HexStrToBytes(clean, out)) {
-            MessageBoxW(m_hWnd, L"Invalid hex input. Use pairs like: 48 65 6C 6C 6F", L"Hex error", MB_ICONWARNING);
-            return {};
-        }
-        return out;
-    } else {
-        // Always encode current editor content as UTF-8 so edits are reflected
-        std::wstring ws = Utils::GetWindowText(m_hEditSend);
-        std::string s = Utils::ToUTF8(ws);
-        return std::vector<BYTE>(s.begin(), s.end());
+    std::streamoff sz = f.tellg();
+    if (sz < 0) { MessageBoxW(m_hWnd, L"Cannot determine the size of the file.", L"Load File", MB_ICONERROR); return; }
+    if ((unsigned long long)sz > FILE_MAX) {
+        MessageBoxW(m_hWnd, L"The file is larger than 64 MB and cannot be loaded.", L"Load File", MB_ICONWARNING);
+        return;
     }
+    std::vector<BYTE> bytes((size_t)sz);
+    f.seekg(0);
+    if (sz > 0) f.read((char*)bytes.data(), sz);
+    if (!f || f.gcount() != sz) {
+        MessageBoxW(m_hWnd, L"The file could not be read completely.", L"Load File", MB_ICONERROR);
+        return;
+    }
+
+    size_t slash = path.find_last_of(L"\\/");
+    LoadPayloadIntoEditor(bytes, slash == std::wstring::npos ? path : path.substr(slash + 1));
+    SetFocus(m_hEditSend);
 }
 
 // ============================================================
 //  BuildNetConfig
 // ============================================================
 
-NetConfig MainWindow::BuildNetConfig()
+bool MainWindow::BuildNetConfig(NetConfig& cfg, bool forSend)
 {
-    NetConfig cfg;
+    cfg = NetConfig();
     cfg.host          = Utils::ToUTF8(Utils::GetWindowText(m_hComboHost));
     cfg.port          = Utils::GetDlgInt(m_hWnd, IDC_EDIT_PORT, 9000);
-    cfg.timeoutSec    = Utils::GetDlgInt(m_hWnd, IDC_EDIT_TIMEOUT, 5);
+    cfg.timeoutSec    = std::clamp(Utils::GetDlgInt(m_hWnd, IDC_EDIT_TIMEOUT, 5), 0, 3600);
     cfg.keepAlive     = Button_GetCheck(m_hChkKeepAlive) == BST_CHECKED;
     cfg.autoDisconnect= Button_GetCheck(m_hChkAutoDisc)  == BST_CHECKED;
     cfg.udpMode       = (SendMessage(m_hComboProtocol, CB_GETCURSEL, 0, 0) == 1);
     cfg.separator     = GetSeparatorMode();
 
-    if (cfg.separator == SeparatorMode::Custom) {
-        std::string pre = Utils::ToUTF8(Utils::GetWindowText(m_hEditPreFix));
-        std::string suf = Utils::ToUTF8(Utils::GetWindowText(m_hEditSufFix));
-        Utils::HexStrToBytes(pre, cfg.customPrefix);
-        Utils::HexStrToBytes(suf, cfg.customSuffix);
+    if (forSend && cfg.separator == SeparatorMode::Custom) {
+        std::wstring err;
+        if (!ParseHexText(Utils::GetWindowText(m_hEditPreFix), cfg.customPrefix, err)) {
+            MessageBoxW(m_hWnd, (L"Invalid custom prefix.\n\n" + err).c_str(), L"Invalid hex", MB_ICONWARNING);
+            SetFocus(m_hEditPreFix);
+            return false;
+        }
+        if (!ParseHexText(Utils::GetWindowText(m_hEditSufFix), cfg.customSuffix, err)) {
+            MessageBoxW(m_hWnd, (L"Invalid custom suffix.\n\n" + err).c_str(), L"Invalid hex", MB_ICONWARNING);
+            SetFocus(m_hEditSufFix);
+            return false;
+        }
     }
-    return cfg;
+    return true;
 }
 
 SeparatorMode MainWindow::GetSeparatorMode()
@@ -1288,37 +1447,85 @@ SeparatorMode MainWindow::GetSeparatorMode()
 }
 
 // ============================================================
-//  Refresh send/recv views
+//  Receive view
 // ============================================================
 
-void MainWindow::RefreshSendView()
-{
-    if (m_hexSendMode) {
-        ShowWindow(m_hEditSend, SW_HIDE);
-        ShowWindow(m_hHexSend,  SW_SHOW);
-        // Sync hex: use raw sendData if available (from file load / log reload),
-        // otherwise re-encode current editor text so user edits are reflected.
-        if (m_sendData.empty()) {
-            std::wstring ws = Utils::GetWindowText(m_hEditSend);
-            std::string s   = Utils::ToUTF8(ws);
-            m_sendData.assign(s.begin(), s.end());
-        }
-        HexView::SetData(m_hHexSend, m_sendData);
-    } else {
-        ShowWindow(m_hHexSend,  SW_HIDE);
-        ShowWindow(m_hEditSend, SW_SHOW);
-    }
-}
-
+// Brings whichever receive view is now in front up to date with m_recvData.
 void MainWindow::RefreshRecvView()
 {
     if (m_hexRecvMode) {
         ShowWindow(m_hEditRecv, SW_HIDE);
         ShowWindow(m_hHexRecv,  SW_SHOW);
-        HexView::SetData(m_hHexRecv, m_recvData);
+        if (m_recvHexStale || HexView::GetDataSize(m_hHexRecv) != m_recvData.size()) {
+            HexView::SetData(m_hHexRecv, m_recvData);
+            m_recvHexStale = false;
+        }
     } else {
         ShowWindow(m_hHexRecv,  SW_HIDE);
         ShowWindow(m_hEditRecv, SW_SHOW);
+        if (m_recvTextStale) RebuildRecvText();
+    }
+}
+
+void MainWindow::RebuildRecvText()
+{
+    size_t complete = Utf8CompleteLength(m_recvData);
+    m_recvPending.assign(m_recvData.begin() + complete, m_recvData.end());
+    std::wstring text = Utils::BytesToDisplayText(m_recvData.data(), complete);
+    m_recvPrevCR = complete > 0 && m_recvData[complete - 1] == '\r';
+    SetWindowTextW(m_hEditRecv, text.c_str());
+    m_recvTextStale = false;
+}
+
+void MainWindow::ClearRecv()
+{
+    m_recvData.clear();
+    m_recvPending.clear();
+    m_recvPrevCR = false;
+    m_recvTextStale = m_recvHexStale = false;
+    SetWindowTextW(m_hEditRecv, L"");
+    HexView::ClearData(m_hHexRecv);
+}
+
+// Shows a UTF-8 tail that never got completed.
+void MainWindow::FlushRecvPending()
+{
+    if (m_recvPending.empty() || m_hexRecvMode) return;
+    std::wstring t = Utils::BytesToDisplayText(m_recvPending);
+    m_recvPending.clear();
+    SendMessage(m_hEditRecv, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
+    SendMessage(m_hEditRecv, EM_REPLACESEL, FALSE, (LPARAM)t.c_str());
+}
+
+// m_recvData already contains `data`; this brings the visible view along and
+// marks the other one stale instead of rebuilding it for every chunk.
+void MainWindow::AppendReceiveData(const std::vector<BYTE>& data)
+{
+    if (m_hexRecvMode) {
+        m_recvTextStale = true;
+        if (m_recvHexStale) return;                 // refreshed on the next view switch
+        HexView::AppendData(m_hHexRecv, data.data(), data.size());
+        return;
+    }
+
+    m_recvHexStale = true;
+    if (m_recvTextStale) { RebuildRecvText(); return; }
+
+    // Decode only complete UTF-8 sequences; an incomplete tail waits for the next chunk.
+    std::vector<BYTE> bytes = std::move(m_recvPending);
+    bytes.insert(bytes.end(), data.begin(), data.end());
+    size_t complete = Utf8CompleteLength(bytes);
+    m_recvPending.assign(bytes.begin() + complete, bytes.end());
+
+    size_t off = 0;
+    if (m_recvPrevCR && complete > 0 && bytes[0] == '\n') off = 1;   // CR LF split over two chunks
+    if (complete > off) {
+        std::wstring ws = Utils::BytesToDisplayText(bytes.data() + off, complete - off);
+        SendMessage(m_hEditRecv, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
+        SendMessage(m_hEditRecv, EM_REPLACESEL, FALSE, (LPARAM)ws.c_str());
+        m_recvPrevCR = bytes[complete - 1] == '\r';
+    } else if (complete > 0) {
+        m_recvPrevCR = false;
     }
 }
 
@@ -1333,13 +1540,8 @@ void MainWindow::RefreshDiagnostics()
         return;
     }
 
-    SOCKET sock = m_net->GetSocket();
-    if (sock == INVALID_SOCKET) {
-        SetWindowTextW(m_hStaticDiagInfo, L"Socket invalid");
-        return;
-    }
-
     std::wstring info;
+    bool ok = m_net->WithSocket([&](SOCKET sock) {
 
     // Local endpoint
     sockaddr_in localAddr = {};
@@ -1388,7 +1590,7 @@ void MainWindow::RefreshDiagnostics()
     // SO_TYPE
     int soType = 0; optLen = sizeof(int);
     getsockopt(sock, SOL_SOCKET, SO_TYPE, (char*)&soType, &optLen);
-    info += (soType == SOCK_STREAM) ? L"Type: SOCK_STREAM  " : L"Type: ?  ";
+    info += (soType == SOCK_STREAM) ? L"Type: SOCK_STREAM  " : (soType == SOCK_DGRAM) ? L"Type: SOCK_DGRAM  " : L"Type: ?  ";
 
     // Estimated MTU (Ethernet): MSS + 40 (TCP+IP headers)
     if (mss > 0) {
@@ -1398,39 +1600,63 @@ void MainWindow::RefreshDiagnostics()
         info += L"MTU: (query N/A)  Est. Frame: ~1514 B (Ethernet)";
     }
 
-    SetWindowTextW(m_hStaticDiagInfo, info.c_str());
+    });
+    SetWindowTextW(m_hStaticDiagInfo, ok ? info.c_str() : L"Socket not available");
 }
 
 // ============================================================
 //  SetConnectionUI
 // ============================================================
 
-void MainWindow::SetConnectionUI(bool connected)
+void MainWindow::UpdateSendEnable()
 {
-    m_connected = connected;
-    EnableWindow(m_hBtnConnect,    !connected);
-    EnableWindow(m_hBtnDisconnect,  connected);
-    EnableWindow(m_hBtnSend,        connected || Button_GetCheck(m_hChkAutoConnect) == BST_CHECKED);
-    EnableWindow(m_hBtnCyclicStart, connected || Button_GetCheck(m_hChkAutoConnect) == BST_CHECKED);
-    EnableWindow(m_hComboHost,    !connected);
-    EnableWindow(m_hEditPort,      !connected);
-    EnableWindow(m_hEditTimeout,   !connected);
-    EnableWindow(m_hComboProtocol, !connected);
-    EnableWindow(m_hChkKeepAlive,  !connected);
-    EnableWindow(m_hChkAutoDisc,   !connected);
-    EnableWindow(m_hChkAutoConnect,!connected);
-    if (connected) {
-        SetWindowTextW(m_hStaticStatus, L"\u25CF Connected");
-        // Build title: "TCP Client  –  ip:port"
-        std::wstring ip   = Utils::GetWindowText(m_hComboHost);
-        std::wstring port = Utils::GetWindowText(m_hEditPort);
+    const bool autoConn = Button_GetCheck(m_hChkAutoConnect) == BST_CHECKED;
+    const bool canSend  = m_connected || autoConn;
+    EnableWindow(m_hBtnSend, canSend);
+    // While a cyclic run is winding down its button stays disabled.
+    const bool stopping = m_cyclicRunning && m_cyclicStop;
+    EnableWindow(m_hBtnCyclicStart, (canSend || m_cyclicRunning) && !stopping);
+}
+
+void MainWindow::SetConnectionUI(ConnState st)
+{
+    m_sessionActive = (st != CS_IDLE);
+    m_connected     = (st == CS_CONNECTED);
+    EnableWindow(m_hBtnConnect,    !m_sessionActive);
+    EnableWindow(m_hBtnDisconnect,  m_sessionActive);
+    UpdateSendEnable();
+    EnableWindow(m_hComboHost,    !m_sessionActive);
+    EnableWindow(m_hEditPort,      !m_sessionActive);
+    EnableWindow(m_hEditTimeout,   !m_sessionActive);
+    EnableWindow(m_hComboProtocol, !m_sessionActive);
+    EnableWindow(m_hChkKeepAlive,  !m_sessionActive);
+    EnableWindow(m_hChkAutoDisc,   !m_sessionActive);
+    EnableWindow(m_hChkAutoConnect,!m_sessionActive);
+
+    // Tab label: everything after the en dash is shown by the frame.
+    std::wstring detail;
+    if (m_sessionActive) {
         bool isUdp = (SendMessage(m_hComboProtocol, CB_GETCURSEL, 0, 0) == 1);
-        std::wstring title = std::wstring(isUdp ? L"UDP Client v" TCPTOOLS_VERSION : L"TCP Client v" TCPTOOLS_VERSION)
-                             + L"  \u2013  " + ip + L":" + port;
-        SetWindowTextW(m_hWnd, title.c_str());
-    } else {
-        SetWindowTextW(m_hStaticStatus, L"\u25CF Disconnected");
+        detail = std::wstring(isUdp ? L"UDP " : L"") + Utils::GetWindowText(m_hComboHost)
+                 + L":" + Utils::GetWindowText(m_hEditPort);
+    }
+    switch (st) {
+    case CS_CONNECTED:
+        SetWindowTextW(m_hStaticStatus, L"● Connected");
+        SetWindowTextW(m_hWnd, (L"TCP Client v" TCPTOOLS_VERSION L"  –  " + detail).c_str());
+        NotifyToolState(m_hWnd, TOOL_ACTIVE);
+        break;
+    case CS_CONNECTING:
+        SetWindowTextW(m_hStaticStatus, L"◌ Connecting...");
+        SetWindowTextW(m_hWnd, (L"TCP Client v" TCPTOOLS_VERSION L"  –  " + detail + L"…").c_str());
+        NotifyToolState(m_hWnd, TOOL_WAITING);
+        break;
+    default:
+        SetWindowTextW(m_hStaticStatus,
+            m_lastError.empty() ? L"● Disconnected" : (L"● Disconnected - " + m_lastError).c_str());
         SetWindowTextW(m_hWnd, L"TCP Client v" TCPTOOLS_VERSION);
+        NotifyToolState(m_hWnd, TOOL_IDLE);
+        break;
     }
     InvalidateRect(m_hStaticStatus, nullptr, TRUE);
 }
@@ -1442,46 +1668,32 @@ void MainWindow::SetConnectionUI(bool connected)
 void MainWindow::OnNetConnected()
 {
     m_connectTime = Utils::Now();
-    SetConnectionUI(true);
+    SetConnectionUI(CS_CONNECTED);
 
-    // Save connection to history
+    // Save connection to history. Other pages write the same file, so merge with
+    // what is on disk instead of overwriting it with this page's older copy.
     {
         std::wstring host = Utils::GetWindowText(m_hComboHost);
         std::wstring port = Utils::GetWindowText(m_hEditPort);
-        std::wstring entry = host + L":" + port;
-        Utils::SaveHistory(L"TcpClient", entry, m_connHistory);
+        m_connHistory = Utils::LoadHistory(L"TcpClient");
+        Utils::SaveHistory(L"TcpClient", host + L":" + port, m_connHistory);
         PopulateHostCombo();
-        SetWindowTextW(m_hComboHost, host.c_str());
-    }
-
-    // If the connection was triggered by auto-connect-before-send, fire the send now.
-    if (m_pendingAutoSend) {
-        m_pendingAutoSend = false;
-        DoSend(); // will proceed since m_connected is now true
-    }
-    // If the connection was triggered by auto-connect-before-cyclic, start cyclic now.
-    if (m_pendingCyclicStart) {
-        m_pendingCyclicStart = false;
-        PostMessageW(m_hWnd, WM_COMMAND, MAKEWPARAM(IDC_BTN_CYCLIC_START, BN_CLICKED), 0);
     }
 
     bool isUdp = (SendMessage(m_hComboProtocol, CB_GETCURSEL, 0, 0) == 1);
-    const wchar_t* proto = isUdp ? L"UDP" : L"TCP";
+    const wchar_t* proto = ProtoLabel(isUdp);
 
     LogEntry le;
     le.type      = LogType::Connected;
     le.timestamp = Utils::NowTimestamp();
     le.preview   = std::wstring(L"[") + proto + L"] Connected to "
-                   + Utils::ToWide(Utils::ToUTF8(Utils::GetWindowText(m_hComboHost)))
+                   + Utils::GetWindowText(m_hComboHost)
                    + L":" + Utils::GetWindowText(m_hEditPort);
     le.byteCount = 0;
     AddLogEntry(std::move(le));
 
-    // Exhaustive socket info log
-    if (m_net && m_net->GetSocket() != INVALID_SOCKET) {
-        SOCKET sock = m_net->GetSocket();
-
-        // Log socket options
+    // Socket info log
+    if (m_net) m_net->WithSocket([this](SOCKET sock) {
         int sndbuf = 0, rcvbuf = 0, optLen = sizeof(int);
         getsockopt(sock, SOL_SOCKET, SO_SNDBUF, (char*)&sndbuf, &optLen);
         optLen = sizeof(int);
@@ -1498,11 +1710,10 @@ void MainWindow::OnNetConnected()
         li.preview = infoBuf;
         AddLogEntry(std::move(li));
 
-        // Log local endpoint
         sockaddr_in localAddr = {};
         int localLen = sizeof(localAddr);
         if (getsockname(sock, (sockaddr*)&localAddr, &localLen) == 0) {
-            wchar_t ip[64]; DWORD ipLen = 64;
+            wchar_t ip[64] = {}; DWORD ipLen = 64;
             WSAAddressToStringW((sockaddr*)&localAddr, localLen, nullptr, ip, &ipLen);
             LogEntry li2;
             li2.type = LogType::Info;
@@ -1510,7 +1721,7 @@ void MainWindow::OnNetConnected()
             li2.preview = L"Local endpoint: " + std::wstring(ip);
             AddLogEntry(std::move(li2));
         }
-    }
+    });
 
     UpdateStats(CycleStats{});
     {
@@ -1520,29 +1731,41 @@ void MainWindow::OnNetConnected()
     }
 
     RefreshDiagnostics();
+
+    // Connection triggered by auto-connect: do what the user asked for, now that
+    // the connection (and its log lines) are in place.
+    if (m_pendingAutoSend) {
+        m_pendingAutoSend = false;
+        DoSend();
+    }
+    if (m_pendingCyclicStart) {
+        m_pendingCyclicStart = false;
+        PostMessageW(m_hWnd, WM_COMMAND, MAKEWPARAM(IDC_BTN_CYCLIC_START, BN_CLICKED), 0);
+    }
 }
 
-void MainWindow::OnNetDisconnected()
+void MainWindow::OnNetDisconnected(bool neverConnected)
 {
     m_pendingAutoSend    = false; // cancel pending auto-send if connection dropped
-    m_pendingCyclicStart = false; // cancel pending cyclic start if connection dropped
-    if (m_cyclicRunning) {
-        m_cyclicStop = true;
-        if (m_cyclicThread.joinable()) m_cyclicThread.join();
-        m_cyclicRunning = false;
-        SetWindowTextW(m_hBtnCyclicStart, L"Start Cyclic");
+    m_pendingCyclicStart = false;
+    // A running cyclic thread sees the closed session by itself.
+    FlushRecvPending();
+    const bool hadError = !m_lastError.empty();
+    SetConnectionUI(CS_IDLE);
+    m_lastError.clear();
+
+    const wchar_t* proto = ProtoLabel(SendMessage(m_hComboProtocol, CB_GETCURSEL, 0, 0) == 1);
+
+    // A failed connect already has its Error entry.
+    if (!neverConnected || !hadError) {
+        LogEntry le;
+        le.type      = neverConnected ? LogType::Info : LogType::Disconnected;
+        le.timestamp = Utils::NowTimestamp();
+        le.preview   = std::wstring(L"[") + proto + L"] "
+                       + (neverConnected ? L"Connection attempt cancelled" : L"Disconnected (connection closed)");
+        le.byteCount = 0;
+        AddLogEntry(std::move(le));
     }
-    SetConnectionUI(false);
-
-    bool isUdp = (SendMessage(m_hComboProtocol, CB_GETCURSEL, 0, 0) == 1);
-    const wchar_t* proto = isUdp ? L"UDP" : L"TCP";
-
-    LogEntry le;
-    le.type      = LogType::Disconnected;
-    le.timestamp = Utils::NowTimestamp();
-    le.preview   = std::wstring(L"[") + proto + L"] Disconnected (connection closed)";
-    le.byteCount = 0;
-    AddLogEntry(std::move(le));
 
     RefreshDiagnostics();
 }
@@ -1558,59 +1781,52 @@ void MainWindow::OnNetDataReceived(size_t len, BYTE* pData)
 
     // Auto-clear receive window before appending new data
     if (Button_GetCheck(m_hChkAutoClearRecv) == BST_CHECKED) {
-        m_recvData.clear();
         m_lastRecvData.clear();
-        SetWindowTextW(m_hEditRecv, L"");
-        HexView::ClearData(m_hHexRecv);
+        ClearRecv();
     }
 
     m_recvData.insert(m_recvData.end(), chunk.begin(), chunk.end());
     m_lastRecvData.insert(m_lastRecvData.end(), chunk.begin(), chunk.end()); // accumulate for Save Last
-    AppendReceiveText(chunk);
+    TrimNewestHalf(m_lastRecvData, LAST_RECV_MAX);
+    if (TrimNewestHalf(m_recvData, RECV_MAX)) {
+        // Both views must show the same (shortened) buffer.
+        if (m_hexRecvMode) { HexView::SetData(m_hHexRecv, m_recvData); m_recvTextStale = true; }
+        else               { RebuildRecvText(); m_recvHexStale = true; }
+    } else {
+        AppendReceiveData(chunk);
+    }
 
-    // Determine protocol label
-    bool isUdp = (SendMessage(m_hComboProtocol, CB_GETCURSEL, 0, 0) == 1);
-    const wchar_t* proto = isUdp ? L"UDP" : L"TCP";
+    const wchar_t* proto = ProtoLabel(SendMessage(m_hComboProtocol, CB_GETCURSEL, 0, 0) == 1);
 
     LogEntry le;
     le.type      = LogType::Received;
     le.timestamp = Utils::NowTimestamp();
-    le.data      = chunk;
     le.byteCount = len;
-    std::wstring prev;
-    for (size_t i = 0; i < std::min(len, (size_t)80); ++i) {
-        BYTE b = chunk[i];
-        prev += (b >= 0x20 && b < 0x7F) ? (wchar_t)b : L'.';
-    }
-    le.preview = std::wstring(L"[") + proto + L"] " + prev;
+    le.preview   = std::wstring(L"[") + proto + L"] " + MakePreview(chunk.data(), chunk.size());
+    le.data      = std::move(chunk);
     AddLogEntry(std::move(le));
-
-    // Compute latency: find last Sent entry with valid sendEnd but no latency stored yet
-    for (int i = (int)m_log.size() - 1; i >= 0; --i) {
-        if (m_log[i].type == LogType::Sent && m_log[i].stats.valid && m_log[i].latencyMs < 0) {
-            // Approximate latency as time from sendEnd to now (UI thread time)
-            double lat = Utils::ElapsedMs(m_log[i].stats.sendEnd, Utils::Now());
-            if (lat >= 0) {
-                m_log[i].latencyMs = lat;
-                // Invalidate this row in the virtual ListView
-                for (int v = (int)m_logVisible.size() - 1; v >= 0; --v) {
-                    if (m_logVisible[v] == i) {
-                        ListView_RedrawItems(m_hListLog, v, v);
-                        break;
-                    }
-                }
-            }
-            break;
-        }
-    }
 
     // Update total stats labels
     {
         wchar_t buf[80];
-        swprintf_s(buf, L"Total sent: %s", Utils::FormatBytes(m_totalBytesSent).c_str());
-        SetWindowTextW(m_hStatTotalSent, buf);
         swprintf_s(buf, L"Total recv: %s", Utils::FormatBytes(m_totalBytesRecv).c_str());
         SetWindowTextW(m_hStatTotalRecv, buf);
+    }
+}
+
+// Send-to-first-receive time measured by the network thread.
+void MainWindow::OnNetLatency(double latMs)
+{
+    if (m_cyclicRunning) return;   // cyclic sends have no log entry of their own
+    for (int i = (int)m_log.size() - 1; i >= 0; --i) {
+        if (m_log[i].type != LogType::Sent) continue;
+        if (m_log[i].latencyMs < 0) {
+            m_log[i].latencyMs = latMs;
+            for (int v = (int)m_logVisible.size() - 1; v >= 0; --v) {
+                if (m_logVisible[v] == i) { ListView_RedrawItems(m_hListLog, v, v); break; }
+            }
+        }
+        break;
     }
 }
 
@@ -1621,6 +1837,11 @@ void MainWindow::OnNetSendComplete(size_t bytesSent, CycleStats* pStats)
 
     // Accumulate total bytes
     m_totalBytesSent += bytesSent;
+
+    if (m_connected && !m_lastError.empty()) {   // a non-fatal error (UDP) is over
+        m_lastError.clear();
+        SetWindowTextW(m_hStaticStatus, L"● Connected");
+    }
 
     // During cyclic mode, skip log entry updates (no individual log entries)
     if (!m_cyclicRunning) {
@@ -1643,19 +1864,20 @@ void MainWindow::OnNetSendComplete(size_t bytesSent, CycleStats* pStats)
     UpdateStats(s);
 }
 
-void MainWindow::OnNetError(int wsaErr, std::wstring* pMsg)
+// Errors come from the network thread, possibly while another tab is in front,
+// so they go to the log and the status line, never to a modal box. The session
+// end (WM_NET_DISCONNECTED) follows for every fatal one.
+void MainWindow::OnNetError(int /*wsaErr*/, std::wstring* pMsg)
 {
-    m_pendingAutoSend    = false; // cancel pending auto-send if connection failed
-    m_pendingCyclicStart = false; // cancel pending cyclic start if connection failed
+    m_pendingAutoSend    = false;
+    m_pendingCyclicStart = false;
     std::wstring msg;
     if (pMsg) { msg = *pMsg; delete pMsg; }
 
-    SetConnectionUI(false);
-    if (m_net) m_net->Disconnect();
-
-    wchar_t title[64];
-    swprintf_s(title, L"Network Error (%d)", wsaErr);
-    MessageBoxW(m_hWnd, msg.c_str(), title, MB_ICONERROR);
+    m_lastError = msg;
+    if (m_sessionActive)
+        SetWindowTextW(m_hStaticStatus,
+            ((m_connected ? L"● Connected - " : L"◌ Connecting... - ") + msg).c_str());
 
     LogEntry le;
     le.type      = LogType::Error;
@@ -1663,31 +1885,6 @@ void MainWindow::OnNetError(int wsaErr, std::wstring* pMsg)
     le.preview   = msg;
     le.byteCount = 0;
     AddLogEntry(std::move(le));
-}
-
-// ============================================================
-//  AppendReceiveText
-// ============================================================
-
-void MainWindow::AppendReceiveText(const std::vector<BYTE>& data)
-{
-    if (m_hexRecvMode) {
-        HexView::SetData(m_hHexRecv, m_recvData);
-    } else {
-        const int MAX_CHARS = 1 * 1024 * 1024; // 1 MB rolling cap
-        const int TRIM_TO   = MAX_CHARS / 2;    // keep newest ~512 KB
-        int len = GetWindowTextLengthW(m_hEditRecv);
-        if (len > MAX_CHARS) {
-            // Remove oldest half, preserving recent data
-            SendMessage(m_hEditRecv, EM_SETSEL, 0, TRIM_TO);
-            SendMessage(m_hEditRecv, EM_REPLACESEL, FALSE, (LPARAM)L"[...older output trimmed...]\r\n");
-            len = GetWindowTextLengthW(m_hEditRecv);
-        }
-        std::string s(data.begin(), data.end());
-        std::wstring ws = Utils::ToWide(s);
-        SendMessage(m_hEditRecv, EM_SETSEL, (WPARAM)len, (LPARAM)len);
-        SendMessage(m_hEditRecv, EM_REPLACESEL, FALSE, (LPARAM)ws.c_str());
-    }
 }
 
 // ============================================================
@@ -1777,9 +1974,33 @@ void MainWindow::RefreshLogView()
     InvalidateRect(m_hListLog, nullptr, TRUE);
 }
 
+void MainWindow::ClearLog()
+{
+    m_log.clear();
+    m_logVisible.clear();
+    m_logBase  = 0;
+    m_logBytes = 0;
+    ListView_SetItemCountEx(m_hListLog, 0, 0);
+    InvalidateRect(m_hListLog, nullptr, TRUE);
+}
+
 void MainWindow::AddLogEntry(LogEntry&& e)
 {
+    m_logBytes += e.data.size();
     m_log.push_back(std::move(e));
+    NotifyToolEvent(m_hWnd);   // every entry counts, also ones the log filter hides
+
+    if (m_log.size() > LOG_MAX_ENTRIES || m_logBytes > LOG_MAX_BYTES) {
+        // Drop the oldest 10 %; m_logBase keeps the "#" column counting from the first ever entry.
+        size_t drop = std::max<size_t>(m_log.size() / 10, 1);
+        for (size_t i = 0; i < drop; ++i) m_logBytes -= m_log[i].data.size();
+        m_log.erase(m_log.begin(), m_log.begin() + (std::ptrdiff_t)drop);
+        m_logBase += drop;
+        RefreshLogView();
+        if (!m_logVisible.empty()) ListView_EnsureVisible(m_hListLog, (int)m_logVisible.size() - 1, FALSE);
+        return;
+    }
+
     const LogEntry& le = m_log.back();
     int origIdx = (int)(m_log.size() - 1);
 
@@ -1820,7 +2041,7 @@ void MainWindow::OnNotify(NMHDR* nm)
 
             if (di->item.mask & LVIF_TEXT) {
                 switch (di->item.iSubItem) {
-                case 0: swprintf_s(buf, L"%d", logIdx + 1); break;
+                case 0: swprintf_s(buf, L"%zu", m_logBase + (size_t)logIdx + 1); break;
                 case 1: wcsncpy_s(buf, le.timestamp.c_str(), _TRUNCATE); break;
                 case 2: { int t = (int)le.type; wcsncpy_s(buf, (t >= 0 && t < 6) ? typeNames[t] : L"?", _TRUNCATE); break; }
                 case 3: if (le.byteCount > 0) swprintf_s(buf, L"%zu", le.byteCount); else buf[0] = 0; break;
@@ -1867,12 +2088,7 @@ void MainWindow::OnContextMenuLog(POINT pt)
 
     if (cmd == IDM_LOG_RELOAD && origIdx >= 0) DoReloadLogEntry(origIdx);
     if (cmd == IDM_LOG_COPY   && origIdx >= 0) Utils::CopyToClipboard(m_hWnd, m_log[origIdx].preview);
-    if (cmd == IDM_LOG_CLEAR) {
-        m_log.clear();
-        m_logVisible.clear();
-        ListView_SetItemCountEx(m_hListLog, 0, 0);
-        InvalidateRect(m_hListLog, nullptr, TRUE);
-    }
+    if (cmd == IDM_LOG_CLEAR) ClearLog();
 }
 
 // ============================================================
@@ -1882,31 +2098,20 @@ void MainWindow::OnContextMenuLog(POINT pt)
 void MainWindow::DoReloadLogEntry(int idx)
 {
     if (idx < 0 || idx >= (int)m_log.size()) return;
-    const LogEntry& le = m_log[idx];
+    const LogEntry le = m_log[idx];   // copy: reloading must not depend on the log staying put
 
     switch (le.type)
     {
     case LogType::Sent:
     {
-        m_sendData = le.data;
-        std::string s(m_sendData.begin(), m_sendData.end());
-        std::wstring ws = Utils::ToWide(s);
-        HexView::SetData(m_hHexSend, m_sendData);
-        m_ignoreEditChange = true;
-        SetWindowTextW(m_hEditSend, ws.c_str());
-        m_ignoreEditChange = false;
-        RefreshSendView();
-        // Switch to send tab / bring focus
+        LoadPayloadIntoEditor(le.data, L"");
         SetFocus(m_hEditSend);
         break;
     }
     case LogType::Received:
     {
         m_recvData = le.data;
-        std::string s(m_recvData.begin(), m_recvData.end());
-        std::wstring ws = Utils::ToWide(s);
-        SetWindowTextW(m_hEditRecv, ws.c_str());
-        HexView::SetData(m_hHexRecv, m_recvData);
+        m_recvTextStale = m_recvHexStale = true;
         RefreshRecvView();
         break;
     }
@@ -1929,7 +2134,7 @@ void MainWindow::CreateTooltips()
         CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
         m_hWnd, nullptr, m_hInst, nullptr);
     if (!m_hTooltip) return;
-    SendMessageW(m_hTooltip, TTM_SETMAXTIPWIDTH, 0, 420);
+    SendMessageW(m_hTooltip, TTM_SETMAXTIPWIDTH, 0, Dpi::Scale(420));
     SendMessageW(m_hTooltip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 30000);
     SendMessageW(m_hTooltip, TTM_SETDELAYTIME, TTDT_INITIAL,  1200);
     SendMessageW(m_hTooltip, TTM_SETDELAYTIME, TTDT_RESHOW,    200);
@@ -1954,8 +2159,7 @@ void MainWindow::CreateTooltips()
         L"You can type a new address or pick one from the dropdown, "
         L"which stores your recent connections automatically.\n\n"
         L"Supported formats:\n"
-        L"\u2022 IPv4 address: 192.168.1.10\n"
-        L"\u2022 IPv6 address: ::1 or [::1]\n"
+        L"\u2022 IPv4 address: 192.168.1.10 (IPv6 is not supported)\n"
         L"\u2022 Hostname: myserver.local\n"
         L"\u2022 host:port shortcut: 192.168.1.10:9001\n"
         L"   (auto-fills both Host and Port fields)");
@@ -1970,9 +2174,11 @@ void MainWindow::CreateTooltips()
 
     tip(m_hEditTimeout,
         L"Connection timeout in seconds.\n\n"
-        L"How long to wait for the TCP handshake or first "
-        L"UDP response before giving up.\n\n"
-        L"\u2022 Enter 0 to wait indefinitely.\n"
+        L"How long to wait for the TCP connection to be "
+        L"established, and how long a single send may block "
+        L"before it fails. (UDP has no handshake.)\n\n"
+        L"\u2022 Whole seconds, 0\u20133600. Enter 0 to wait without limit "
+        L"(Disconnect still cancels).\n"
         L"\u2022 Typical values: 3\u201310 seconds.\n"
         L"\u2022 Use a longer timeout for remote/VPN hosts.");
 
@@ -1995,22 +2201,23 @@ void MainWindow::CreateTooltips()
         L"to click this \u2014 it connects when you send data.");
 
     tip(m_hBtnDisconnect,
-        L"Close the current connection gracefully.\n\n"
-        L"Sends a TCP FIN (or discards the UDP socket) "
+        L"Close the current connection, or cancel a connection "
+        L"attempt that is still in progress.\n\n"
+        L"Closes the TCP connection (or discards the UDP socket) "
         L"and returns to the idle state.");
 
     tip(m_hChkKeepAlive,
-        L"Enable TCP keep-alive probes.\n\n"
-        L"The OS sends periodic probe packets on an idle connection "
-        L"so that a broken link (cable unplugged, remote crash) "
-        L"is detected within seconds instead of waiting for the "
-        L"next send to fail.\n\n"
+        L"Enable TCP keep-alive probes (TCP only).\n\n"
+        L"The OS sends probe packets on a connection that has been idle "
+        L"for 10 seconds, so that a broken link (cable unplugged, "
+        L"remote crash) is detected after roughly 20 seconds instead of "
+        L"waiting for the next send to fail.\n\n"
         L"Recommended for long-lived connections.");
 
     tip(m_hChkAutoDisc,
         L"Auto-Disconnect after every send.\n\n"
         L"The connection is closed immediately after each payload "
-        L"is transmitted. Useful for protocols that expect a fresh "
+        L"is transmitted; a response that has not arrived yet is lost. Useful for protocols that expect a fresh "
         L"connection per request (e.g. some HTTP/1.0 or industrial "
         L"protocols).\n\n"
         L"Can be combined with Auto-Connect for fully automatic "
@@ -2036,8 +2243,8 @@ void MainWindow::CreateTooltips()
     // ================================================================
     tip(m_hEditSend,
         L"Send editor \u2014 type or paste the data to transmit.\n\n"
-        L"In text mode, type plain ASCII/UTF-8 text. "
-        L"In hex mode, enter space-separated hex pairs: "
+        L"In text mode, type plain text; it is sent as UTF-8. "
+        L"With Hex checked, the editor holds hex pairs: "
         L"48 65 6C 6C 6F (= \"Hello\").\n\n"
         L"Keyboard shortcuts:\n"
         L"\u2022 Ctrl+Enter \u2014 Send immediately\n"
@@ -2052,22 +2259,25 @@ void MainWindow::CreateTooltips()
 
     tip(m_hBtnLoadFile,
         L"Load a file from disk into the send editor.\n\n"
-        L"The entire file is read as raw bytes. If Hex View "
-        L"is active, data is shown as hex bytes; otherwise as text.\n\n"
+        L"The file (up to 64 MB) is read as raw bytes and sent exactly as it is on disk. "
+        L"A text file is shown as text (or hex when Hex is checked). A binary "
+        L"file up to 1 MB switches the editor to hex; a larger one is "
+        L"represented by a one-line note.\n\n"
         L"Useful for sending binary protocols, captured packets, "
         L"or template request files.");
 
     tip(m_hBtnClearSend,
-        L"Clear the send editor and internal buffer.\n\n"
-        L"Both the text view and the hex view are reset.");
+        L"Clear the send editor and any loaded data.");
 
     tip(m_hChkHexSend,
-        L"Toggle Hex View for the send editor.\n\n"
-        L"When checked, the editor displays and accepts data "
-        L"as space-separated hexadecimal byte pairs.\n"
+        L"Edit the data to send as hex.\n\n"
+        L"When checked, the editor shows the data as hexadecimal "
+        L"byte pairs (16 per line) that you can edit; what is sent is "
+        L"the bytes those pairs describe. Spaces and line breaks are ignored.\n"
         L"Example: 48 65 6C 6C 6F = \"Hello\"\n\n"
-        L"Switching modes converts the current data between "
-        L"representations automatically.");
+        L"Switching converts the current data. Back to text, invalid hex "
+        L"is refused with a message, and bytes that are not text are still "
+        L"sent exactly as they are. Data over 1 MB cannot be edited as hex.");
 
     tip(m_hChkAutoClearSend,
         L"Auto-clear the send editor after each send.\n\n"
@@ -2116,8 +2326,9 @@ void MainWindow::CreateTooltips()
         L"transmitted repeatedly at the configured interval. "
         L"The counter shows how many sends have been executed.\n\n"
         L"Click again to stop the cycle.\n\n"
-        L"TIP: Combine with Auto-Connect and Auto-Disconnect "
-        L"to test connection cycling under load.");
+        L"The cycle ends by itself if the connection is lost or a send "
+        L"fails. With Auto-Disconnect the connection is closed after the first "
+        L"send, which ends the cycle.");
 
     tip(m_hStaticCyclicCount,
         L"Cyclic send counter.\n\n"
@@ -2136,7 +2347,7 @@ void MainWindow::CreateTooltips()
         L"checkbox. Use Copy or Save to export the data.");
 
     tip(m_hBtnClearRecv,
-        L"Clear the receive display and internal buffer.\n\n"
+        L"Clear the receive display and buffer.\n\n"
         L"Both the text view and the hex view are reset. "
         L"The log history is NOT affected.");
 
@@ -2158,7 +2369,8 @@ void MainWindow::CreateTooltips()
         L"When checked, incoming data is shown as hexadecimal "
         L"bytes with an ASCII sidebar. When unchecked, data is "
         L"displayed as text.\n\n"
-        L"Switching modes re-renders all accumulated data.");
+        L"Both views show the same buffer; only the newest part "
+        L"(up to 8 MB) of a long session is kept.");
 
     tip(m_hChkAutoClearRecv,
         L"Auto-clear the receive display on new data.\n\n"

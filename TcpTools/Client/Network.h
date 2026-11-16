@@ -8,8 +8,8 @@ namespace Client {
 //  Network layer - Winsock2 TCP/UDP client (worker threads)
 //
 //  Architecture:
-//    - WorkerThread: connect + recv loop (runs until disconnect)
-//    - SendWorkerLoop: persistent send thread, processes queued sends
+//    - Core::Run: connect + recv loop (one worker thread per session, joined)
+//    - Core::SendLoop: send thread of the session, processes queued sends
 //    - UI thread: QueueSend() pushes to queue (non-blocking)
 //    - Recv thread posts latency via WM_NET_RECV_LATENCY (no mutex)
 // ============================================================
@@ -67,54 +67,45 @@ struct SendRequest {
 
 // Messages posted back to the UI window (lParam = heap-allocated payload, must free)
 // WM_NET_CONNECTED      wParam=0            lParam=nullptr
-// WM_NET_DISCONNECTED   wParam=0            lParam=nullptr
+// WM_NET_DISCONNECTED   wParam=0 (was connected) / 1 (connect failed or cancelled)
+//                       Posted exactly once per Connect(), after everything else of
+//                       that session, so the UI may call Connect() again when it arrives.
 // WM_NET_SEND_COMPLETE  wParam=bytesSent    lParam=CycleStats*
 // WM_NET_DATA_RECEIVED  wParam=dataLen      lParam=BYTE* (heap)
 // WM_NET_RECV_LATENCY   wParam=latUs(lo32)  lParam=latUs(hi32)   (microseconds as int64)
-// WM_NET_ERROR          wParam=wsaError     lParam=wchar_t* (heap msg)
+// WM_NET_ERROR          wParam=wsaError     lParam=std::wstring* (heap msg)
 
+// Lifetime: all threads belong to a shared Core that outlives this object when a
+// worker is still inside a blocking name lookup, so destruction never waits for DNS
+// and never leaves a thread touching freed memory. After destruction nothing is posted.
 class TcpNetwork
 {
 public:
     explicit TcpNetwork(HWND notifyWnd);
     ~TcpNetwork();
 
-    // Called from UI thread
+    // UI thread. False when a session is still running.
     bool     Connect(const NetConfig& cfg);
+    // Asks the session to end (also cancels a connect in progress). Returns at once;
+    // WM_NET_DISCONNECTED follows.
     void     Disconnect();
 
-    // Queue a send request (non-blocking, processed by send worker thread)
+    // Queue a send request (non-blocking, processed by the session's send thread)
     void     QueueSend(std::vector<BYTE> data, const NetConfig& cfg);
 
-    // Direct send (for cyclic thread or internal use — blocks until sent)
+    // Direct send (cyclic thread) - blocks until sent or the session ends.
     bool     Send(const std::vector<BYTE>& data, const NetConfig& cfg);
 
-    bool     IsConnected() const   { return m_connected.load(); }
-    SOCKET   GetSocket()   const   { return m_sock; }
+    bool     IsConnected() const;
+    // True from Connect() until the session thread has finished.
+    bool     IsActive() const;
+    // Runs fn(socket) while the socket cannot be closed. fn must not block.
+    bool     WithSocket(const std::function<void(SOCKET)>& fn);
 
+    struct Core;
 private:
-    void     WorkerThread(NetConfig cfg);
-    void     RecvLoop();
-    void     SendWorkerLoop();
-    void     PostError(int wsaErr, const std::wstring& msg);
-
-    HWND               m_notifyWnd {nullptr};
-    SOCKET             m_sock      {INVALID_SOCKET};
-    std::atomic<bool>  m_connected {false};
-    std::atomic<bool>  m_stopRecv  {false};
-    std::thread        m_recvThread;
-    std::mutex         m_sendMutex;       // serializes send() calls
-
-    // Send queue (persistent send worker thread)
-    std::queue<SendRequest> m_sendQueue;
-    std::mutex              m_sendQueueMutex;
-    std::condition_variable m_sendQueueCV;
-    std::thread             m_sendThread;
-    std::atomic<bool>       m_sendStop {false};
-
-    CycleStats         m_stats;
-    std::mutex         m_statsMutex;
-    bool               m_udpMode    {false};
+    std::shared_ptr<Core> m_core;
+    std::thread           m_worker;
 };
 
 } // namespace Client

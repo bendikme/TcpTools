@@ -14,6 +14,7 @@ enum class LogType { Listening, ClientConn, ClientDisconn, Sent, Received, Error
 
 struct LogEntry {
     LogType          type;
+    unsigned long long seq{0};      // running number shown in the "#" column (survives trimming)
     std::wstring     timestamp;
     std::wstring     preview;
     std::vector<BYTE>data;
@@ -44,7 +45,6 @@ private:
     void OnDestroy();
     void OnSize(int w, int h);
     void OnCommand(WORD id, WORD notify, HWND hCtrl);
-    void OnGetMinMaxInfo(MINMAXINFO* mm);
     void OnNotify(NMHDR* nm);
     void OnContextMenuLog(POINT pt);
 
@@ -58,31 +58,44 @@ private:
     void OnNetError(int wsaErr, std::wstring* pMsg);
 
     // UI Actions
+    bool StartServer(int port, int timeoutSec, bool udp, bool echo);
     void DoStartServer();
     void DoStopServer();
     void DoSend();
     void DoLoadFile();
     void DoReloadLogEntry(int idx);
     void DoSaveLastRecv();
+    void DoToggleSendHex();
 
     // UI Helpers
     void SetServerUI(bool listening, bool clientConnected);
+    void UpdateToolState();
+    void SetPageTitle(const std::wstring& detail);
     void UpdateStats(const CycleStats& s);
     void ClearStats();
     void AddLogEntry(LogEntry&& e);
-    void AppendReceiveText(const std::vector<BYTE>& data);
-    std::vector<BYTE> GetSendData();
-    NetConfig         BuildNetConfig();
+    void TrimLog();
+    LogEntry* FindLogBySeq(unsigned long long seq, int* visibleIdx);
+    void AppendReceiveText(const std::vector<BYTE>& data, bool flush = false);
+    void RebuildReceiveView();
+    void ResetRecvTextState();
+    void CapRecvBuffers();
+    void SetSendEditText(const std::wstring& text);
+    void ShowSendBytes(const std::vector<BYTE>& bytes, const std::wstring& note);
+    bool GetSendData(std::vector<BYTE>& out);
+    bool ParseHexField(const std::wstring& text, const wchar_t* what, std::vector<BYTE>& out);
+    bool BuildNetConfig(NetConfig& cfg);
     SeparatorMode     GetSeparatorMode();
-    void              RefreshSendView();
     void              RefreshRecvView();
     void              RefreshDiagnostics();
     void              RefreshLogView();
     void              CreateTooltips();
-    void              PositionHelpButton();
+    void              ShowStatusNote(const std::wstring& text);
+    void              DrainPendingMessages();
 
     // Layout helpers
-    void LayoutControls(int w, int h);
+    void RelayoutToClient();
+    void LayoutControls(int w, int h);      // w/h in 96-DPI units
     HWND MakeLabel(const wchar_t* text, int x, int y, int w, int h);
     HWND MakeEdit(int id, int x, int y, int w, int h, DWORD extra = 0);
     HWND MakeButton(int id, const wchar_t* text, int x, int y, int w, int h);
@@ -109,7 +122,6 @@ private:
 
     // Send panel
     HWND    m_hEditSend       {nullptr};
-    HWND    m_hHexSend        {nullptr};
     HWND    m_hBtnSend        {nullptr};
     HWND    m_hBtnLoadFile    {nullptr};
     HWND    m_hBtnClearSend   {nullptr};
@@ -169,21 +181,29 @@ private:
     std::unique_ptr<ServerNetwork> m_net;
     std::vector<LogEntry>          m_log;
     std::vector<int>               m_logVisible; // indices into m_log passing current filter
-    std::vector<BYTE>              m_sendData;
+    size_t                         m_logBytes      {0};   // payload bytes held by m_log
+    unsigned long long             m_nextSeq       {1};
+    std::vector<BYTE>              m_sendData;      // raw payload pinned by Load File / log reload; cleared when the user edits
     std::vector<BYTE>              m_recvData;
-    std::vector<BYTE>              m_lastRecvData;  // only last transmission
+    std::vector<BYTE>              m_lastRecvData;  // received since the last Send / Clear
+    std::vector<BYTE>              m_recvTail;      // incomplete UTF-8 sequence not yet shown in the text view
+    bool                           m_recvLastCR    {false};
     bool                           m_hexSendMode   {false};
     bool                           m_hexRecvMode   {false};
     bool                           m_ignoreEditChange {false}; // suppress EN_CHANGE during programmatic edits
     HWND                           m_hTooltip         {nullptr};
     HWND                           m_hBtnHelp         {nullptr};
     bool                           m_tooltipsEnabled  {false};
+    bool                           m_starting      {false};  // Start clicked, WM_NET_LISTENING not yet seen
     bool                           m_listening     {false};
     bool                           m_clientConn    {false};
+    bool                           m_udpActive     {false};  // protocol of the current / last run
     float                          m_splitRatio    {0.5f};
     int                            m_logFilter     {0}; // 0=All, 1=Data, 2=Connection, 3=Errors
     size_t                         m_totalBytesSent {0};
     size_t                         m_totalBytesRecv {0};
+    std::wstring                   m_peerText;
+    int                            m_port          {0};
 
     // Connection history
     std::vector<std::wstring>      m_portHistory;

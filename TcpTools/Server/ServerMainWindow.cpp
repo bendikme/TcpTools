@@ -11,6 +11,15 @@ namespace Server {
 static LRESULT CALLBACK SendEditSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam,
                                              UINT_PTR /*idSubclass*/, DWORD_PTR /*refData*/)
 {
+    // The frame runs IsDialogMessage; make sure it hands Ctrl+Enter to the edit
+    // instead of treating it as a dialog key.
+    if (msg == WM_GETDLGCODE) {
+        LRESULT code = DefSubclassProc(hWnd, msg, wParam, lParam);
+        const MSG* m = (const MSG*)lParam;
+        if (m && m->message == WM_KEYDOWN && m->wParam == VK_RETURN && (GetKeyState(VK_CONTROL) & 0x8000))
+            code |= DLGC_WANTMESSAGE;
+        return code;
+    }
     if (msg == WM_KEYDOWN && wParam == VK_RETURN && (GetKeyState(VK_CONTROL) & 0x8000)) {
         HWND parent = GetParent(hWnd);
         PostMessageW(parent, WM_COMMAND, MAKEWPARAM(IDC_BTN_SEND, BN_CLICKED), 0);
@@ -23,29 +32,19 @@ static LRESULT CALLBACK SendEditSubclassProc(HWND hWnd, UINT msg, WPARAM wParam,
 }
 
 // ============================================================
-//  Constants
+//  Constants (layout numbers are 96-DPI units; Move() scales them)
 // ============================================================
 static constexpr int MARGIN    = 8;
 static constexpr int ROW_H     = 24;
 static constexpr int BTN_W     = 90;
 static constexpr int GRP_TITLE = 18;
 
-static HFONT CreateUIFont()
-{
-    NONCLIENTMETRICSW ncm = {}; ncm.cbSize = sizeof(ncm);
-    SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
-    return CreateFontIndirectW(&ncm.lfMessageFont);
-}
-static HFONT CreateMonoUI()
-{
-    LOGFONTW lf = {};
-    lf.lfHeight = -13; lf.lfWeight = FW_NORMAL;
-    lf.lfPitchAndFamily = FIXED_PITCH | FF_MODERN; lf.lfCharSet = DEFAULT_CHARSET;
-    wcscpy_s(lf.lfFaceName, L"Consolas");
-    HFONT f = CreateFontIndirectW(&lf);
-    if (!f) { wcscpy_s(lf.lfFaceName, L"Courier New"); f = CreateFontIndirectW(&lf); }
-    return f;
-}
+static constexpr size_t RECV_CAP        = 8u * 1024 * 1024;    // received bytes kept; newest half survives a trim
+static constexpr size_t LOG_MAX_ENTRIES = 20000;
+static constexpr size_t LOG_MAX_BYTES   = 64u * 1024 * 1024;   // payload bytes held by the log
+static constexpr size_t FILE_MAX        = 64u * 1024 * 1024;   // Load File limit
+static constexpr size_t HEX_EDIT_MAX    = 1u * 1024 * 1024;    // largest payload shown / edited as hex text
+static constexpr size_t TEXT_SHOW_MAX   = 4u * 1024 * 1024;    // largest payload shown as text in the editor
 
 // ============================================================
 //  RegisterClass / Create
@@ -116,7 +115,7 @@ LRESULT CALLBACK ServerMainWindow::WndProc(HWND hWnd, UINT msg, WPARAM wParam, L
         return 0;
     }
     case WM_DESTROY:
-        if (self) { self->OnDestroy(); delete self; SetWindowLongPtrW(hWnd, 0, 0); }
+        if (self) { SetWindowLongPtrW(hWnd, 0, 0); self->OnDestroy(); delete self; }
         return 0;
     case WM_SIZE:
         if (self && wParam != SIZE_MINIMIZED)
@@ -132,61 +131,71 @@ LRESULT CALLBACK ServerMainWindow::WndProc(HWND hWnd, UINT msg, WPARAM wParam, L
                 L"TCP/UDP Server v" TCPTOOLS_VERSION L"\n"
                 TCPTOOLS_COPYRIGHT L"\n"
                 L"\n"
-                L"\u2500\u2500\u2500 GETTING STARTED \u2500\u2500\u2500\n"
+                L"─── GETTING STARTED ───\n"
                 L"\n"
                 L"1. Enter the port to listen on at the top.\n"
                 L"Select from recent ports in the dropdown, "
                 L"or type a new port number.\n"
-                L"2. Choose TCP or UDP and set the timeout.\n"
-                L"3. Click Start Server to begin listening.\n"
-                L"4. Wait for a client to connect.\n"
+                L"2. Choose TCP or UDP and set the send timeout.\n"
+                L"3. Click Start Server to begin listening (IPv4 only, all local addresses).\n"
+                L"4. Wait for a client to connect (UDP: for a datagram to arrive).\n"
                 L"5. Received data appears in the Receive panel.\n"
                 L"6. Type a response in Send and click Send.\n"
                 L"\n"
-                L"\u2500\u2500\u2500 KEYBOARD SHORTCUTS \u2500\u2500\u2500\n"
+                L"─── KEYBOARD SHORTCUTS ───\n"
                 L"\n"
-                L"\u2022 Ctrl+Enter \u2014 Send data to connected client\n"
-                L"\u2022 F1 \u2014 This help screen\n"
+                L"• Ctrl+Enter — Send data to the connected client\n"
+                L"• F1 — This help screen\n"
+                L"• Ctrl+Tab — Next tab, Ctrl+T — new tab, Ctrl+W — close tab\n"
                 L"\n"
-                L"\u2500\u2500\u2500 FEATURES \u2500\u2500\u2500\n"
+                L"─── FEATURES ───\n"
                 L"\n"
-                L"\u2022 Echo Mode \u2014 Automatically echoes received "
+                L"• Echo Mode — Automatically echoes received "
                 L"data back to the client. Great for testing.\n"
-                L"\u2022 Hex View \u2014 Send/receive data as hex bytes.\n"
-                L"\u2022 Framing \u2014 Auto-wrap payloads with STX/ETX, "
+                L"• Hex — Edit the data to send as hex byte pairs "
+                L"instead of text.\n"
+                L"• Hex View (Receive) — Show received data as a hex dump.\n"
+                L"• Framing — Auto-wrap payloads with STX/ETX, "
                 L"CR LF, LF, CR, NUL, or custom hex delimiters.\n"
-                L"\u2022 Load/Save \u2014 Load files into send editor, "
-                L"save received data to disk.\n"
-                L"\u2022 Port History \u2014 Dropdown remembers recent "
+                L"• Load/Save — Load files into the send editor "
+                L"(sent byte-exact), save received data to disk.\n"
+                L"• Port History — Dropdown remembers recent "
                 L"listen ports across sessions.\n"
+                L"• UDP — There is no connection: the \"client\" is the sender of "
+                L"the last datagram, and Send goes to that sender.\n"
                 L"\n"
-                L"\u2500\u2500\u2500 BOTTOM PANEL \u2500\u2500\u2500\n"
+                L"─── BOTTOM PANEL ───\n"
                 L"\n"
-                L"\u2022 Log \u2014 Full event history. Right-click to reload "
+                L"• Log — Event history (newest 20,000 entries). Right-click to reload "
                 L"data or copy previews.\n"
-                L"\u2022 Diagnostics \u2014 Live socket info (buffers, Nagle, "
-                L"MTU, keep-alive).\n"
-                L"\u2022 Statistics \u2014 Timing, byte counts, latency, "
+                L"• Diagnostics — Live socket info (buffer sizes, Nagle, "
+                L"MSS/MTU estimate).\n"
+                L"• Statistics — Timing, byte counts, latency, "
                 L"and throughput.\n"
                 L"\n"
-                L"\u2500\u2500\u2500 TIPS \u2500\u2500\u2500\n"
+                L"─── TIPS ───\n"
                 L"\n"
-                L"\u2022 Click the [?] button to enable help tooltips.\n"
-                L"\u2022 Command-line: TcpServer.exe [port]\n"
-                L"\u2022 Config stored in: %APPDATA%\\TcpTools\\\n",
-                L"TCP/UDP Server \u2014 Help", MB_OK | MB_ICONINFORMATION);
+                L"• Click the [?] button to enable help tooltips.\n"
+                L"• Command line: TcpTools.exe /tab:server /port:<n> /autostart "
+                L"/echo /logfile:<path>\n"
+                L"• Config stored in: %APPDATA%\\TcpTools\\\n",
+                L"TCP/UDP Server — Help", MB_OK | MB_ICONINFORMATION);
             return 0;
         }
-        break;
     case WM_NOTIFY:
         if (self) self->OnNotify((NMHDR*)lParam);
         return 0;
     case WM_CONTEXTMENU:
         if (self && (HWND)wParam == self->m_hListLog) {
             POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            if (pt.x == -1 && pt.y == -1) {          // keyboard invocation
+                RECT r; GetWindowRect(self->m_hListLog, &r);
+                pt = { r.left + 16, r.top + 16 };
+            }
             self->OnContextMenuLog(pt);
+            return 0;
         }
-        return 0;
+        break;
 
     // Network messages
     case WM_NET_LISTENING:
@@ -267,8 +276,8 @@ void ServerMainWindow::OnCreate(HWND hWnd, HINSTANCE hInst,
                                  int defaultPort, bool autoStart, bool echoMode,
                                  const std::wstring& logFile)
 {
-    m_hFont     = CreateUIFont();
-    m_hFontMono = CreateMonoUI();
+    m_hFont     = Dpi::CreateUIFont();
+    m_hFontMono = Dpi::CreateMonoFont(13);
 
     // --- Server group ---
     m_hGrpServer    = MakeGroupBox(IDC_GRP_SERVER, L" Server ", 0,0,10,10);
@@ -277,13 +286,15 @@ void ServerMainWindow::OnCreate(HWND hWnd, HINSTANCE hInst,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWN | CBS_AUTOHSCROLL,
         0,0,10,200, hWnd, (HMENU)(UINT_PTR)IDC_COMBO_PORT, hInst, nullptr);
     SendMessage(m_hComboPort, WM_SETFONT, (WPARAM)m_hFont, TRUE);
-    m_hLblTimeout   = MakeLabel(L"Timeout (s):", 0,0,80,ROW_H);
+    m_hLblTimeout   = MakeLabel(L"Send timeout (s):", 0,0,100,ROW_H);
     m_hEditTimeout  = MakeEdit(IDC_EDIT_TIMEOUT, 0,0,10,10);
     m_hBtnStart     = MakeButton(IDC_BTN_STARTSERVER, L"Start Server", 0,0,10,10);
     m_hBtnStop      = MakeButton(IDC_BTN_STOPSERVER,  L"Stop Server",  0,0,10,10);
     m_hChkEcho      = MakeCheck(IDC_CHK_ECHO, L"Echo Mode", 0,0,10,10);
-    m_hStaticStatus = MakeLabel(L"\u25CF Not listening", 0,0,10,10);
+    m_hStaticStatus = MakeLabel(L"● Not listening", 0,0,10,10);
     m_hStaticClient = MakeLabel(L"No client", 0,0,10,10);
+    for (HWND h : { m_hStaticStatus, m_hStaticClient })   // long text gets "...", and tooltips can see the mouse
+        SetWindowLongPtrW(h, GWL_STYLE, GetWindowLongPtrW(h, GWL_STYLE) | SS_ENDELLIPSIS | SS_NOTIFY);
 
     m_hComboProtocol = CreateWindowExW(0, L"COMBOBOX", L"",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
@@ -320,15 +331,13 @@ void ServerMainWindow::OnCreate(HWND hWnd, HINSTANCE hInst,
     ShowWindow(m_hEditPreFix, SW_HIDE); ShowWindow(m_hEditSufFix, SW_HIDE);
     ShowWindow(m_hLblPre, SW_HIDE);    ShowWindow(m_hLblSuf, SW_HIDE);
 
-    m_hChkHexSend = MakeCheck(IDC_CHK_HEXVIEW, L"Hex View", 0,0,10,10);
+    m_hChkHexSend = MakeCheck(IDC_CHK_HEXVIEW, L"Hex", 0,0,10,10);
     m_hEditSend   = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
         WS_CHILD|WS_VISIBLE|WS_TABSTOP|WS_VSCROLL|ES_MULTILINE|ES_AUTOVSCROLL|ES_WANTRETURN,
         0,0,10,10, hWnd, (HMENU)(UINT_PTR)IDC_EDIT_SEND, hInst, nullptr);
     SendMessage(m_hEditSend, WM_SETFONT, (WPARAM)m_hFontMono, TRUE);
     SetWindowSubclass(m_hEditSend, SendEditSubclassProc, 1, 0);
     SendMessage(m_hEditSend, EM_SETLIMITTEXT, 0, 0); // no character limit
-    m_hHexSend = HexView::Create(hWnd, 0,0,10,10, IDC_STATIC_HEXVIEW, hInst);
-    ShowWindow(m_hHexSend, SW_HIDE);
 
     m_hBtnSend      = MakeButton(IDC_BTN_SEND,      L"Send",      0,0,10,10);
     m_hBtnLoadFile  = MakeButton(IDC_BTN_LOADFILE,  L"Load File", 0,0,10,10);
@@ -403,7 +412,8 @@ void ServerMainWindow::OnCreate(HWND hWnd, HINSTANCE hInst,
 
     // Log icons (ImageList)
     {
-        m_hImgListLog = ImageList_Create(16, 16, ILC_COLOR32 | ILC_MASK, 10, 0);
+        const int isz = Dpi::Scale(16);
+        m_hImgListLog = ImageList_Create(isz, isz, ILC_COLOR32 | ILC_MASK, 10, 0);
         // Icons for each server LogType: Listening, ClientConn, ClientDisconn, Sent, Received, Error, Stopped, Info
         struct { COLORREF color; const wchar_t* glyph; } iconDefs[] = {
             { RGB(0,100,200), L"\x25CF" },  // Listening (blue circle)
@@ -416,20 +426,22 @@ void ServerMainWindow::OnCreate(HWND hWnd, HINSTANCE hInst,
             { RGB(128,128,128), L"\x2139" }, // Info (gray info)
         };
         HDC hdc = GetDC(hWnd);
-        HFONT hIconFont = CreateFontW(14, 0, 0, 0, FW_NORMAL, 0,0,0,
+        HFONT hIconFont = CreateFontW(Dpi::Scale(14), 0, 0, 0, FW_NORMAL, 0,0,0,
             DEFAULT_CHARSET, 0,0, CLEARTYPE_QUALITY, 0, L"Segoe UI Symbol");
         for (auto& def : iconDefs) {
             HDC mem = CreateCompatibleDC(hdc);
-            HBITMAP bmp = CreateCompatibleBitmap(hdc, 16, 16);
-            SelectObject(mem, bmp);
-            RECT r = {0,0,16,16};
+            HBITMAP bmp = CreateCompatibleBitmap(hdc, isz, isz);
+            HGDIOBJ oldBmp = SelectObject(mem, bmp);
+            RECT r = {0,0,isz,isz};
             HBRUSH bg = CreateSolidBrush(GetSysColor(COLOR_WINDOW));
             FillRect(mem, &r, bg);
             DeleteObject(bg);
             SetBkMode(mem, TRANSPARENT);
             SetTextColor(mem, def.color);
-            SelectObject(mem, hIconFont);
+            HGDIOBJ oldFont = SelectObject(mem, hIconFont);
             DrawTextW(mem, def.glyph, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            SelectObject(mem, oldFont);
+            SelectObject(mem, oldBmp);
             DeleteDC(mem);
             ImageList_AddMasked(m_hImgListLog, bmp, GetSysColor(COLOR_WINDOW));
             DeleteObject(bmp);
@@ -440,7 +452,7 @@ void ServerMainWindow::OnCreate(HWND hWnd, HINSTANCE hInst,
     }
 
     LVCOLUMNW col = {}; col.mask = LVCF_TEXT|LVCF_WIDTH|LVCF_FMT; col.fmt = LVCFMT_LEFT;
-    auto addCol = [&](const wchar_t* h, int w) { col.pszText=(LPWSTR)h; col.cx=w; ListView_InsertColumn(m_hListLog,999,&col); };
+    auto addCol = [&](const wchar_t* h, int w) { col.pszText=(LPWSTR)h; col.cx=Dpi::Scale(w); ListView_InsertColumn(m_hListLog,999,&col); };
     addCol(L"#",75); addCol(L"Time",80); addCol(L"Type",110); addCol(L"Bytes",60); addCol(L"Send ms",70); addCol(L"Lat ms",70); addCol(L"Preview",500);
     m_hBtnClearLog = MakeButton(IDC_BTN_CLEARLOG, L"Clear Log", 0,0,10,10);
 
@@ -453,30 +465,37 @@ void ServerMainWindow::OnCreate(HWND hWnd, HINSTANCE hInst,
     for (auto* n : filterNames) SendMessage(m_hComboLogFilter, CB_ADDSTRING, 0, (LPARAM)n);
     SendMessage(m_hComboLogFilter, CB_SETCURSEL, 0, 0);
 
-    // Initialize network object (pass notify window)
-    m_net = std::make_unique<ServerNetwork>(hWnd, echoMode);
-    if (!logFile.empty()) m_net->SetLogFile(logFile);
-
-    // Initial layout
-    RECT rc; GetClientRect(hWnd, &rc);
-    LayoutControls(rc.right, rc.bottom);
-
     // Help toggle button (top-right "?")
     m_hBtnHelp = CreateWindowExW(0, L"BUTTON", L"?",
         WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | BS_PUSHLIKE,
         0,0,10,10, hWnd, (HMENU)(UINT_PTR)IDC_BTN_HELP, hInst, nullptr);
     SendMessage(m_hBtnHelp, WM_SETFONT, (WPARAM)m_hFont, TRUE);
 
+    // Initialize network object (pass notify window)
+    m_net = std::make_unique<ServerNetwork>(hWnd, echoMode);
+    if (!logFile.empty()) m_net->SetLogFile(logFile);
+
+    // Initial layout
+    RelayoutToClient();
+
     // Tooltips (start disabled)
     CreateTooltips();
+    UpdateToolState();
 
-    // Auto-start if requested
+    // Auto-start if requested (command-line test mode): TCP, 5 s send timeout
     if (autoStart) {
-        int port = _wtoi(Utils::GetWindowText(m_hComboPort).c_str());
-        if (port <= 0) port = defaultPort;
-        int timeout = ::GetDlgItemInt(hWnd, IDC_EDIT_TIMEOUT, nullptr, FALSE);
-        if (timeout <= 0) timeout = 5;
-        m_net->StartListening(port, timeout, false); // auto-start defaults to TCP
+        int port = 0;
+        if (!Utils::IsValidPort(std::to_wstring(defaultPort), port)) {
+            LogEntry le;
+            le.type      = LogType::Error;
+            le.timestamp = Utils::NowTimestamp();
+            le.preview   = L"Auto-start: invalid port " + std::to_wstring(defaultPort);
+            AddLogEntry(std::move(le));
+            ShowStatusNote(L"Auto-start: invalid port " + std::to_wstring(defaultPort));
+        }
+        else {
+            StartServer(port, 5, false, echoMode);
+        }
     }
 }
 
@@ -484,26 +503,27 @@ void ServerMainWindow::OnCreate(HWND hWnd, HINSTANCE hInst,
 //  Layout
 // ============================================================
 
-void ServerMainWindow::OnSize(int w, int h) { LayoutControls(w, h); PositionHelpButton(); }
+void ServerMainWindow::OnSize(int w, int h) { LayoutControls(Dpi::Unscale(w), Dpi::Unscale(h)); }
 
-void ServerMainWindow::PositionHelpButton()
+void ServerMainWindow::RelayoutToClient()
 {
-    // Positioned inside LayoutControls
-}
-
-void ServerMainWindow::OnGetMinMaxInfo(MINMAXINFO* mm)
-{
-    mm->ptMinTrackSize = { 900, 650 };
+    RECT rc; GetClientRect(m_hWnd, &rc);
+    LayoutControls(Dpi::Unscale(rc.right), Dpi::Unscale(rc.bottom));
 }
 
 void ServerMainWindow::LayoutControls(int W, int H)
 {
     if (!m_hComboPort) return;
 
-    HDWP hdwp = BeginDeferWindowPos(54);
+    // A drop-down combo re-selects the first history entry that starts with its
+    // text when it is resized; put the typed text back afterwards.
+    std::wstring portText = Utils::GetWindowText(m_hComboPort);
+
+    HDWP hdwp = BeginDeferWindowPos(60);
     auto Move = [&](HWND hw, int x, int y, int w, int h) {
         if (hw && hdwp)
-            hdwp = DeferWindowPos(hdwp, hw, nullptr, x, y, w, h,
+            hdwp = DeferWindowPos(hdwp, hw, nullptr,
+                                  Dpi::Scale(x), Dpi::Scale(y), Dpi::Scale(w), Dpi::Scale(h),
                                   SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
     };
 
@@ -514,20 +534,21 @@ void ServerMainWindow::LayoutControls(int W, int H)
     Move(m_hGrpServer, x, y, W - 2*MARGIN, srvH);
     int cx = x + MARGIN + 2, cy = y + GRP_TITLE;
 
-    // Row 1: Port | Timeout | Start | Stop | Status
+    // Row 1: Port | Timeout | Protocol | Start | Stop | Status
     Move(m_hLblPort,    cx, cy, 35, ROW_H); cx += 37;
     Move(m_hComboPort, cx, cy, 80, 200); cx += 84;
-    Move(m_hLblTimeout, cx, cy, 80, ROW_H); cx += 82;
+    Move(m_hLblTimeout, cx, cy, 100, ROW_H); cx += 102;
     Move(m_hEditTimeout,cx, cy, 40, ROW_H); cx += 44;
     Move(m_hComboProtocol, cx, cy, 55, 200); cx += 59;
     Move(m_hBtnStart,   cx, cy, 100, ROW_H); cx += 104;
     Move(m_hBtnStop,    cx, cy, 100, ROW_H); cx += 108;
-    Move(m_hStaticStatus, cx, cy, 200, ROW_H);
-    Move(m_hBtnHelp, W - 2*MARGIN - 26, cy, 26, ROW_H);
+    int helpX = W - 2*MARGIN - 26;
+    Move(m_hStaticStatus, cx, cy, std::max(60, helpX - 6 - cx), ROW_H);
+    Move(m_hBtnHelp, helpX, cy, 26, ROW_H);
 
     cx = x + MARGIN + 2; cy += ROW_H + 4;
     Move(m_hChkEcho,      cx, cy, 100, ROW_H); cx += 108;
-    Move(m_hStaticClient, cx, cy, 400, ROW_H);
+    Move(m_hStaticClient, cx, cy, std::max(60, W - 2*MARGIN - MARGIN - cx), ROW_H);
 
     y += srvH + MARGIN;
 
@@ -547,7 +568,7 @@ void ServerMainWindow::LayoutControls(int W, int H)
     // Separator row
     int comboX = sx;
     Move(m_hComboSep,   comboX, sy, 120, 200); comboX += 124;
-    Move(m_hChkHexSend, comboX, sy,  90, ROW_H); comboX += 94;
+    Move(m_hChkHexSend, comboX, sy,  50, ROW_H); comboX += 54;
     Move(m_hLblPre, comboX, sy, 80, ROW_H);
     Move(m_hEditPreFix, comboX+82, sy, 80, ROW_H);
     Move(m_hLblSuf, comboX+170, sy, 80, ROW_H);
@@ -556,7 +577,6 @@ void ServerMainWindow::LayoutControls(int W, int H)
 
     int sendAreaH = midH - GRP_TITLE - ROW_H - 4 - ROW_H - 6 - MARGIN;
     Move(m_hEditSend, sx, sy, sendCtrlW, sendAreaH);
-    Move(m_hHexSend,  sx, sy, sendCtrlW, sendAreaH);
     sy += sendAreaH + 4;
 
     Move(m_hBtnSend,      sx, sy, BTN_W, ROW_H); sx += BTN_W + 4;
@@ -587,12 +607,13 @@ void ServerMainWindow::LayoutControls(int W, int H)
     int tabH = H - y - MARGIN;
     if (tabH < 80) tabH = 80;
     Move(m_hTabBottom, x, y, W - 2*MARGIN, tabH);
-    RECT tabRc = { 0, 0, W - 2*MARGIN, tabH };
+    // AdjustRect works in pixels; convert its result back to layout units.
+    RECT tabRc = { 0, 0, Dpi::Scale(W - 2*MARGIN), Dpi::Scale(tabH) };
     TabCtrl_AdjustRect(m_hTabBottom, FALSE, &tabRc);
-    int tx = x + tabRc.left;
-    int ty = y + tabRc.top;
-    int tw = tabRc.right - tabRc.left;
-    int th = tabRc.bottom - tabRc.top;
+    int tx = x + Dpi::Unscale(tabRc.left);
+    int ty = y + Dpi::Unscale(tabRc.top);
+    int tw = Dpi::Unscale(tabRc.right - tabRc.left);
+    int th = Dpi::Unscale(tabRc.bottom - tabRc.top);
 
     // Log content (tab 0)
     Move(m_hComboLogFilter, tx + 2, ty + 2, 120, 200);
@@ -624,12 +645,16 @@ void ServerMainWindow::LayoutControls(int W, int H)
         Move(m_hStatThrough,   stx2, sty2, statW2, ROW_H); stx2 += statW2 + 2;
         Move(m_hBtnClearStats, stx2, sty2, BTN_W, ROW_H);
         stx2 = tx + 2; sty2 += ROW_H + 2;
-        // Row 3 — cumulative totals
+        // Row 3 - cumulative totals
         Move(m_hStatTotalSent, stx2, sty2, statW2, ROW_H); stx2 += statW2 + 2;
         Move(m_hStatTotalRecv, stx2, sty2, statW2, ROW_H);
     }
 
     if (hdwp) EndDeferWindowPos(hdwp);
+
+    if (Utils::GetWindowText(m_hComboPort) != portText)
+        SetWindowTextW(m_hComboPort, portText.c_str());
+
     RedrawWindow(m_hWnd, nullptr, nullptr,
         RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
 }
@@ -671,11 +696,32 @@ void ServerMainWindow::SwitchBottomTab(int tab)
 
 void ServerMainWindow::OnDestroy()
 {
-    if (m_net) m_net->StopServer();
+    // Joins the accept and send threads and detaches the window, so nothing
+    // touches this object (or posts to the window) after this call.
+    if (m_net) m_net->Shutdown();
+    DrainPendingMessages();
     if (m_hImgListLog) ImageList_Destroy(m_hImgListLog);
     if (m_hTooltip) { DestroyWindow(m_hTooltip); m_hTooltip = nullptr; }
     if (m_hFont)     DeleteObject(m_hFont);
     if (m_hFontMono) DeleteObject(m_hFontMono);
+}
+
+// Frees the payloads of network messages that were posted but never handled.
+void ServerMainWindow::DrainPendingMessages()
+{
+    MSG msg;
+    while (PeekMessageW(&msg, m_hWnd, WM_APP + 1, WM_APP + 8, PM_REMOVE)) {
+        // PeekMessage hands out a pending WM_QUIT whatever the filter says;
+        // swallowing it here would leave the process running without a window.
+        if (msg.message == WM_QUIT) { PostQuitMessage((int)msg.wParam); break; }
+        switch (msg.message) {
+        case WM_NET_CONNECTED:
+        case WM_NET_ERROR:         delete (std::wstring*)msg.lParam; break;
+        case WM_NET_DATA_RECEIVED: delete[] (BYTE*)msg.lParam;       break;
+        case WM_NET_SEND_COMPLETE: delete (CycleStats*)msg.lParam;   break;
+        default: break;
+        }
+    }
 }
 
 // ============================================================
@@ -692,23 +738,23 @@ void ServerMainWindow::OnCommand(WORD id, WORD notify, HWND /*hCtrl*/)
     case IDC_BTN_LOADFILE:    DoLoadFile();    break;
 
     case IDC_BTN_CLEARSEND:
-        SetWindowTextW(m_hEditSend, L"");
-        HexView::ClearData(m_hHexSend);
+        SetSendEditText(L"");
         m_sendData.clear();
         break;
 
     case IDC_BTN_CLEARRECV:
-        SetWindowTextW(m_hEditRecv, L"");
-        HexView::ClearData(m_hHexRecv);
         m_recvData.clear();
         m_lastRecvData.clear();
+        ResetRecvTextState();
+        SetWindowTextW(m_hEditRecv, L"");
+        HexView::ClearData(m_hHexRecv);
         break;
 
     case IDC_BTN_COPYRECV:
         if (!m_hexRecvMode)
             Utils::CopyToClipboard(m_hWnd, Utils::GetWindowText(m_hEditRecv));
         else
-            Utils::CopyToClipboard(m_hWnd, Utils::ToWide(Utils::BytesToHexStr(m_recvData)));
+            Utils::CopyToClipboard(m_hWnd, Utils::BytesToHexText(m_recvData));
         break;
 
     case IDC_BTN_SAVERECV:
@@ -721,14 +767,12 @@ void ServerMainWindow::OnCommand(WORD id, WORD notify, HWND /*hCtrl*/)
 
     case IDC_BTN_CLEARLOG:
         m_log.clear();
-        m_logVisible.clear();
-        ListView_SetItemCountEx(m_hListLog, 0, 0);
-        InvalidateRect(m_hListLog, nullptr, TRUE);
+        m_logBytes = 0;
+        RefreshLogView();
         break;
 
     case IDC_CHK_HEXVIEW:
-        m_hexSendMode = Button_GetCheck(m_hChkHexSend) == BST_CHECKED;
-        RefreshSendView();
+        DoToggleSendHex();
         break;
 
     case IDC_CHK_HEXVIEW_RECV:
@@ -744,8 +788,7 @@ void ServerMainWindow::OnCommand(WORD id, WORD notify, HWND /*hCtrl*/)
             ShowWindow(m_hEditSufFix, custom ? SW_SHOW : SW_HIDE);
             ShowWindow(m_hLblPre,     custom ? SW_SHOW : SW_HIDE);
             ShowWindow(m_hLblSuf,     custom ? SW_SHOW : SW_HIDE);
-            RECT rc; GetClientRect(m_hWnd, &rc);
-            LayoutControls(rc.right, rc.bottom);
+            RelayoutToClient();
         }
         break;
 
@@ -754,8 +797,8 @@ void ServerMainWindow::OnCommand(WORD id, WORD notify, HWND /*hCtrl*/)
         break;
 
     case IDC_EDIT_SEND:
-        // Clear cached sendData when the user actually types so the hex view
-        // re-syncs from the editor next time. Guard against programmatic SetWindowText.
+        // The user edited the text: the pinned raw bytes (file / log reload) no longer
+        // match it. Programmatic SetWindowText is guarded by m_ignoreEditChange.
         if (notify == EN_CHANGE && !m_ignoreEditChange) m_sendData.clear();
         break;
 
@@ -783,30 +826,64 @@ void ServerMainWindow::OnCommand(WORD id, WORD notify, HWND /*hCtrl*/)
 
 void ServerMainWindow::PopulatePortCombo()
 {
+    // CB_RESETCONTENT clears the edit text; keep what the user has typed.
+    std::wstring text = Utils::GetWindowText(m_hComboPort);
     SendMessage(m_hComboPort, CB_RESETCONTENT, 0, 0);
     for (auto& e : m_portHistory)
         SendMessage(m_hComboPort, CB_ADDSTRING, 0, (LPARAM)e.c_str());
+    SetWindowTextW(m_hComboPort, text.c_str());
 }
 
 // ============================================================
 //  DoStartServer / DoStopServer
 // ============================================================
 
+static bool ParseTimeoutSec(const std::wstring& s, int& out)
+{
+    if (s.empty() || s.size() > 4) return false;
+    for (wchar_t c : s) if (c < L'0' || c > L'9') return false;
+    out = _wtoi(s.c_str());
+    return out <= 3600;
+}
+
+bool ServerMainWindow::StartServer(int port, int timeoutSec, bool udp, bool echo)
+{
+    if (!m_net) m_net = std::make_unique<ServerNetwork>(m_hWnd);
+    m_net->SetEchoMode(echo);
+    m_udpActive = udp;
+    m_port      = port;
+    if (!m_net->StartListening(port, timeoutSec, udp)) {
+        ShowStatusNote(L"The server is still shutting down - try again in a moment.");
+        return false;
+    }
+    // Until WM_NET_LISTENING (or WM_NET_STOPPED after a failed start) arrives the
+    // controls are locked so a second Start cannot race the first.
+    m_starting = true;
+    SetWindowTextW(m_hStaticStatus, L"◌ Starting...");
+    SetServerUI(false, false);
+    return true;
+}
+
 void ServerMainWindow::DoStartServer()
 {
-    if (m_listening) return;
+    if (m_listening || m_starting) return;
 
     // Validate port
     std::wstring portW = Utils::GetWindowText(m_hComboPort);
     int port = 0;
     if (!Utils::IsValidPort(portW, port)) {
-        MessageBoxW(m_hWnd, L"Please enter a valid port number (1\u201365535).", L"Invalid port", MB_ICONWARNING);
+        MessageBoxW(m_hWnd, L"Please enter a valid port number (1–65535).", L"Invalid port", MB_ICONWARNING);
         SetFocus(m_hComboPort);
         return;
     }
 
-    int timeout = ::GetDlgItemInt(m_hWnd, IDC_EDIT_TIMEOUT, nullptr, FALSE);
-    if (timeout <= 0) timeout = 5;
+    int timeout = 5;
+    if (!ParseTimeoutSec(Utils::GetWindowText(m_hEditTimeout), timeout)) {
+        MessageBoxW(m_hWnd, L"The send timeout must be a whole number of seconds from 0 to 3600 (0 = no limit).",
+                    L"Invalid timeout", MB_ICONWARNING);
+        SetFocus(m_hEditTimeout);
+        return;
+    }
 
     bool udp = (SendMessage(m_hComboProtocol, CB_GETCURSEL, 0, 0) == 1);
 
@@ -819,14 +896,13 @@ void ServerMainWindow::DoStartServer()
         return;
     }
 
-    if (!m_net) m_net = std::make_unique<ServerNetwork>(m_hWnd);
-    bool echo = Button_GetCheck(m_hChkEcho) == BST_CHECKED;
-    m_net->SetEchoMode(echo);
-    m_net->StartListening(port, timeout, udp);
+    StartServer(port, timeout, udp, Button_GetCheck(m_hChkEcho) == BST_CHECKED);
 }
 
 void ServerMainWindow::DoStopServer()
 {
+    // Waits for the accept thread (it polls every 100-200 ms); WM_NET_STOPPED then
+    // brings the UI back to idle.
     if (m_net) m_net->StopServer();
 }
 
@@ -837,18 +913,30 @@ void ServerMainWindow::DoStopServer()
 void ServerMainWindow::DoSend()
 {
     if (!m_clientConn) {
-        MessageBoxW(m_hWnd, L"No client connected.", L"Not connected", MB_ICONWARNING);
+        MessageBoxW(m_hWnd,
+            m_udpActive ? L"No UDP sender yet - Send goes to the sender of the last received datagram."
+                        : L"No client connected.",
+            L"Not connected", MB_ICONWARNING);
         return;
     }
-    std::vector<BYTE> data = GetSendData();
+    std::vector<BYTE> data;
+    if (!GetSendData(data)) return;
     if (data.empty()) {
         MessageBoxW(m_hWnd, L"Nothing to send.", L"Empty data", MB_ICONWARNING);
         return;
     }
-    NetConfig cfg = BuildNetConfig();
+    NetConfig cfg;
+    if (!BuildNetConfig(cfg)) return;
 
-    bool isUdp = cfg.udpMode;
-    const wchar_t* proto = isUdp ? L"UDP" : L"TCP";
+    const wchar_t* proto = m_udpActive ? L"UDP" : L"TCP";
+
+    // The completion message carries this id back (= the log entry's number).
+    const unsigned long long id = m_nextSeq;
+    if (!m_net || !m_net->QueueSend(data, cfg, id)) {
+        MessageBoxW(m_hWnd, L"The data could not be queued: the client is gone or too many sends are waiting.",
+                    L"Not sent", MB_ICONWARNING);
+        return;
+    }
 
     LogEntry le;
     le.type      = LogType::Sent;
@@ -865,17 +953,132 @@ void ServerMainWindow::DoSend()
     // Reset last recv for new transmission
     m_lastRecvData.clear();
 
-    std::thread([this, data, cfg]() mutable {
-        if (m_net) m_net->Send(data, cfg);
-    }).detach();
-
     AddLogEntry(std::move(le));
 
     // Auto-clear send window after sending
     if (Button_GetCheck(m_hChkAutoClearSend) == BST_CHECKED) {
-        SetWindowTextW(m_hEditSend, L"");
-        HexView::ClearData(m_hHexSend);
+        SetSendEditText(L"");
         m_sendData.clear();
+    }
+}
+
+// ============================================================
+//  Send editor: text / hex payload
+// ============================================================
+
+void ServerMainWindow::SetSendEditText(const std::wstring& text)
+{
+    m_ignoreEditChange = true;
+    SetWindowTextW(m_hEditSend, text.c_str());
+    m_ignoreEditChange = false;
+}
+
+// Parses hex pairs (whitespace ignored). Shows what is wrong and returns false on error.
+bool ServerMainWindow::ParseHexField(const std::wstring& text, const wchar_t* what, std::vector<BYTE>& out)
+{
+    out.clear();
+    int hi = -1;
+    size_t digits = 0;
+    for (size_t i = 0; i < text.size(); ++i) {
+        wchar_t c = text[i];
+        if (c == L' ' || c == L'\t' || c == L'\r' || c == L'\n') continue;
+        int v;
+        if (c >= L'0' && c <= L'9')      v = c - L'0';
+        else if (c >= L'a' && c <= L'f') v = c - L'a' + 10;
+        else if (c >= L'A' && c <= L'F') v = c - L'A' + 10;
+        else {
+            wchar_t msg[200];
+            swprintf_s(msg, L"%s: '%c' is not a hex digit (character %zu). Use pairs like 48 65 6C 6C 6F.",
+                       what, c, i + 1);
+            MessageBoxW(m_hWnd, msg, L"Invalid hex", MB_ICONWARNING);
+            out.clear();
+            return false;
+        }
+        ++digits;
+        if (hi < 0) hi = v;
+        else { out.push_back((BYTE)(hi * 16 + v)); hi = -1; }
+    }
+    if (hi >= 0) {
+        wchar_t msg[200];
+        swprintf_s(msg, L"%s: odd number of hex digits (%zu) - every byte needs two digits.", what, digits);
+        MessageBoxW(m_hWnd, msg, L"Invalid hex", MB_ICONWARNING);
+        out.clear();
+        return false;
+    }
+    return true;
+}
+
+// Text mode: the pinned raw bytes if there are any, else the editor text as UTF-8.
+// Hex mode: the editor parsed as hex.
+bool ServerMainWindow::GetSendData(std::vector<BYTE>& out)
+{
+    if (m_hexSendMode)
+        return ParseHexField(Utils::GetWindowText(m_hEditSend), L"Send data", out);
+    if (!m_sendData.empty()) { out = m_sendData; return true; }
+    std::string s = Utils::ToUTF8(Utils::GetWindowText(m_hEditSend));
+    out.assign(s.begin(), s.end());
+    return true;
+}
+
+void ServerMainWindow::DoToggleSendHex()
+{
+    const bool wantHex = Button_GetCheck(m_hChkHexSend) == BST_CHECKED;
+    if (wantHex == m_hexSendMode) return;
+
+    if (wantHex) {
+        std::vector<BYTE> payload;
+        GetSendData(payload);                       // text mode: cannot fail
+        if (payload.size() > HEX_EDIT_MAX) {
+            MessageBoxW(m_hWnd, L"This data is larger than 1 MB and cannot be edited as hex. "
+                                L"It can still be sent as it is.", L"Hex", MB_ICONINFORMATION);
+            Button_SetCheck(m_hChkHexSend, BST_UNCHECKED);
+            return;
+        }
+        m_hexSendMode = true;
+        SetSendEditText(Utils::BytesToHexText(payload));
+    }
+    else {
+        std::vector<BYTE> bytes;
+        if (!ParseHexField(Utils::GetWindowText(m_hEditSend), L"Send data", bytes)) {
+            Button_SetCheck(m_hChkHexSend, BST_CHECKED);   // stay in hex mode
+            return;
+        }
+        m_hexSendMode = false;
+        std::wstring shown = Utils::BytesToDisplayText(bytes);
+        std::string back = Utils::ToUTF8(shown);
+        bool exact = Utils::LooksLikeText(bytes) && back.size() == bytes.size()
+                  && (bytes.empty() || memcmp(back.data(), bytes.data(), bytes.size()) == 0);
+        SetSendEditText(shown);
+        // Bytes the text view cannot reproduce exactly stay pinned so Send still transmits them.
+        if (exact) m_sendData.clear(); else m_sendData = bytes;
+    }
+}
+
+// Pins `bytes` as the payload and shows them in the editor the best way the
+// current mode allows. `note` names the source (file name) for the placeholder.
+void ServerMainWindow::ShowSendBytes(const std::vector<BYTE>& bytes, const std::wstring& note)
+{
+    m_sendData = bytes;
+    const bool text = Utils::LooksLikeText(bytes);
+
+    if (m_hexSendMode) {
+        if (bytes.size() <= HEX_EDIT_MAX) { SetSendEditText(Utils::BytesToHexText(bytes)); return; }
+        m_hexSendMode = false;                      // too large to edit as hex
+        Button_SetCheck(m_hChkHexSend, BST_UNCHECKED);
+    }
+    if (text && bytes.size() <= TEXT_SHOW_MAX) {
+        SetSendEditText(Utils::BytesToDisplayText(bytes));
+    }
+    else if (!text && bytes.size() <= HEX_EDIT_MAX) {
+        m_hexSendMode = true;
+        Button_SetCheck(m_hChkHexSend, BST_CHECKED);
+        SetSendEditText(Utils::BytesToHexText(bytes));
+    }
+    else {
+        std::wstring n = L"[" + std::wstring(text ? L"Large text " : L"Binary ")
+                       + (note.empty() ? L"data" : L"file " + note)
+                       + L", " + std::to_wstring(bytes.size()) + L" bytes - sent exactly as loaded]";
+        SetSendEditText(n);
     }
 }
 
@@ -890,17 +1093,19 @@ void ServerMainWindow::DoLoadFile()
 
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) { MessageBoxW(m_hWnd, L"Cannot open file.", L"Error", MB_ICONERROR); return; }
-    auto sz = f.tellg(); f.seekg(0);
-    m_sendData.resize((size_t)sz);
-    f.read((char*)m_sendData.data(), sz);
+    std::streamoff sz = f.tellg();
+    if (sz < 0) { MessageBoxW(m_hWnd, L"Cannot read the file size.", L"Error", MB_ICONERROR); return; }
+    if ((unsigned long long)sz > FILE_MAX) {
+        MessageBoxW(m_hWnd, L"The file is larger than the 64 MB limit.", L"File too large", MB_ICONWARNING);
+        return;
+    }
+    f.seekg(0);
+    std::vector<BYTE> bytes((size_t)sz);
+    if (sz > 0) f.read((char*)bytes.data(), sz);
+    if (!f && sz > 0) { MessageBoxW(m_hWnd, L"The file could not be read completely.", L"Error", MB_ICONERROR); return; }
     f.close();
 
-    std::string raw(m_sendData.begin(), m_sendData.end());
-    HexView::SetData(m_hHexSend, m_sendData);
-    m_ignoreEditChange = true;
-    SetWindowTextW(m_hEditSend, Utils::ToWide(raw).c_str());
-    m_ignoreEditChange = false;
-    RefreshSendView();
+    ShowSendBytes(bytes, PathFindFileNameW(path.c_str()));
 }
 
 // ============================================================
@@ -910,7 +1115,7 @@ void ServerMainWindow::DoLoadFile()
 void ServerMainWindow::DoSaveLastRecv()
 {
     if (m_lastRecvData.empty()) {
-        MessageBoxW(m_hWnd, L"No received data from the last transmission to save.",
+        MessageBoxW(m_hWnd, L"No data received since the last Send or Clear to save.",
                     L"Nothing to save", MB_ICONINFORMATION);
         return;
     }
@@ -923,12 +1128,12 @@ void ServerMainWindow::DoSaveLastRecv()
     ofn.nMaxFile    = MAX_PATH;
     ofn.lpstrDefExt = L"bin";
     ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
-    ofn.lpstrTitle  = L"Save Last Received Transmission";
+    ofn.lpstrTitle  = L"Save Received Data";
     if (!GetSaveFileNameW(&ofn)) return;
 
     std::ofstream out(buf, std::ios::binary);
     if (!out) { MessageBoxW(m_hWnd, L"Cannot write file.", L"Save error", MB_ICONERROR); return; }
-    out.write(reinterpret_cast<const char*>(m_lastRecvData.data()), m_lastRecvData.size());
+    out.write(reinterpret_cast<const char*>(m_lastRecvData.data()), (std::streamsize)m_lastRecvData.size());
     out.close();
 
     wchar_t msg[MAX_PATH + 64];
@@ -937,45 +1142,24 @@ void ServerMainWindow::DoSaveLastRecv()
 }
 
 // ============================================================
-//  GetSendData / BuildNetConfig / GetSeparatorMode
+//  BuildNetConfig / GetSeparatorMode
 // ============================================================
 
-std::vector<BYTE> ServerMainWindow::GetSendData()
+bool ServerMainWindow::BuildNetConfig(NetConfig& cfg)
 {
-    if (m_hexSendMode) {
-        std::wstring ws = Utils::GetWindowText(m_hEditSend);
-        std::string s   = Utils::ToUTF8(ws);
-        std::string clean;
-        for (char c : s) if (c != ' ' && c != '\t' && c != '\r' && c != '\n') clean += c;
-        std::vector<BYTE> out;
-        if (!Utils::HexStrToBytes(clean, out)) {
-            MessageBoxW(m_hWnd, L"Invalid hex input.", L"Hex error", MB_ICONWARNING);
-            return {};
-        }
-        return out;
-    } else {
-        // Always encode current editor content as UTF-8 so edits are reflected
-        std::wstring ws = Utils::GetWindowText(m_hEditSend);
-        std::string s   = Utils::ToUTF8(ws);
-        return std::vector<BYTE>(s.begin(), s.end());
-    }
-}
-
-NetConfig ServerMainWindow::BuildNetConfig()
-{
-    NetConfig cfg;
-    cfg.port       = _wtoi(Utils::GetWindowText(m_hComboPort).c_str());
-    cfg.timeoutSec = ::GetDlgItemInt(m_hWnd, IDC_EDIT_TIMEOUT, nullptr, FALSE);
-    if (cfg.timeoutSec <= 0) cfg.timeoutSec = 5;
+    cfg = NetConfig();
+    cfg.port       = m_port;
     cfg.separator  = GetSeparatorMode();
-    cfg.udpMode    = (SendMessage(m_hComboProtocol, CB_GETCURSEL, 0, 0) == 1);
+    cfg.udpMode    = m_udpActive;
     if (cfg.separator == SeparatorMode::Custom) {
-        std::string pre = Utils::ToUTF8(Utils::GetWindowText(m_hEditPreFix));
-        std::string suf = Utils::ToUTF8(Utils::GetWindowText(m_hEditSufFix));
-        Utils::HexStrToBytes(pre, cfg.customPrefix);
-        Utils::HexStrToBytes(suf, cfg.customSuffix);
+        if (!ParseHexField(Utils::GetWindowText(m_hEditPreFix), L"Custom prefix", cfg.customPrefix)) {
+            SetFocus(m_hEditPreFix); return false;
+        }
+        if (!ParseHexField(Utils::GetWindowText(m_hEditSufFix), L"Custom suffix", cfg.customSuffix)) {
+            SetFocus(m_hEditSufFix); return false;
+        }
     }
-    return cfg;
+    return true;
 }
 
 SeparatorMode ServerMainWindow::GetSeparatorMode()
@@ -985,41 +1169,95 @@ SeparatorMode ServerMainWindow::GetSeparatorMode()
 }
 
 // ============================================================
-//  RefreshSendView / RefreshRecvView
+//  Receive view
+//
+//  The text view and the hex view always hold the same buffer
+//  (m_recvData); the checkbox only chooses which one is visible.
 // ============================================================
-
-void ServerMainWindow::RefreshSendView()
-{
-    if (m_hexSendMode) {
-        ShowWindow(m_hEditSend, SW_HIDE);
-        ShowWindow(m_hHexSend,  SW_SHOW);
-        if (m_sendData.empty()) {
-            std::wstring ws = Utils::GetWindowText(m_hEditSend);
-            std::string s   = Utils::ToUTF8(ws);
-            m_sendData.assign(s.begin(), s.end());
-        }
-        HexView::SetData(m_hHexSend, m_sendData);
-    } else {
-        ShowWindow(m_hHexSend,  SW_HIDE);
-        ShowWindow(m_hEditSend, SW_SHOW);
-    }
-}
 
 void ServerMainWindow::RefreshRecvView()
 {
-    if (m_hexRecvMode) {
-        ShowWindow(m_hEditRecv, SW_HIDE);
-        ShowWindow(m_hHexRecv,  SW_SHOW);
-        HexView::SetData(m_hHexRecv, m_recvData);
-    } else {
-        ShowWindow(m_hHexRecv,  SW_HIDE);
-        ShowWindow(m_hEditRecv, SW_SHOW);
+    ShowWindow(m_hEditRecv, m_hexRecvMode ? SW_HIDE : SW_SHOW);
+    ShowWindow(m_hHexRecv,  m_hexRecvMode ? SW_SHOW : SW_HIDE);
+}
+
+void ServerMainWindow::ResetRecvTextState()
+{
+    m_recvTail.clear();
+    m_recvLastCR = false;
+}
+
+// Bytes at the end of `b` that start a UTF-8 sequence which is not complete yet.
+static size_t IncompleteUtf8Tail(const std::vector<BYTE>& b)
+{
+    const size_t n = b.size();
+    for (size_t k = 1; k <= 3 && k <= n; ++k) {
+        BYTE c = b[n - k];
+        if ((c & 0xC0) == 0x80) continue;               // continuation byte: look further back
+        size_t need = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+        return need > k ? k : 0;
     }
+    return 0;
+}
+
+// Appends to the text view only. A UTF-8 character split across two chunks is held
+// back until its rest arrives, and a CR LF split across chunks shows as one break.
+void ServerMainWindow::AppendReceiveText(const std::vector<BYTE>& data, bool flush)
+{
+    std::vector<BYTE> bytes = std::move(m_recvTail);
+    m_recvTail.clear();
+    bytes.insert(bytes.end(), data.begin(), data.end());
+    if (!flush) {
+        size_t t = IncompleteUtf8Tail(bytes);
+        if (t) {
+            m_recvTail.assign(bytes.end() - t, bytes.end());
+            bytes.resize(bytes.size() - t);
+        }
+    }
+    size_t off = 0;
+    if (m_recvLastCR && !bytes.empty() && bytes[0] == '\n') { off = 1; m_recvLastCR = false; }
+    if (bytes.size() <= off) return;
+    m_recvLastCR = (bytes.back() == '\r');
+
+    std::wstring ws = Utils::BytesToDisplayText(bytes.data() + off, bytes.size() - off);
+    int len = GetWindowTextLengthW(m_hEditRecv);
+    SendMessage(m_hEditRecv, EM_SETSEL, (WPARAM)len, (LPARAM)len);
+    SendMessage(m_hEditRecv, EM_REPLACESEL, FALSE, (LPARAM)ws.c_str());
+    SendMessage(m_hEditRecv, EM_SCROLLCARET, 0, 0);
+}
+
+// Replaces both views with the whole of m_recvData.
+void ServerMainWindow::RebuildReceiveView()
+{
+    ResetRecvTextState();
+    SetWindowTextW(m_hEditRecv, Utils::BytesToDisplayText(m_recvData).c_str());
+    m_recvLastCR = !m_recvData.empty() && m_recvData.back() == '\r';
+    int len = GetWindowTextLengthW(m_hEditRecv);
+    SendMessage(m_hEditRecv, EM_SETSEL, (WPARAM)len, (LPARAM)len);
+    SendMessage(m_hEditRecv, EM_SCROLLCARET, 0, 0);
+    HexView::SetData(m_hHexRecv, m_recvData);
+}
+
+// Keeps the newest half of a buffer that outgrew RECV_CAP, starting on a UTF-8 boundary.
+static bool TrimToNewestHalf(std::vector<BYTE>& v)
+{
+    if (v.size() <= RECV_CAP) return false;
+    size_t cut = v.size() - RECV_CAP / 2;
+    while (cut < v.size() && (v[cut] & 0xC0) == 0x80) ++cut;
+    v.erase(v.begin(), v.begin() + cut);
+    return true;
 }
 
 // ============================================================
 //  RefreshDiagnostics - nerdy socket info
 // ============================================================
+
+static std::wstring SockAddrText(const sockaddr_in& a)
+{
+    wchar_t ip[64] = {}; DWORD ipLen = 64;
+    WSAAddressToStringW((sockaddr*)&a, sizeof(a), nullptr, ip, &ipLen);
+    return ip;
+}
 
 void ServerMainWindow::RefreshDiagnostics()
 {
@@ -1030,76 +1268,117 @@ void ServerMainWindow::RefreshDiagnostics()
 
     std::wstring info;
 
-    // Listen socket info
-    SOCKET lsock = m_net->GetListenSocket();
-    if (lsock != INVALID_SOCKET) {
-        sockaddr_in localAddr = {};
-        int localLen = sizeof(localAddr);
-        if (getsockname(lsock, (sockaddr*)&localAddr, &localLen) == 0) {
-            wchar_t ip[64]; DWORD ipLen = 64;
-            WSAAddressToStringW((sockaddr*)&localAddr, localLen, nullptr, ip, &ipLen);
-            info += L"Listen: " + std::wstring(ip) + L"  ";
-        }
+    std::wstring listenEp;
+    m_net->WithListenSocket([&](SOCKET s) {
+        sockaddr_in a = {}; int len = sizeof(a);
+        if (getsockname(s, (sockaddr*)&a, &len) == 0) listenEp = SockAddrText(a);
+    });
+    if (listenEp.empty()) {
+        SetWindowTextW(m_hStaticDiagInfo, L"Server not listening — start the server for diagnostics");
+        return;
     }
-
+    info += L"Listen: " + listenEp + (m_udpActive ? L" (UDP)  " : L" (TCP)  ");
     info += L"Echo: ";
     info += m_net->GetEchoMode() ? L"ON  " : L"OFF  ";
 
-    SOCKET csock = m_net->GetClientSocket();
-    if (csock != INVALID_SOCKET && m_clientConn) {
-        // Remote endpoint
-        sockaddr_in remoteAddr = {};
-        int remoteLen = sizeof(remoteAddr);
-        if (getpeername(csock, (sockaddr*)&remoteAddr, &remoteLen) == 0) {
-            wchar_t ip[64]; DWORD ipLen = 64;
-            WSAAddressToStringW((sockaddr*)&remoteAddr, remoteLen, nullptr, ip, &ipLen);
-            info += L"Client: " + std::wstring(ip);
-        }
-        info += L"\r\n";
-
-        // Socket options
+    auto sockOpts = [&](SOCKET s, bool tcp) {
         int sndbuf = 0, rcvbuf = 0, optLen = sizeof(int);
-        getsockopt(csock, SOL_SOCKET, SO_SNDBUF, (char*)&sndbuf, &optLen);
+        getsockopt(s, SOL_SOCKET, SO_SNDBUF, (char*)&sndbuf, &optLen);
         optLen = sizeof(int);
-        getsockopt(csock, SOL_SOCKET, SO_RCVBUF, (char*)&rcvbuf, &optLen);
-        BOOL nodelay = FALSE; optLen = sizeof(BOOL);
-        getsockopt(csock, IPPROTO_TCP, TCP_NODELAY, (char*)&nodelay, &optLen);
-
+        getsockopt(s, SOL_SOCKET, SO_RCVBUF, (char*)&rcvbuf, &optLen);
         wchar_t buf[256];
-        swprintf_s(buf, L"SO_SNDBUF: %dB  SO_RCVBUF: %dB  Nagle: %s  ",
-                   sndbuf, rcvbuf, nodelay ? L"OFF" : L"ON");
+        swprintf_s(buf, L"SO_SNDBUF: %dB  SO_RCVBUF: %dB  ", sndbuf, rcvbuf);
         info += buf;
-
+        if (!tcp) return;
+        BOOL nodelay = FALSE; optLen = sizeof(BOOL);
+        getsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char*)&nodelay, &optLen);
+        swprintf_s(buf, L"Nagle: %s  ", nodelay ? L"OFF" : L"ON");
+        info += buf;
         int mss = 0; optLen = sizeof(int);
-        if (getsockopt(csock, IPPROTO_TCP, TCP_MAXSEG, (char*)&mss, &optLen) == 0 && mss > 0) {
+        if (getsockopt(s, IPPROTO_TCP, TCP_MAXSEG, (char*)&mss, &optLen) == 0 && mss > 0)
             swprintf_s(buf, L"MSS: %dB  MTU: ~%dB  Frame: ~%dB", mss, mss + 40, mss + 40 + 14);
-        } else {
+        else
             swprintf_s(buf, L"Est. Frame: ~1514B (Ethernet)");
-        }
         info += buf;
-    } else {
-        info += L"\r\nNo client \x2014 connect a client for full diagnostics";
+    };
+
+    if (m_udpActive) {
+        info += m_clientConn ? L"Last sender: " + m_peerText : std::wstring(L"No datagram received yet");
+        info += L"\r\n";
+        m_net->WithListenSocket([&](SOCKET s) { sockOpts(s, false); });
+    }
+    else {
+        bool haveClient = false;
+        std::wstring clientEp;
+        std::wstring opts;
+        haveClient = m_net->WithClientSocket([&](SOCKET s) {
+            sockaddr_in a = {}; int len = sizeof(a);
+            if (getpeername(s, (sockaddr*)&a, &len) == 0) clientEp = SockAddrText(a);
+            std::wstring saved = std::move(info);
+            info.clear();
+            sockOpts(s, true);
+            opts = std::move(info);
+            info = std::move(saved);
+        });
+        if (haveClient) {
+            info += L"Client: " + clientEp + L"\r\n" + opts;
+        }
+        else {
+            info += L"\r\nNo client — connect a client for full diagnostics";
+        }
     }
 
     SetWindowTextW(m_hStaticDiagInfo, info.c_str());
 }
 
 // ============================================================
-//  SetServerUI
+//  SetServerUI / tool state
 // ============================================================
 
 void ServerMainWindow::SetServerUI(bool listening, bool clientConnected)
 {
     m_listening  = listening;
     m_clientConn = clientConnected;
-    EnableWindow(m_hBtnStart,      !listening);
-    EnableWindow(m_hBtnStop,        listening);
-    EnableWindow(m_hComboPort,     !listening);
-    EnableWindow(m_hEditTimeout,   !listening);
-    EnableWindow(m_hComboProtocol, !listening);
+    const bool busy = listening || m_starting;
+    EnableWindow(m_hBtnStart,      !busy);
+    EnableWindow(m_hBtnStop,        busy);
+    EnableWindow(m_hComboPort,     !busy);
+    EnableWindow(m_hEditTimeout,   !busy);
+    EnableWindow(m_hComboProtocol, !busy);
     // Echo mode can always be toggled (SetEchoMode propagates to running network)
     EnableWindow(m_hChkEcho,       TRUE);
     EnableWindow(m_hBtnSend,        clientConnected);
+    UpdateToolState();
+}
+
+void ServerMainWindow::SetPageTitle(const std::wstring& detail)
+{
+    std::wstring t = L"TCP Server v" TCPTOOLS_VERSION;
+    if (!detail.empty()) t += L"  –  " + detail;     // the frame shows what follows the dash
+    SetWindowTextW(m_hWnd, t.c_str());
+}
+
+void ServerMainWindow::UpdateToolState()
+{
+    ToolState st = TOOL_IDLE;
+    std::wstring d;
+    const std::wstring port = std::to_wstring(m_port);
+    if (m_clientConn) {
+        st = TOOL_ACTIVE;
+        d  = L":" + port + L" ● " + m_peerText;
+    }
+    else if (m_listening || m_starting) {
+        st = TOOL_WAITING;
+        d  = std::wstring(m_listening ? L"Listening :" : L"Starting :") + port + (m_udpActive ? L" (UDP)" : L"");
+    }
+    SetPageTitle(d);
+    NotifyToolState(m_hWnd, st);
+}
+
+void ServerMainWindow::ShowStatusNote(const std::wstring& text)
+{
+    SetWindowTextW(m_hStaticClient, text.c_str());
+    InvalidateRect(m_hStaticClient, nullptr, TRUE);
 }
 
 // ============================================================
@@ -1108,52 +1387,46 @@ void ServerMainWindow::SetServerUI(bool listening, bool clientConnected)
 
 void ServerMainWindow::OnNetListening(int port)
 {
+    m_starting = false;
+    m_port     = port;
     SetServerUI(true, false);
 
     // Save port to history
     {
         std::wstring entry = std::to_wstring(port);
         Utils::SaveHistory(L"TcpServer", entry, m_portHistory);
-        PopulatePortCombo();
         SetWindowTextW(m_hComboPort, entry.c_str());
+        PopulatePortCombo();
     }
 
     wchar_t buf[80];
-    swprintf_s(buf, L"\u25CC Listening on port %d", port);
+    swprintf_s(buf, L"◌ Listening on port %d", port);
     SetWindowTextW(m_hStaticStatus, buf);
-    SetWindowTextW(m_hStaticClient, L"No client connected");
+    SetWindowTextW(m_hStaticClient, m_udpActive ? L"No datagram received yet" : L"No client connected");
     InvalidateRect(m_hStaticStatus, nullptr, TRUE);
     InvalidateRect(m_hStaticClient, nullptr, TRUE);
-
-    // Title bar
-    wchar_t titleBuf[128];
-    swprintf_s(titleBuf, L"TCP Server v" TCPTOOLS_VERSION L"  \u2013  Listening :%d", port);
-    SetWindowTextW(m_hWnd, titleBuf);
 
     LogEntry le;
     le.type      = LogType::Listening;
     le.timestamp = Utils::NowTimestamp();
-    bool isUdp = (SendMessage(m_hComboProtocol, CB_GETCURSEL, 0, 0) == 1);
     wchar_t leBuf[128];
-    swprintf_s(leBuf, L"[%s] Listening on port %d", isUdp ? L"UDP" : L"TCP", port);
+    swprintf_s(leBuf, L"[%s] Listening on port %d", m_udpActive ? L"UDP" : L"TCP", port);
     le.preview   = leBuf;
     AddLogEntry(std::move(le));
 
     // Exhaustive: listen socket info
     if (m_net) {
-        SOCKET lsock = m_net->GetListenSocket();
-        if (lsock != INVALID_SOCKET) {
-            sockaddr_in localAddr = {};
-            int localLen = sizeof(localAddr);
-            if (getsockname(lsock, (sockaddr*)&localAddr, &localLen) == 0) {
-                wchar_t ip[64]; DWORD ipLen = 64;
-                WSAAddressToStringW((sockaddr*)&localAddr, localLen, nullptr, ip, &ipLen);
-                LogEntry li;
-                li.type = LogType::Info;
-                li.timestamp = Utils::NowTimestamp();
-                li.preview = L"Listen endpoint: " + std::wstring(ip);
-                AddLogEntry(std::move(li));
-            }
+        std::wstring ep;
+        m_net->WithListenSocket([&](SOCKET s) {
+            sockaddr_in a = {}; int len = sizeof(a);
+            if (getsockname(s, (sockaddr*)&a, &len) == 0) ep = SockAddrText(a);
+        });
+        if (!ep.empty()) {
+            LogEntry li;
+            li.type = LogType::Info;
+            li.timestamp = Utils::NowTimestamp();
+            li.preview = L"Listen endpoint: " + ep;
+            AddLogEntry(std::move(li));
         }
     }
 
@@ -1162,17 +1435,23 @@ void ServerMainWindow::OnNetListening(int port)
 
 void ServerMainWindow::OnNetStopped()
 {
+    const bool wasListening = m_listening;
+    m_starting = false;
+    m_peerText.clear();
     SetServerUI(false, false);
-    SetWindowTextW(m_hStaticStatus, L"\u25CF Not listening");
-    SetWindowTextW(m_hStaticClient, L"");
+    SetWindowTextW(m_hStaticStatus, L"● Not listening");
     InvalidateRect(m_hStaticStatus, nullptr, TRUE);
-    SetWindowTextW(m_hWnd, L"TCP Server v" TCPTOOLS_VERSION);
+    // After a failed start the client line keeps showing the error.
+    if (wasListening) {
+        SetWindowTextW(m_hStaticClient, L"");
+        InvalidateRect(m_hStaticClient, nullptr, TRUE);
 
-    LogEntry le;
-    le.type      = LogType::Stopped;
-    le.timestamp = Utils::NowTimestamp();
-    le.preview   = L"Server stopped";
-    AddLogEntry(std::move(le));
+        LogEntry le;
+        le.type      = LogType::Stopped;
+        le.timestamp = Utils::NowTimestamp();
+        le.preview   = L"Server stopped";
+        AddLogEntry(std::move(le));
+    }
 
     RefreshDiagnostics();
 }
@@ -1181,23 +1460,13 @@ void ServerMainWindow::OnNetClientConnected(std::wstring* pAddrStr)
 {
     std::wstring addr;
     if (pAddrStr) { addr = *pAddrStr; delete pAddrStr; }
+    m_peerText = addr;
 
     SetServerUI(true, true);
-    SetWindowTextW(m_hStaticStatus, L"\u25CF Listening (client connected)");
+    SetWindowTextW(m_hStaticStatus, m_udpActive ? L"● Listening (receiving)" : L"● Listening (client connected)");
     InvalidateRect(m_hStaticStatus, nullptr, TRUE);
-    wchar_t buf[128];
-    swprintf_s(buf, L"Client: %s", addr.c_str());
-    SetWindowTextW(m_hStaticClient, buf);
+    SetWindowTextW(m_hStaticClient, ((m_udpActive ? L"Last sender: " : L"Client: ") + addr).c_str());
     InvalidateRect(m_hStaticClient, nullptr, TRUE);
-
-    // Title bar
-    {
-        std::wstring portStr = Utils::GetWindowText(m_hComboPort);
-        wchar_t titleBuf[256];
-        swprintf_s(titleBuf, L"TCP Server v" TCPTOOLS_VERSION L"  \u2013  :%s  \u25CF  %s",
-                   portStr.c_str(), addr.c_str());
-        SetWindowTextW(m_hWnd, titleBuf);
-    }
 
     {
         wchar_t sb[64];
@@ -1209,16 +1478,12 @@ void ServerMainWindow::OnNetClientConnected(std::wstring* pAddrStr)
     LogEntry le;
     le.type      = LogType::ClientConn;
     le.timestamp = Utils::NowTimestamp();
-    {
-        bool isUdp = (SendMessage(m_hComboProtocol, CB_GETCURSEL, 0, 0) == 1);
-        le.preview = std::wstring(L"[") + (isUdp ? L"UDP" : L"TCP") + L"] Client connected: " + addr;
-    }
+    le.preview   = std::wstring(L"[") + (m_udpActive ? L"UDP] Datagrams from: " : L"TCP] Client connected: ") + addr;
     AddLogEntry(std::move(le));
 
-    // Exhaustive: client socket info
-    if (m_net) {
-        SOCKET csock = m_net->GetClientSocket();
-        if (csock != INVALID_SOCKET) {
+    // Exhaustive: client socket info (TCP only; a UDP "client" has no socket)
+    if (m_net && !m_udpActive) {
+        m_net->WithClientSocket([&](SOCKET csock) {
             int sndbuf = 0, rcvbuf = 0, optLen = sizeof(int);
             getsockopt(csock, SOL_SOCKET, SO_SNDBUF, (char*)&sndbuf, &optLen);
             optLen = sizeof(int);
@@ -1235,19 +1500,16 @@ void ServerMainWindow::OnNetClientConnected(std::wstring* pAddrStr)
             li.preview = infoBuf;
             AddLogEntry(std::move(li));
 
-            // Local endpoint of client socket
             sockaddr_in localAddr = {};
             int localLen = sizeof(localAddr);
             if (getsockname(csock, (sockaddr*)&localAddr, &localLen) == 0) {
-                wchar_t ip[64]; DWORD ipLen = 64;
-                WSAAddressToStringW((sockaddr*)&localAddr, localLen, nullptr, ip, &ipLen);
                 LogEntry li2;
                 li2.type = LogType::Info;
                 li2.timestamp = Utils::NowTimestamp();
-                li2.preview = L"Server-side endpoint: " + std::wstring(ip);
+                li2.preview = L"Server-side endpoint: " + SockAddrText(localAddr);
                 AddLogEntry(std::move(li2));
             }
-        }
+        });
     }
 
     RefreshDiagnostics();
@@ -1255,18 +1517,19 @@ void ServerMainWindow::OnNetClientConnected(std::wstring* pAddrStr)
 
 void ServerMainWindow::OnNetClientDisconnected()
 {
+    // A UTF-8 character still waiting for its rest will not get it now.
+    if (!m_recvTail.empty()) AppendReceiveText({}, true);
+    m_recvLastCR = false;
+
+    m_peerText.clear();
     SetServerUI(m_listening, false);
     if (m_listening) {
-        SetWindowTextW(m_hStaticStatus, L"\u25CC Listening");
-        SetWindowTextW(m_hStaticClient, L"Client disconnected -- waiting...");
-        // Restore listening title
-        std::wstring portStr = Utils::GetWindowText(m_hComboPort);
-        std::wstring titleStr = L"TCP Server v" TCPTOOLS_VERSION L"  \u2013  Listening :" + portStr;
-        SetWindowTextW(m_hWnd, titleStr.c_str());
+        SetWindowTextW(m_hStaticStatus, L"◌ Listening");
+        SetWindowTextW(m_hStaticClient, m_udpActive ? L"Sender cleared -- waiting for a datagram..."
+                                                    : L"Client disconnected -- waiting...");
     } else {
-        SetWindowTextW(m_hStaticStatus, L"\u25CF Not listening");
+        SetWindowTextW(m_hStaticStatus, L"● Not listening");
         SetWindowTextW(m_hStaticClient, L"");
-        SetWindowTextW(m_hWnd, L"TCP Server v" TCPTOOLS_VERSION);
     }
     InvalidateRect(m_hStaticStatus, nullptr, TRUE);
     InvalidateRect(m_hStaticClient, nullptr, TRUE);
@@ -1274,10 +1537,8 @@ void ServerMainWindow::OnNetClientDisconnected()
     LogEntry le;
     le.type      = LogType::ClientDisconn;
     le.timestamp = Utils::NowTimestamp();
-    {
-        bool isUdp = (SendMessage(m_hComboProtocol, CB_GETCURSEL, 0, 0) == 1);
-        le.preview = std::wstring(L"[") + (isUdp ? L"UDP" : L"TCP") + L"] Client disconnected (connection closed)";
-    }
+    le.preview   = m_udpActive ? L"[UDP] Sender cleared"
+                               : L"[TCP] Client disconnected (connection closed)";
     AddLogEntry(std::move(le));
 
     RefreshDiagnostics();
@@ -1289,7 +1550,6 @@ void ServerMainWindow::OnNetDataReceived(size_t len, BYTE* pData)
     delete[] pData;
 
     m_totalBytesRecv += len;
-    // Always keep the Total recv label current, regardless of stats tab state
     {
         wchar_t buf[80];
         swprintf_s(buf, L"Total recv: %s", Utils::FormatBytes(m_totalBytesRecv).c_str());
@@ -1300,28 +1560,42 @@ void ServerMainWindow::OnNetDataReceived(size_t len, BYTE* pData)
     if (Button_GetCheck(m_hChkAutoClearRecv) == BST_CHECKED) {
         m_recvData.clear();
         m_lastRecvData.clear();
+        ResetRecvTextState();
         SetWindowTextW(m_hEditRecv, L"");
         HexView::ClearData(m_hHexRecv);
     }
 
     m_recvData.insert(m_recvData.end(), chunk.begin(), chunk.end());
     m_lastRecvData.insert(m_lastRecvData.end(), chunk.begin(), chunk.end());
-    AppendReceiveText(chunk);
+    TrimToNewestHalf(m_lastRecvData);
+    if (TrimToNewestHalf(m_recvData)) {
+        RebuildReceiveView();
+    }
+    else {
+        AppendReceiveText(chunk);
+        HexView::AppendData(m_hHexRecv, chunk.data(), chunk.size());
+    }
 
-    bool isUdp = (SendMessage(m_hComboProtocol, CB_GETCURSEL, 0, 0) == 1);
-    const wchar_t* proto = isUdp ? L"UDP" : L"TCP";
+    // Latency of the first reply after a manual Send; statistics of the current cycle.
+    CycleStats st = m_net ? m_net->GetStats() : CycleStats();
+    double latency = -1;
+    if (st.valid && st.bytesReceived == len && st.sendEnd.time_since_epoch().count() != 0
+        && st.recvStart > st.sendEnd)
+        latency = st.SendToFirstRecvMs();
+    UpdateStats(st);
 
     LogEntry le;
     le.type      = LogType::Received;
     le.timestamp = Utils::NowTimestamp();
-    le.data      = chunk;
+    le.data      = std::move(chunk);
     le.byteCount = len;
+    le.latencyMs = latency;
     std::wstring prev;
     for (size_t i = 0; i < std::min(len, (size_t)80); ++i) {
-        BYTE b = chunk[i];
+        BYTE b = le.data[i];
         prev += (b >= 0x20 && b < 0x7F) ? (wchar_t)b : L'.';
     }
-    le.preview = std::wstring(L"[") + proto + L"] " + prev;
+    le.preview = std::wstring(L"[") + (m_udpActive ? L"UDP" : L"TCP") + L"] " + prev;
     AddLogEntry(std::move(le));
 }
 
@@ -1331,88 +1605,49 @@ void ServerMainWindow::OnNetSendComplete(size_t bytesSent, CycleStats* pStats)
     if (pStats) { s = *pStats; delete pStats; }
 
     m_totalBytesSent += bytesSent;
-    // Always keep the Total sent label current, regardless of s.valid
     {
         wchar_t buf[80];
         swprintf_s(buf, L"Total sent: %s", Utils::FormatBytes(m_totalBytesSent).c_str());
         SetWindowTextW(m_hStatTotalSent, buf);
-        swprintf_s(buf, L"Total recv: %s", Utils::FormatBytes(m_totalBytesRecv).c_str());
-        SetWindowTextW(m_hStatTotalRecv, buf);
     }
 
-    // Try to find the last pending Sent log entry (from manual send) and attach stats.
-    bool foundSent = false;
-    for (int i = (int)m_log.size() - 1; i >= 0; --i) {
-        if (m_log[i].type == LogType::Sent) {
-            m_log[i].stats = s;
-            for (int v = (int)m_logVisible.size() - 1; v >= 0; --v) {
-                if (m_logVisible[v] == i) {
-                    ListView_RedrawItems(m_hListLog, v, v);
-                    break;
-                }
-            }
-            foundSent = true;
-            break;
-        }
-    }
-
-    // If no manual Sent entry exists this is an echo reply – add a log entry for it.
-    if (!foundSent && bytesSent > 0
-        && Button_GetCheck(m_hChkEcho) == BST_CHECKED) {
-        bool isUdp = (SendMessage(m_hComboProtocol, CB_GETCURSEL, 0, 0) == 1);
-        const wchar_t* proto = isUdp ? L"UDP" : L"TCP";
+    if (s.isEcho) {
         LogEntry le;
         le.type      = LogType::Sent;
         le.timestamp = Utils::NowTimestamp();
         le.byteCount = bytesSent;
         le.stats     = s;
-        wchar_t buf[80];
-        swprintf_s(buf, L"[%s] Echoed %zu bytes", proto, bytesSent);
+        wchar_t buf[96];
+        swprintf_s(buf, s.ok ? L"[%s] Echoed %zu bytes" : L"[%s] Echo FAILED after %zu bytes",
+                   m_udpActive ? L"UDP" : L"TCP", bytesSent);
         le.preview = buf;
         AddLogEntry(std::move(le));
+    }
+    else {
+        int vis = -1;
+        if (LogEntry* e = FindLogBySeq(s.id, &vis)) {
+            e->stats = s;
+            if (!s.ok) e->preview += L"  (NOT SENT)";
+            if (vis >= 0) ListView_RedrawItems(m_hListLog, vis, vis);
+        }
     }
 
     UpdateStats(s);
 }
 
-void ServerMainWindow::OnNetError(int wsaErr, std::wstring* pMsg)
+void ServerMainWindow::OnNetError(int /*wsaErr*/, std::wstring* pMsg)
 {
     std::wstring msg;
     if (pMsg) { msg = *pMsg; delete pMsg; }
-    // Don't stop server on error, just log it
-    wchar_t title[64]; swprintf_s(title, L"Network Error (%d)", wsaErr);
-    MessageBoxW(m_hWnd, msg.c_str(), title, MB_ICONERROR);
+    // Raised by the network threads, possibly while another tab is in front: log
+    // it and show it on the status line instead of a modal box.
+    ShowStatusNote(L"Error: " + msg);
 
     LogEntry le;
     le.type      = LogType::Error;
     le.timestamp = Utils::NowTimestamp();
     le.preview   = msg;
     AddLogEntry(std::move(le));
-}
-
-// ============================================================
-//  AppendReceiveText
-// ============================================================
-
-void ServerMainWindow::AppendReceiveText(const std::vector<BYTE>& data)
-{
-    if (m_hexRecvMode) {
-        HexView::SetData(m_hHexRecv, m_recvData);
-    } else {
-        const int MAX_CHARS = 1 * 1024 * 1024; // 1 MB rolling cap
-        const int TRIM_TO   = MAX_CHARS / 2;    // keep newest ~512 KB
-        int len = GetWindowTextLengthW(m_hEditRecv);
-        if (len > MAX_CHARS) {
-            // Remove oldest half, preserving recent data
-            SendMessage(m_hEditRecv, EM_SETSEL, 0, TRIM_TO);
-            SendMessage(m_hEditRecv, EM_REPLACESEL, FALSE, (LPARAM)L"[...older output trimmed...]\r\n");
-            len = GetWindowTextLengthW(m_hEditRecv);
-        }
-        std::string s(data.begin(), data.end());
-        std::wstring ws = Utils::ToWide(s);
-        SendMessage(m_hEditRecv, EM_SETSEL, (WPARAM)len, (LPARAM)len);
-        SendMessage(m_hEditRecv, EM_REPLACESEL, FALSE, (LPARAM)ws.c_str());
-    }
 }
 
 // ============================================================
@@ -1428,28 +1663,24 @@ void ServerMainWindow::UpdateStats(const CycleStats& s)
         else         swprintf_s(buf, L"%s ---", lbl);
         SetWindowTextW(hw, buf);
     };
-    set(m_hStatSendStart, L"Send start:", s.ConnectToSendMs());
-    set(m_hStatSendEnd,   L"Send end:",   s.SendDurationMs());
-    set(m_hStatRecvStart, L"Recv start:", s.SendToFirstRecvMs());
-    set(m_hStatRecvEnd,   L"Recv end:",   s.RecvDurationMs());
-    set(m_hStatLatency,   L"Latency:",    s.SendToFirstRecvMs());
-    set(m_hStatTotal,     L"Total:",      s.TotalMs());
+    const bool sent = s.sendStart.time_since_epoch().count() != 0 && s.sendEnd.time_since_epoch().count() != 0;
+    const bool recv = s.recvStart.time_since_epoch().count() != 0;
+    set(m_hStatSendStart, L"Send start:", sent ? s.ConnectToSendMs() : -1);
+    set(m_hStatSendEnd,   L"Send end:",   sent ? s.SendDurationMs() : -1);
+    set(m_hStatRecvStart, L"Recv start:", (sent && recv) ? s.SendToFirstRecvMs() : -1);
+    set(m_hStatRecvEnd,   L"Recv end:",   recv ? s.RecvDurationMs() : -1);
+    set(m_hStatLatency,   L"Latency:",    (sent && recv) ? s.SendToFirstRecvMs() : -1);
+    set(m_hStatTotal,     L"Total time:", (sent && recv) ? s.TotalMs() : -1);
 
     wchar_t buf[80];
-    swprintf_s(buf, L"Sent: %s", Utils::FormatBytes(s.bytesSent).c_str());
+    swprintf_s(buf, L"Bytes sent: %s", Utils::FormatBytes(s.bytesSent).c_str());
     SetWindowTextW(m_hStatBytesSent, buf);
-    swprintf_s(buf, L"Recv: %s", Utils::FormatBytes(s.bytesReceived).c_str());
+    swprintf_s(buf, L"Bytes recv: %s", Utils::FormatBytes(s.bytesReceived).c_str());
     SetWindowTextW(m_hStatBytesRecv, buf);
 
     double th = s.ThroughputKBps();
     if (th > 0) { swprintf_s(buf, L"Throughput: %.1f KB/s", th); SetWindowTextW(m_hStatThrough, buf); }
     else          SetWindowTextW(m_hStatThrough, L"Throughput: ---");
-
-    // Update total byte labels (totals accumulated in OnNetSendComplete/OnNetDataReceived)
-    swprintf_s(buf, L"Total sent: %s", Utils::FormatBytes(m_totalBytesSent).c_str());
-    SetWindowTextW(m_hStatTotalSent, buf);
-    swprintf_s(buf, L"Total recv: %s", Utils::FormatBytes(m_totalBytesRecv).c_str());
-    SetWindowTextW(m_hStatTotalRecv, buf);
 }
 
 void ServerMainWindow::ClearStats()
@@ -1495,9 +1726,44 @@ void ServerMainWindow::RefreshLogView()
     InvalidateRect(m_hListLog, nullptr, TRUE);
 }
 
+// Drops the oldest 10 % while the log is over its entry or payload-byte cap.
+// Entries keep their own sequence number, so the "#" column stays consistent.
+void ServerMainWindow::TrimLog()
+{
+    while ((m_log.size() > LOG_MAX_ENTRIES || m_logBytes > LOG_MAX_BYTES) && m_log.size() > 1) {
+        size_t n = std::max<size_t>(m_log.size() / 10, 1);
+        for (size_t i = 0; i < n; ++i) m_logBytes -= m_log[i].data.size();
+        m_log.erase(m_log.begin(), m_log.begin() + n);
+    }
+    RefreshLogView();
+}
+
+// Entries are numbered consecutively and only ever removed from the front.
+LogEntry* ServerMainWindow::FindLogBySeq(unsigned long long seq, int* visibleIdx)
+{
+    if (visibleIdx) *visibleIdx = -1;
+    if (m_log.empty() || seq < m_log.front().seq || seq > m_log.back().seq) return nullptr;
+    int idx = (int)(seq - m_log.front().seq);
+    if (visibleIdx) {
+        auto it = std::lower_bound(m_logVisible.begin(), m_logVisible.end(), idx);
+        if (it != m_logVisible.end() && *it == idx) *visibleIdx = (int)(it - m_logVisible.begin());
+    }
+    return &m_log[idx];
+}
+
 void ServerMainWindow::AddLogEntry(LogEntry&& e)
 {
+    e.seq = m_nextSeq++;
+    m_logBytes += e.data.size();
     m_log.push_back(std::move(e));
+    NotifyToolEvent(m_hWnd);   // counts every appended entry, also filtered-out ones
+
+    if (m_log.size() > LOG_MAX_ENTRIES || m_logBytes > LOG_MAX_BYTES) {
+        TrimLog();
+        ListView_EnsureVisible(m_hListLog, (int)m_logVisible.size() - 1, FALSE);
+        return;
+    }
+
     const LogEntry& le = m_log.back();
     int origIdx = (int)(m_log.size() - 1);
 
@@ -1537,11 +1803,11 @@ void ServerMainWindow::OnNotify(NMHDR* nm)
 
             if (di->item.mask & LVIF_TEXT) {
                 switch (di->item.iSubItem) {
-                case 0: swprintf_s(buf, L"%d", logIdx + 1); break;
+                case 0: swprintf_s(buf, L"%llu", le.seq); break;
                 case 1: wcsncpy_s(buf, le.timestamp.c_str(), _TRUNCATE); break;
                 case 2: { int t = (int)le.type; wcsncpy_s(buf, (t >= 0 && t < 8) ? typeNames[t] : L"?", _TRUNCATE); break; }
                 case 3: if (le.byteCount > 0) swprintf_s(buf, L"%zu", le.byteCount); else buf[0] = 0; break;
-                case 4: { double sms = le.stats.SendDurationMs(); if (sms >= 0) swprintf_s(buf, L"%.1f", sms); else buf[0] = 0; break; }
+                case 4: { double sms = le.stats.SendDurationMs(); if (sms >= 0 && le.type == LogType::Sent) swprintf_s(buf, L"%.1f", sms); else buf[0] = 0; break; }
                 case 5: { if (le.latencyMs >= 0) swprintf_s(buf, L"%.1f", le.latencyMs); else buf[0] = 0; break; }
                 case 6: wcsncpy_s(buf, 1024, le.preview.c_str(), _TRUNCATE); break;
                 default: buf[0] = 0; break;
@@ -1576,36 +1842,32 @@ void ServerMainWindow::OnContextMenuLog(POINT pt)
     AppendMenuW(hMenu, MF_STRING, IDM_LOG_CLEAR, L"Clear Log");
     int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD|TPM_RIGHTBUTTON, pt.x, pt.y, 0, m_hWnd, nullptr);
     DestroyMenu(hMenu);
+    // The log can change while the menu is open (network messages are still handled).
+    if (origIdx >= (int)m_log.size()) origIdx = -1;
     if (cmd == IDM_LOG_RELOAD && origIdx >= 0) DoReloadLogEntry(origIdx);
     if (cmd == IDM_LOG_COPY   && origIdx >= 0) Utils::CopyToClipboard(m_hWnd, m_log[origIdx].preview);
     if (cmd == IDM_LOG_CLEAR) {
         m_log.clear();
-        m_logVisible.clear();
-        ListView_SetItemCountEx(m_hListLog, 0, 0);
-        InvalidateRect(m_hListLog, nullptr, TRUE);
+        m_logBytes = 0;
+        RefreshLogView();
     }
 }
 
 void ServerMainWindow::DoReloadLogEntry(int idx)
 {
     if (idx < 0 || idx >= (int)m_log.size()) return;
-    const LogEntry& le = m_log[idx];
+    const LogEntry le = m_log[idx];     // copy: ShowSendBytes / rebuilds must not see it change
     switch (le.type)
     {
     case LogType::Sent:
-        m_sendData = le.data;
-        HexView::SetData(m_hHexSend, m_sendData);
-        m_ignoreEditChange = true;
-        SetWindowTextW(m_hEditSend, Utils::ToWide(std::string(m_sendData.begin(), m_sendData.end())).c_str());
-        m_ignoreEditChange = false;
-        RefreshSendView();
-        SetFocus(m_hEditSend);
+        if (!le.data.empty()) {
+            ShowSendBytes(le.data, L"");
+            SetFocus(m_hEditSend);
+        }
         break;
     case LogType::Received:
         m_recvData = le.data;
-        SetWindowTextW(m_hEditRecv, Utils::ToWide(std::string(m_recvData.begin(), m_recvData.end())).c_str());
-        HexView::SetData(m_hHexRecv, m_recvData);
-        RefreshRecvView();
+        RebuildReceiveView();
         break;
     default: break;
     }
@@ -1623,7 +1885,7 @@ void ServerMainWindow::CreateTooltips()
         CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
         m_hWnd, nullptr, m_hInst, nullptr);
     if (!m_hTooltip) return;
-    SendMessageW(m_hTooltip, TTM_SETMAXTIPWIDTH, 0, 420);
+    SendMessageW(m_hTooltip, TTM_SETMAXTIPWIDTH, 0, Dpi::Scale(420));
     SendMessageW(m_hTooltip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 30000);
     SendMessageW(m_hTooltip, TTM_SETDELAYTIME, TTDT_INITIAL,  1200);
     SendMessageW(m_hTooltip, TTM_SETDELAYTIME, TTDT_RESHOW,    200);
@@ -1657,37 +1919,28 @@ void ServerMainWindow::CreateTooltips()
         L"privileges. A port already in use will be rejected.");
 
     tip(m_hEditTimeout,
-        L"Receive / accept timeout in seconds.\n\n"
-        L"How long the server waits for data or a new "
-        L"client before timing out.\n\n"
-        L"\u2022 Enter 0 to wait indefinitely (default).\n"
-        L"\u2022 Typical values: 5\u201330 seconds.\n\n"
-        L"A timeout of 0 keeps the server listening "
-        L"without any time limit.");
+        L"Send timeout in seconds.\n\n"
+        L"How long a send to the client may stall (for example a peer that stops reading) before it is aborted. Receiving is not time-limited.\n\n"
+        L"• Whole seconds, 0–3600.\n"
+        L"• 0 = no limit (default is 5).\n\n"
+        L"Fixed while the server is running.");
 
     tip(m_hComboProtocol,
-        L"Network protocol the server uses.\n\n"
-        L"TCP \u2014 Transmission Control Protocol.\n"
+        L"Network protocol the server uses (IPv4 only).\n\n"
+        L"TCP — Transmission Control Protocol.\n"
         L"Reliable, ordered, byte-stream delivery. "
-        L"Server accepts one client at a time.\n\n"
-        L"UDP \u2014 User Datagram Protocol.\n"
-        L"Connectionless datagrams. Receives data from "
-        L"any sender without a connection handshake.");
+        L"Server serves one client at a time; further connections wait until it is gone.\n\n"
+        L"UDP — User Datagram Protocol.\n"
+        L"Connectionless datagrams. Data from any sender is received; the sender of the last datagram is shown as the client and is where Send and Echo replies go.");
 
     tip(m_hBtnStart,
         L"Start the server.\n\n"
-        L"Binds to the configured port and begins listening "
-        L"for incoming client connections. The status bar "
-        L"shows \u201cListening on port ...\u201d once the server is ready.\n\n"
-        L"The port must be free \u2014 if another process is "
-        L"already using it, an error is displayed.");
+        L"Binds to the configured port (all local IPv4 addresses) and begins listening. The status line shows “Listening on port ...” once the server is ready.\n\n"
+        L"The port must be free — if another process is already using it, a message is shown.");
 
     tip(m_hBtnStop,
         L"Stop the server.\n\n"
-        L"Closes the listening socket, disconnects any "
-        L"connected client, and returns to the idle state. "
-        L"The port is released and becomes available for "
-        L"other applications.");
+        L"Closes the listening socket, disconnects any connected client (UDP: forgets the sender), and returns to the idle state. The port is released and becomes available for other applications.");
 
     tip(m_hChkEcho,
         L"Echo mode.\n\n"
@@ -1703,27 +1956,24 @@ void ServerMainWindow::CreateTooltips()
     tip(m_hStaticStatus,
         L"Server status indicator.\n\n"
         L"Shows the current state:\n"
-        L"\u2022 Stopped \u2014 not running\n"
-        L"\u2022 Listening on port ... \u2014 waiting for clients\n"
-        L"\u2022 Client connected \u2014 active session");
+        L"• Not listening — not running\n"
+        L"• Listening on port ... — waiting for a client / datagram\n"
+        L"• Listening (client connected) — active session");
 
     tip(m_hStaticClient,
-        L"Connected client information.\n\n"
-        L"Displays the IP address and port of the currently "
-        L"connected client, or empty when no client is connected.");
+        L"Client information and messages.\n\n"
+        L"Displays the IP address and port of the connected client (UDP: the sender of the last datagram), or the last error. Empty when idle.");
 
     // ================================================================
     //  SEND GROUP
     // ================================================================
     tip(m_hEditSend,
-        L"Send editor \u2014 type or paste data to send to the client.\n\n"
-        L"In text mode, type plain ASCII/UTF-8 text. "
-        L"In hex mode, enter space-separated hex pairs: "
-        L"48 65 6C 6C 6F (= \"Hello\").\n\n"
+        L"Send editor — type or paste the data to send to the client.\n\n"
+        L"Text mode: the text is sent as UTF-8. A loaded file or a reloaded log entry is sent byte-exact until you edit the text.\n"
+        L"Hex mode (Hex checkbox): enter hex byte pairs, e.g. 48 65 6C 6C 6F (= \"Hello\"). Spaces and line breaks are ignored.\n\n"
         L"Keyboard shortcuts:\n"
-        L"\u2022 Ctrl+Enter \u2014 Send immediately\n"
-        L"\u2022 Ctrl+A \u2014 Select all text\n\n"
-        L"You can also load binary data from a file.");
+        L"• Ctrl+Enter — Send immediately\n"
+        L"• Ctrl+A — Select all text");
 
     tip(m_hBtnSend,
         L"Send the current editor contents to the client.\n\n"
@@ -1733,23 +1983,17 @@ void ServerMainWindow::CreateTooltips()
         L"Shortcut: Ctrl+Enter");
 
     tip(m_hBtnLoadFile,
-        L"Load a file from disk into the send editor.\n\n"
-        L"The entire file is read as raw bytes. If Hex View "
-        L"is active, data is shown as hex bytes; otherwise as text.\n\n"
-        L"Useful for sending binary protocols or template "
-        L"response files.");
+        L"Load a file from disk into the send editor (up to 64 MB).\n\n"
+        L"The file is read as raw bytes and sent exactly as loaded. Text files are shown as text (or hex, if Hex is on). Binary files up to 1 MB switch to hex; larger binary files show a one-line note instead.\n\n"
+        L"Useful for sending binary protocols or template response files.");
 
     tip(m_hBtnClearSend,
-        L"Clear the send editor and internal buffer.\n\n"
-        L"Both the text view and the hex view are reset.");
+        L"Clear the send editor and any loaded data.");
 
     tip(m_hChkHexSend,
-        L"Toggle Hex View for the send editor.\n\n"
-        L"When checked, the editor displays and accepts data "
-        L"as space-separated hexadecimal byte pairs.\n"
-        L"Example: 48 65 6C 6C 6F = \"Hello\"\n\n"
-        L"Switching modes converts the current data between "
-        L"representations automatically.");
+        L"Hex mode for the send editor.\n\n"
+        L"When checked, the editor shows the data as editable hex byte pairs (16 per line) and Send transmits the bytes you enter. Example: 48 65 6C 6C 6F = \"Hello\"\n\n"
+        L"Switching converts the content: text → hex shows the bytes that would be sent; hex → text decodes them (invalid hex is reported and nothing changes). Data that is not plain text stays pinned so it is still sent exactly. Hex editing is limited to 1 MB.");
 
     tip(m_hChkAutoClearSend,
         L"Auto-clear the send editor after each send.\n\n"
@@ -1802,18 +2046,12 @@ void ServerMainWindow::CreateTooltips()
 
     tip(m_hBtnSaveRecv,
         L"Save received data to a file.\n\n"
-        L"Writes the raw bytes from the most recent "
-        L"transmission to a file on disk. Only the last "
-        L"send/receive cycle is kept.\n\n"
-        L"Useful for capturing binary payloads or saving "
-        L"client data for offline analysis.");
+        L"Writes the raw bytes received since your last Send (or since the last Clear) to a file on disk (newest ~4–8 MB if more arrived).\n\n"
+        L"Useful for capturing binary payloads or saving client data for offline analysis.");
 
     tip(m_hChkHexRecv,
         L"Toggle Hex View for the receive display.\n\n"
-        L"When checked, incoming data is shown as hexadecimal "
-        L"bytes with an ASCII sidebar. When unchecked, data is "
-        L"displayed as text.\n\n"
-        L"Switching modes re-renders all accumulated data.");
+        L"When checked, received data is shown as a hex dump with an ASCII sidebar. When unchecked, it is shown as text. Both views hold the same data (up to 8 MB; the oldest half is dropped beyond that).");
 
     tip(m_hChkAutoClearRecv,
         L"Auto-clear the receive display on new data.\n\n"
@@ -1826,13 +2064,9 @@ void ServerMainWindow::CreateTooltips()
     // ================================================================
     tip(m_hTabBottom,
         L"Bottom panel tabs.\n\n"
-        L"\u2022 Log \u2014 chronological history of all events "
-        L"(listen, client connections, sends, receives, errors). "
-        L"Right-click entries to reload or copy.\n\n"
-        L"\u2022 Diagnostics \u2014 live socket information: buffer sizes, "
-        L"Nagle state, keep-alive, MTU estimate.\n\n"
-        L"\u2022 Statistics \u2014 timing and byte counters for the "
-        L"current session.\n\n"
+        L"• Log — chronological history of events (listen, connections, sends, receives, errors; newest 20,000 entries). Right-click entries to reload or copy.\n\n"
+        L"• Diagnostics — live socket information: buffer sizes, Nagle state, MSS/MTU estimate.\n\n"
+        L"• Statistics — timing and byte counters.\n\n"
         L"Press F1 for a complete help guide.");
 
     tip(m_hBtnClearLog,
@@ -1852,10 +2086,9 @@ void ServerMainWindow::CreateTooltips()
     tip(m_hBtnRefreshDiag,
         L"Refresh socket diagnostics.\n\n"
         L"Queries the active sockets for live information:\n"
-        L"\u2022 Send/receive buffer sizes (SO_SNDBUF/SO_RCVBUF)\n"
-        L"\u2022 Nagle algorithm (TCP_NODELAY) state\n"
-        L"\u2022 Keep-alive probe status\n"
-        L"\u2022 Estimated path MTU (if available)\n\n"
+        L"• Send/receive buffer sizes (SO_SNDBUF/SO_RCVBUF)\n"
+        L"• Nagle algorithm (TCP_NODELAY) state\n"
+        L"• MSS and an estimated MTU (TCP, if available)\n\n"
         L"Only available while the server is running.");
 
     tip(m_hBtnClearStats,

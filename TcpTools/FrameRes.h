@@ -17,3 +17,6 @@
 
 // Frame-internal messages
 #define WM_FRAME_PAGE_TITLE     (WM_APP + 210)   // lParam = page HWND whose title changed
+
+// Timers
+#define IDT_UNREAD_LABELS       1                // repaints the tab labels whose event count changed

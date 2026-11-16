@@ -42,6 +42,8 @@ private:
         int          number {1};            // 1-based per kind: "Client", "Client 2", ...
         ToolState    state  {TOOL_IDLE};
         std::wstring detail;                // endpoint text taken from the page's title
+        int          unread {0};            // log events since the tab was last in front
+        bool         labelDirty {false};    // the tab text is behind `unread`
         HWND         lastFocus {nullptr};   // control that had the focus when the tab was left
     };
 
@@ -62,6 +64,8 @@ private:
     int     FindPage(HWND hwnd) const;
     void    UpdatePageTitle(int index);
     void    UpdateTabItem(int index);
+    void    OnToolEvent(HWND page, int count);
+    void    FlushUnreadLabels();
     void    UpdateCaption();
     std::wstring PageLabel(const Page& p) const;
 

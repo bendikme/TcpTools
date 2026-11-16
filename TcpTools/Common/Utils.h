@@ -88,19 +88,25 @@ namespace Utils
         return ss.str();
     }
 
-    // Parse "DE AD BE EF" or "DEADBEEF" -> bytes
+    // Parse "DE AD BE EF" or "DEADBEEF" -> bytes. Whitespace is ignored; anything
+    // else that is not a hex digit, or an odd number of digits, fails (out is empty).
     inline bool HexStrToBytes(const std::string& hex, std::vector<BYTE>& out) {
         out.clear();
-        std::string h;
-        for (char c : hex) if (c != ' ' && c != '\t' && c != '\n' && c != '\r') h += c;
-        if (h.size() % 2 != 0) return false;
-        for (size_t i = 0; i < h.size(); i += 2) {
-            char buf[3] = { h[i], h[i+1], 0 };
-            char* ep = nullptr;
-            long v = strtol(buf, &ep, 16);
-            if (*ep != 0) return false;
-            out.push_back((BYTE)v);
+        auto nibble = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        };
+        int hi = -1;
+        for (char c : hex) {
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') continue;
+            int v = nibble(c);
+            if (v < 0) { out.clear(); return false; }
+            if (hi < 0) hi = v;
+            else { out.push_back((BYTE)((hi << 4) | v)); hi = -1; }
         }
+        if (hi >= 0) { out.clear(); return false; }      // a digit without its pair
         return true;
     }
 
@@ -121,10 +127,10 @@ namespace Utils
     }
 
     // ---- Text for EDIT controls ----------------------------
-    // Bytes -> text an EDIT control can show: decoded as UTF-8 (invalid bytes
-    // become U+FFFD), every line end (CR LF, lone CR, lone LF) shown as a line
-    // break, and NUL / other control characters shown as '.', so that nothing
-    // cuts the text short. For display only: it does not round-trip.
+    // Bytes -> text an EDIT control can show: decoded as UTF-8, every line end
+    // (CR LF, lone CR, lone LF) shown as a line break, and NUL, other control
+    // characters and bytes that are not UTF-8 shown as '.', so that nothing cuts
+    // the text short. For display only: it does not round-trip.
     inline std::wstring BytesToDisplayText(const BYTE* data, size_t len) {
         if (!data || len == 0) return {};
         if (len > (size_t)INT_MAX) len = (size_t)INT_MAX;
@@ -142,7 +148,11 @@ namespace Utils
             }
             else if (c == L'\n')            out += L"\r\n";
             else if (c == L'\t')            out += c;
-            else if (c < 0x20 || c == 0x7F) out += L'.';
+            // Control characters and bytes that are not UTF-8 (U+FFFD after decoding)
+            // show as '.', like the ASCII column of a hex dump. Besides being
+            // readable, it keeps binary data on the EDIT control's fast plain-text
+            // path: thousands of U+FFFD make it lay out text ten times slower.
+            else if (c < 0x20 || c == 0x7F || c == 0xFFFD) out += L'.';
             else                            out += c;
         }
         return out;
@@ -187,11 +197,15 @@ namespace Utils
         size_t bytes = (text.size() + 1) * sizeof(wchar_t);
         HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, bytes);
         if (!hg) { CloseClipboard(); return false; }
-        memcpy(GlobalLock(hg), text.c_str(), bytes);
+        void* p = GlobalLock(hg);
+        if (!p) { GlobalFree(hg); CloseClipboard(); return false; }
+        memcpy(p, text.c_str(), bytes);
         GlobalUnlock(hg);
-        SetClipboardData(CF_UNICODETEXT, hg);
+        // The clipboard owns the block only when SetClipboardData succeeds.
+        bool ok = SetClipboardData(CF_UNICODETEXT, hg) != nullptr;
+        if (!ok) GlobalFree(hg);
         CloseClipboard();
-        return true;
+        return ok;
     }
 
 
@@ -269,8 +283,15 @@ namespace Utils
         return entries;
     }
 
+    // Puts `entry` first in the history file and returns the new list in `entries`.
+    // The file is read again first: several tabs of the same tool share it, and
+    // each would otherwise write back only what it knew when it was opened.
     inline void SaveHistory(const wchar_t* appName, const std::wstring& entry,
                             std::vector<std::wstring>& entries, int maxEntries = 10) {
+        {
+            std::vector<std::wstring> onDisk = LoadHistory(appName);
+            if (!onDisk.empty()) entries = std::move(onDisk);
+        }
         // Remove duplicate if present
         entries.erase(std::remove(entries.begin(), entries.end(), entry), entries.end());
         // Insert at front (most recent first)
