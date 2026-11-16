@@ -1,0 +1,50 @@
+# Builds TcpTools and publishes the GitHub release when a version tag is pushed.
+#
+#   git tag v26.11.0 && git push origin v26.11.0
+#
+# The DYNATEC Portal's Applications page offers the newest release's
+# TcpTools-<version>-windows-x64.zip (software entry "TcpTools", tag prefix "v").
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write        # create the release and upload its file
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag must match Version.h
+        shell: pwsh
+        run: |
+          $m = Select-String -Path Version.h -Pattern 'TCPTOOLS_VERSION_STR\s+"([^"]+)"'
+          $version = $m.Matches[0].Groups[1].Value
+          if ("v$version" -ne $env:GITHUB_REF_NAME) {
+            throw "Tag $env:GITHUB_REF_NAME does not match Version.h ($version)"
+          }
+
+      # The end-to-end tests drive the program's window; they are run on a
+      # developer machine before the tag is pushed (scripts\release.ps1).
+      - name: Build and package
+        shell: pwsh
+        run: .\scripts\release.ps1 -SkipTests
+
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag     = $env:GITHUB_REF_NAME
+          $version = $tag.Substring(1)
+          $zip     = "dist\TcpTools-$version-windows-x64.zip"
+          $notes   = "docs\release-notes\$tag.md"
+          if (Test-Path $notes) {
+            gh release create $tag $zip --title "TcpTools $version" --verify-tag --notes-file $notes
+          } else {
+            gh release create $tag $zip --title "TcpTools $version" --verify-tag --generate-notes
+          }
