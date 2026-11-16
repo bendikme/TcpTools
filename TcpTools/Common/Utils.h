@@ -1,5 +1,6 @@
 #pragma once
 #include "pch.h"
+#include "NetAddr.h"
 
 // ============================================================
 //  Utilities
@@ -228,38 +229,10 @@ namespace Utils
         return true;
     }
 
-    inline bool IsValidHostOrIP(const std::wstring& s) {
-        if (s.empty()) return false;
-        // Reject strings with spaces or control chars
-        for (wchar_t c : s) {
-            if (c <= 0x20 || c == 0x7F) return false;
-        }
-        // Must start and end with alphanumeric or digit (not '.' or '-')
-        wchar_t first = s.front(), last = s.back();
-        if (!iswalnum(first) && first != L'[') return false; // '[' for IPv6 bracket notation
-        if (!iswalnum(last) && last != L']') return false;
-        return true;
-    }
-
-    inline bool IsPortAvailable(int port, bool udp) {
-        WSADATA wsa;
-        bool needInit = (WSAStartup(MAKEWORD(2, 2), &wsa) == 0);
-
-        SOCKET s = socket(AF_INET, udp ? SOCK_DGRAM : SOCK_STREAM,
-                          udp ? IPPROTO_UDP : IPPROTO_TCP);
-        if (s == INVALID_SOCKET) {
-            if (needInit) WSACleanup();
-            return false;
-        }
-        sockaddr_in addr = {};
-        addr.sin_family      = AF_INET;
-        addr.sin_port        = htons((u_short)port);
-        addr.sin_addr.s_addr = INADDR_ANY;
-        bool ok = (bind(s, (sockaddr*)&addr, sizeof(addr)) != SOCKET_ERROR);
-        closesocket(s);
-        if (needInit) WSACleanup();
-        return ok;
-    }
+    // Host and port checks live in NetAddr.h (IPv4 and IPv6); these names are
+    // kept for the callers that only need a yes or no.
+    inline bool IsValidHostOrIP(const std::wstring& s) { return NetAddr::IsValidHost(s); }
+    inline bool IsPortAvailable(int port, bool udp)    { return NetAddr::IsPortFree(port, udp); }
 
     // ---- Connection history ---------------------------------
     inline std::wstring GetHistoryFilePath(const wchar_t* appName) {

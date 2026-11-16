@@ -111,6 +111,8 @@
     <ClInclude Include="Common\HexView.h" />
     <ClInclude Include="Common\Utils.h" />
     <ClInclude Include="Common\ToolHost.h" />
+    <ClInclude Include="Common\NetAddr.h" />
+    <ClInclude Include="Common\HandoffQueue.h" />
     <ClInclude Include="Client\MainWindow.h" />
     <ClInclude Include="Client\Network.h" />
     <ClInclude Include="Client\resource.h" />

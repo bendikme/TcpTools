@@ -10,9 +10,11 @@
 #    4. Client tab, text           Client tab  ->  Relay tab  ->  Server tab (echo) -> back
 #    5. Client tab, hex            "Hex" send of binary bytes arrives byte-exact
 #    6. UDP                        raw UDP client  <->  second TcpTools.exe (UDP echo)
-#    7. Start/stop cycles          relay and server stopped and started repeatedly;
-#                                  the client in auto-connect / auto-disconnect cycles
-#    8. Shutdown                   closing the window while everything is connected
+#    7. IPv6 and names             [::1], "[::1]:port" and localhost through relay and client
+#    8. Start/stop cycles          relay and server stopped and started repeatedly; a waiting
+#                                  second client; the port is exclusive; the client in
+#                                  auto-connect / auto-disconnect cycles (replies kept)
+#    9. Shutdown                   closing the window while everything is connected
 #                                  ends the process cleanly
 #
 #  Usage:
@@ -24,17 +26,20 @@
 # =============================================================================
 
 param(
-    [int]    $Port   = 9901,
-    [string] $Config = "Debug"
+    [int]    $Port     = 9901,
+    [string] $Config   = "Debug",
+    [string] $Exe      = "",       # test this TcpTools.exe instead of bin\<Config>\TcpTools.exe
+    [int]    $MaxLagMs = 1500      # how long the window may take to react after a 1 MB burst
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $ROOT = Split-Path $PSScriptRoot -Parent
-$EXE  = Join-Path $ROOT "bin\$Config\TcpTools.exe"
-$LOG  = Join-Path $env:TEMP "TcpTools_test_recv.bin"
-$LOG2 = Join-Path $env:TEMP "TcpTools_test_recv_udp.bin"
+$EXE  = if ($Exe) { $Exe } else { Join-Path $ROOT "bin\$Config\TcpTools.exe" }
+# The port is part of the names so that two test runs do not share their files.
+$LOG  = Join-Path $env:TEMP "TcpTools_test_recv_$Port.bin"
+$LOG2 = Join-Path $env:TEMP "TcpTools_test_recv_udp_$Port.bin"
 $script:PASS = 0
 $script:FAIL = 0
 
@@ -123,11 +128,12 @@ function Assert-True([bool]$Cond, [string]$TestName, [string]$Why = "condition i
 
 # Sends $Data over a new TCP connection and reads the same number of bytes back.
 function Send-Recv {
-    param([byte[]]$Data, [int]$ToPort, [int]$ReadMs = 3000)
+    param([byte[]]$Data, [int]$ToPort, [int]$ReadMs = 3000, [string]$ToHost = "127.0.0.1")
     $tcp = $null; $stream = $null
     try {
-        $tcp = New-Object System.Net.Sockets.TcpClient
-        $tcp.Connect("127.0.0.1", $ToPort)
+        $ip  = [System.Net.IPAddress]::Parse($ToHost)
+        $tcp = New-Object System.Net.Sockets.TcpClient ($ip.AddressFamily)
+        $tcp.Connect($ip, $ToPort)
         $stream = $tcp.GetStream()
         $stream.ReadTimeout  = $ReadMs
         $stream.WriteTimeout = 5000
@@ -179,7 +185,7 @@ Write-Host "============================================" -ForegroundColor Cyan
 
 foreach ($f in $LOG, $LOG2) { if (Test-Path $f) { Remove-Item $f -Force } }
 
-$app = $null; $app2 = $null
+$app = $null; $app2 = $null; $app3 = $null
 try {
     # -------------------------------------------------------------------------
     Write-Host "`n1. Server tab, echo mode" -ForegroundColor Cyan
@@ -208,6 +214,18 @@ try {
     $t6 = New-Object byte[] (1024 * 1024)
     (New-Object System.Random 42).NextBytes($t6)
     Assert-Equal (Send-Recv -Data $t6 -ToPort $ServerPort -ReadMs 15000) $t6 "Echo: 1 MB random payload"; $expectedLog.AddRange($t6)
+
+    # The megabyte is still being shown. A click must not wait behind it: the
+    # posted click on the "Hex View" box has to come through within $MaxLagMs.
+    $S_CHK_HEX_RECV = 1023
+    $chk = Get-Ctl $pgServer $S_CHK_HEX_RECV
+    $sw  = [Diagnostics.Stopwatch]::StartNew()
+    [void][W32]::PostMessage($chk, [W32]::BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero)
+    $reacted = Wait-Until { [int][W32]::SendMessage($chk, [W32]::BM_GETCHECK, [IntPtr]::Zero, [IntPtr]::Zero) -eq 1 } 30000
+    $lag = $sw.ElapsedMilliseconds
+    Assert-True ($reacted -and $lag -le $MaxLagMs) "Server: window reacts within $MaxLagMs ms after a 1 MB burst" "took $lag ms"
+    [void][W32]::PostMessage($chk, [W32]::BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero)
+    [void](Wait-Until { [int][W32]::SendMessage($chk, [W32]::BM_GETCHECK, [IntPtr]::Zero, [IntPtr]::Zero) -eq 0 } 30000)
 
     # -------------------------------------------------------------------------
     Write-Host "`n2. Server log file" -ForegroundColor Cyan
@@ -297,7 +315,43 @@ try {
     } finally { $udp.Close() }
 
     # -------------------------------------------------------------------------
-    Write-Host "`n7. Start/stop cycles" -ForegroundColor Cyan
+    Write-Host "`n7. IPv6 and names" -ForegroundColor Cyan
+    # The server and the relay listen on IPv4 and IPv6 with one socket.
+    Click $pgClient $C_DISCONNECT
+    $idle = Wait-Until { [W32]::IsWindowEnabled((Get-Ctl $pgClient $C_CONNECT)) } 10000
+    Assert-True $idle "Client: disconnected" "Connect button stayed disabled"
+    Start-Sleep -Milliseconds 500
+    $v6 = [System.Text.Encoding]::UTF8.GetBytes("OVER IPV6 THROUGH THE RELAY")
+    Assert-Equal (Send-Recv -Data $v6 -ToPort $RelayPort -ReadMs 5000 -ToHost "::1") $v6 "Relay: raw client over IPv6 ([::1])"
+
+    # Client tab: "[::1]:port" typed into the host field is split into host and port.
+    foreach ($case in @(@("[::1]:$RelayPort", "IPv6 literal with port"), @("localhost", "host name"))) {
+        Click $pgClient $C_BTN_CLEARRECV
+        Click $pgClient 1013
+        Set-Text $pgClient $C_PORT "$RelayPort"
+        Set-Text $pgClient $C_HOST $case[0]
+        Click    $pgClient $C_CONNECT
+        $up = Wait-Until { [W32]::IsWindowEnabled((Get-Ctl $pgClient $C_DISCONNECT)) -and
+                           [W32]::IsWindowEnabled((Get-Ctl $pgClient $C_BTN_SEND)) -and
+                           -not [W32]::IsWindowEnabled((Get-Ctl $pgClient $C_CONNECT)) } 10000
+        $text = "hello via " + $case[1]
+        if ($up) {
+            Start-Sleep -Milliseconds 300
+            Set-Text $pgClient $C_EDIT_SEND $text
+            Click    $pgClient $C_BTN_SEND
+            $up = Wait-Until { (Get-Text $pgClient $C_EDIT_RECV) -eq $text } 8000
+        }
+        Assert-True $up ("Client: connect and echo with " + $case[1] + " '" + $case[0] + "'") ("receive view shows: '" + (Get-Text $pgClient $C_EDIT_RECV) + "'")
+        Click $pgClient $C_DISCONNECT
+        [void](Wait-Until { [W32]::IsWindowEnabled((Get-Ctl $pgClient $C_CONNECT)) } 10000)
+        Start-Sleep -Milliseconds 400
+    }
+    Set-Text $pgClient $C_HOST "127.0.0.1"
+    Click    $pgClient $C_CONNECT
+    [void](Wait-Until { [W32]::IsWindowEnabled((Get-Ctl $pgClient $C_DISCONNECT)) } 10000)
+
+    # -------------------------------------------------------------------------
+    Write-Host "`n8. Start/stop cycles" -ForegroundColor Cyan
     # Relay off and on, several times in a row, then it must still relay.
     $cyclesOk = $true
     for ($i = 0; $i -lt 5 -and $cyclesOk; $i++) {
@@ -333,10 +387,45 @@ try {
     $s1 = [System.Text.Encoding]::UTF8.GetBytes("STILL ECHOING AFTER RESTARTS")
     Assert-Equal (Send-Recv -Data $s1 -ToPort $ServerPort -ReadMs 5000) $s1 "Server: echo after the restarts"
 
+    # A second client while one is connected: the server says that it waits, and
+    # serves it when the first one has gone.
+    $S_CLIENTINFO = 1009
+    $tcpA = New-Object System.Net.Sockets.TcpClient; $tcpA.Connect("127.0.0.1", $ServerPort)
+    Start-Sleep -Milliseconds 600
+    $tcpB = New-Object System.Net.Sockets.TcpClient; $tcpB.Connect("127.0.0.1", $ServerPort)
+    try {
+        $shown = Wait-Until { (Get-Text $pgServer $S_CLIENTINFO) -match "waiting" } 5000
+        Assert-True $shown "Server: a second client is shown as waiting" ("client label: '" + (Get-Text $pgServer $S_CLIENTINFO) + "'")
+        $sB = $tcpB.GetStream(); $sB.ReadTimeout = 6000
+        $msgB = [System.Text.Encoding]::UTF8.GetBytes("FROM THE WAITING CLIENT")
+        $sB.Write($msgB, 0, $msgB.Length); $sB.Flush()
+        Start-Sleep -Milliseconds 400
+        $tcpA.Close()
+        $got = New-Object byte[] $msgB.Length; $n = 0
+        try { while ($n -lt $got.Length) { $r = $sB.Read($got, $n, $got.Length - $n); if ($r -le 0) { break }; $n += $r } } catch { }
+        if ($n -lt $got.Length) { $got = $got[0..([Math]::Max($n - 1, 0))]; if ($n -eq 0) { $got = [byte[]]@() } }
+        Assert-Equal $got $msgB "Server: the waiting client is served when the first one leaves"
+        $expectedWaiting = $msgB.Length
+    } finally {
+        try { $tcpA.Close() } catch {}
+        try { $tcpB.Close() } catch {}
+        Start-Sleep -Milliseconds 400
+    }
+
+    # The port belongs to this server alone: a second program cannot listen on it too.
+    $app3 = Start-App "/tab:server /port:$ServerPort /autostart"
+    $pgServer3 = Get-Page $app3.MainWindowHandle "TcpServerMainWnd"
+    $stole = Wait-Until { [W32]::IsWindowEnabled((Get-Ctl $pgServer3 $S_BTN_STOP)) } 2500
+    Assert-True (-not $stole) "Server: a second instance cannot listen on the same port" "it is listening"
+    [void][W32]::PostMessage($app3.MainWindowHandle, [W32]::WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero)
+    if (-not $app3.WaitForExit(8000)) { $app3 | Stop-Process -Force }
+    Assert-Equal (Send-Recv -Data $s1 -ToPort $ServerPort -ReadMs 5000) $s1 "Server: still echoing after the port was contested"
+
     # Client: auto-connect + auto-disconnect, 15 sends in quick succession. Every
     # send is its own connect - send - disconnect; all must arrive, in order.
     $C_CHK_AUTODISC = 1007; $C_CHK_AUTOCONNECT = 1072
     Set-Text $pgClient $C_PORT "$ServerPort"
+    Click $pgClient $C_BTN_CLEARRECV
     # Clear drops the bytes the hex test left pinned in the editor. (Typing would
     # do the same; a text set from another process does not count as typing.)
     Click $pgClient 1013
@@ -361,6 +450,10 @@ try {
         $tail = New-Object byte[] ($all.Length - $before)
         [System.Array]::Copy($all, $before, $tail, 0, $tail.Length)
         Assert-Equal $tail ([byte[]]$expected.ToArray()) "Client: 15 auto-connect / send / auto-disconnect cycles arrive complete and in order"
+        # Auto-Disconnect must not cut off the reply: every echo is in the Receive view.
+        $wantText = [System.Text.Encoding]::UTF8.GetString([byte[]]$expected.ToArray())
+        $allBack  = Wait-Until { (Get-Text $pgClient $C_EDIT_RECV) -eq $wantText } 5000
+        Assert-True $allBack "Client: every reply arrived although Auto-Disconnect is on" ("receive view shows: '" + (Get-Text $pgClient $C_EDIT_RECV) + "'")
         if ($tail.Length -ne $expected.Count) {
             Write-Host ("         server received: " + [System.Text.Encoding]::ASCII.GetString($tail)) -ForegroundColor Yellow
         }
@@ -381,7 +474,7 @@ try {
     Assert-True $busy "Client: reconnected through the relay" "not connected"
 
     # -------------------------------------------------------------------------
-    Write-Host "`n8. Shutdown while connected" -ForegroundColor Cyan
+    Write-Host "`n9. Shutdown while connected" -ForegroundColor Cyan
     # Client connected, relay relaying, server with a client: closing the window
     # must stop every network thread and end the process by itself.
     foreach ($pair in @(@($app, "main instance (client + relay + server connected)"), @($app2, "UDP instance"))) {
@@ -396,7 +489,7 @@ catch {
     Fail "Test run aborted" $_.Exception.Message
 }
 finally {
-    foreach ($p in $app, $app2) {
+    foreach ($p in $app, $app2, $app3) {
         if ($p -and -not $p.HasExited) { try { $p | Stop-Process -Force } catch {} }
     }
 }

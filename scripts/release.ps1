@@ -4,6 +4,8 @@
 #    scripts\release.ps1                 build Release|x64, run the tests, write
 #                                        dist\TcpTools-<version>-windows-x64.zip
 #    scripts\release.ps1 -SkipTests      the same without the end-to-end tests
+#    scripts\release.ps1 -SignThumbprint <thumbprint>
+#                                        ... and sign TcpTools.exe (see "Sign" below)
 #    scripts\release.ps1 -Publish        ... and create the GitHub release
 #                                        v<version> with the zip (needs `gh`,
 #                                        logged in; the tag must be pushed)
@@ -16,8 +18,12 @@
 param(
     [switch] $SkipTests,
     [switch] $Publish,
-    [string] $Toolset = ""        # e.g. v143 to build with an older Visual Studio
+    [string] $Toolset = "",       # e.g. v143 to build with an older Visual Studio
+    [string] $SignThumbprint = "",# sign with this certificate of the user's store
+    [int]    $MaxLagMs = 1500     # passed to the tests (slower machines: raise it)
 )
+
+$script:Signed = $false
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -61,10 +67,46 @@ $fileVersion = (Get-Item $exe).VersionInfo.ProductVersion
 if ($fileVersion -ne $version) { throw "TcpTools.exe says version '$fileVersion', Version.h says '$version'" }
 
 # ---- Tests ----------------------------------------------------------------------
+# Before signing and packaging: the file that is tested is the file that ships
+# (signing only adds the signature).
 if (-not $SkipTests) {
     Write-Host "Running the end-to-end tests ..." -ForegroundColor Cyan
-    & (Join-Path $root "Test\RunTests.ps1") -Config Release
+    & (Join-Path $root "Test\RunTests.ps1") -Config Release -MaxLagMs $MaxLagMs
     if ($LASTEXITCODE -ne 0) { throw "Tests failed ($LASTEXITCODE)" }
+}
+
+# ---- Sign (when a certificate is given) ---------------------------------------------
+# Either  -SignThumbprint <thumbprint of a code-signing certificate in the user's store>
+# or the environment variables TCPTOOLS_SIGN_PFX_BASE64 (a .pfx, base64) and
+# TCPTOOLS_SIGN_PFX_PASSWORD - the release workflow fills them from the repository
+# secrets of the same names. Without a certificate the exe stays unsigned and
+# Windows SmartScreen asks before its first start.
+$pfxFile = $null
+try {
+    $signArgs = $null
+    if ($SignThumbprint) {
+        $signArgs = @("/sha1", $SignThumbprint)
+    } elseif ($env:TCPTOOLS_SIGN_PFX_BASE64) {
+        $pfxFile = Join-Path ([System.IO.Path]::GetTempPath()) ("tcptools-sign-" + [Guid]::NewGuid().ToString("N") + ".pfx")
+        [System.IO.File]::WriteAllBytes($pfxFile, [Convert]::FromBase64String($env:TCPTOOLS_SIGN_PFX_BASE64))
+        $signArgs = @("/f", $pfxFile)
+        if ($env:TCPTOOLS_SIGN_PFX_PASSWORD) { $signArgs += @("/p", $env:TCPTOOLS_SIGN_PFX_PASSWORD) }
+    }
+    if ($signArgs) {
+        $signtool = Get-ChildItem (Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\bin") -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue |
+                    Where-Object { $_.FullName -match "\\x64\\" } | Sort-Object FullName -Descending | Select-Object -First 1
+        if (-not $signtool) { throw "signtool.exe not found (Windows SDK)" }
+        Write-Host "Signing TcpTools.exe ..." -ForegroundColor Cyan
+        & $signtool.FullName sign /fd SHA256 /td SHA256 /tr "http://timestamp.digicert.com" /d "TcpTools" @signArgs $exe
+        if ($LASTEXITCODE -ne 0) { throw "signtool failed ($LASTEXITCODE)" }
+        & $signtool.FullName verify /pa $exe
+        if ($LASTEXITCODE -ne 0) { throw "The signature does not verify ($LASTEXITCODE)" }
+        $script:Signed = $true
+    } else {
+        Write-Host "No signing certificate given: TcpTools.exe is NOT signed." -ForegroundColor Yellow
+    }
+} finally {
+    if ($pfxFile -and (Test-Path $pfxFile)) { Remove-Item $pfxFile -Force }
 }
 
 # ---- Package ----------------------------------------------------------------------

@@ -1,9 +1,14 @@
-# Builds TcpTools and publishes the GitHub release when a version tag is pushed.
+# Builds, tests and publishes TcpTools when a version tag is pushed.
 #
-#   git tag v26.11.0 && git push origin v26.11.0
+#   git tag v26.11.1 && git push origin v26.11.1
 #
+# The file that is published is the file the end-to-end tests ran against.
 # The DYNATEC Portal's Applications page offers the newest release's
 # TcpTools-<version>-windows-x64.zip (software entry "TcpTools", tag prefix "v").
+#
+# Code signing: add the repository secrets TCPTOOLS_SIGN_PFX_BASE64 (the
+# code-signing certificate as a base64 .pfx) and TCPTOOLS_SIGN_PFX_PASSWORD.
+# Without them the release is published unsigned.
 name: Release
 
 on:
@@ -28,11 +33,20 @@ jobs:
             throw "Tag $env:GITHUB_REF_NAME does not match Version.h ($version)"
           }
 
-      # The end-to-end tests drive the program's window; they are run on a
-      # developer machine before the tag is pushed (scripts\release.ps1).
-      - name: Build and package
-        shell: pwsh
-        run: .\scripts\release.ps1 -SkipTests
+      # Windows PowerShell, like on a developer machine. The tests start
+      # TcpTools.exe and drive its window; a hosted runner is slower than a
+      # desktop, hence the wider limit for the responsiveness check.
+      - name: Build, test, sign and package
+        shell: powershell
+        env:
+          TCPTOOLS_SIGN_PFX_BASE64: ${{ secrets.TCPTOOLS_SIGN_PFX_BASE64 }}
+          TCPTOOLS_SIGN_PFX_PASSWORD: ${{ secrets.TCPTOOLS_SIGN_PFX_PASSWORD }}
+        run: .\scripts\release.ps1 -MaxLagMs 6000
+
+      - name: Stop a TcpTools.exe the failed tests left running
+        if: failure()
+        shell: powershell
+        run: Get-Process TcpTools -ErrorAction SilentlyContinue | Stop-Process -Force
 
       - name: Publish the release
         shell: pwsh
