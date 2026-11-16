@@ -49,13 +49,16 @@ private:
     void OnContextMenuLog(POINT pt);
 
     // Network message handlers
+    void OnNetEvents();                              // WM_SERVER_EVENTS: drains one slice of the hand-off queue
     void OnNetListening(int port);
     void OnNetStopped();
-    void OnNetClientConnected(std::wstring* pAddrStr);
+    void OnNetClientConnected(const NetEvent& ev);
     void OnNetClientDisconnected();
-    void OnNetDataReceived(size_t len, BYTE* pData);
-    void OnNetSendComplete(size_t bytesSent, CycleStats* pStats);
-    void OnNetError(int wsaErr, std::wstring* pMsg);
+    void OnNetWaiting(const NetEvent& ev);
+    void OnNetDataRun(std::vector<NetEvent*>& run);  // consecutive data chunks, shown with one update
+    void OnNetSendComplete(const NetEvent& ev);
+    void OnNetError(const std::wstring& msg);
+    void UpdateClientLabel();
 
     // UI Actions
     bool StartServer(int port, int timeoutSec, bool udp, bool echo);
@@ -74,10 +77,13 @@ private:
     void UpdateStats(const CycleStats& s);
     void ClearStats();
     void AddLogEntry(LogEntry&& e);
+    void FlushLogView();
+    void RebuildLogVisible();
     void TrimLog();
     LogEntry* FindLogBySeq(unsigned long long seq, int* visibleIdx);
     void AppendReceiveText(const std::vector<BYTE>& data, bool flush = false);
     void RebuildReceiveView();
+    void RebuildTextView();
     void ResetRecvTextState();
     void CapRecvBuffers();
     void SetSendEditText(const std::wstring& text);
@@ -91,7 +97,6 @@ private:
     void              RefreshLogView();
     void              CreateTooltips();
     void              ShowStatusNote(const std::wstring& text);
-    void              DrainPendingMessages();
 
     // Layout helpers
     void RelayoutToClient();
@@ -204,6 +209,17 @@ private:
     size_t                         m_totalBytesRecv {0};
     std::wstring                   m_peerText;
     int                            m_port          {0};
+    int                            m_waiting       {0};      // TCP clients parked behind the current one
+
+    // Receive views: the visible one is current, the hidden one is rebuilt when shown.
+    bool                           m_textStale     {false};
+    bool                           m_hexStale      {false};
+
+    // Log list updates are batched per drained slice of network events.
+    int                            m_logBatch      {0};
+    int                            m_logNotify     {0};      // entries added since the host was told
+    bool                           m_logDirty      {false};
+    bool                           m_logRebuild    {false};  // the list needs a full refresh (log was trimmed)
 
     // Connection history
     std::vector<std::wstring>      m_portHistory;

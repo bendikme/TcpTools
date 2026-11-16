@@ -24,13 +24,6 @@ static std::wstring WsaMessage(int code)
     return s.empty() ? L"Error " + std::to_wstring(code) : s;
 }
 
-static std::wstring AddrStr(const sockaddr_in& a)
-{
-    wchar_t ip[64] = {};
-    InetNtopW(AF_INET, (void*)&a.sin_addr, ip, 64);
-    return std::wstring(ip) + L":" + std::to_wstring(ntohs(a.sin_port));
-}
-
 static bool SetNonBlocking(SOCKET s)
 {
     u_long mode = 1;
@@ -46,24 +39,12 @@ static void DisableUdpConnReset(SOCKET s)
     WSAIoctl(s, _WSAIOW(IOC_VENDOR, 12), &off, sizeof(off), nullptr, 0, &ret, nullptr, nullptr);
 }
 
-static int ResolveV4(const std::string& host, int port, sockaddr_in& out)
-{
-    addrinfo hints = {}, *res = nullptr;
-    hints.ai_family = AF_INET;
-    int rc = getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res);
-    if (rc != 0 || !res) return rc ? rc : WSAHOST_NOT_FOUND;
-    out = {};
-    memcpy(&out, res->ai_addr, std::min<size_t>(res->ai_addrlen, sizeof(out)));
-    freeaddrinfo(res);
-    return 0;
-}
-
 // ============================================================
 //  RelayNetwork
 // ============================================================
 
-RelayNetwork::RelayNetwork(HWND notifyWnd)
-    : m_notifyWnd(notifyWnd)
+RelayNetwork::RelayNetwork(HandoffQueue<RelayEvent>& events)
+    : m_events(events)
 {
 }
 
@@ -72,22 +53,21 @@ RelayNetwork::~RelayNetwork()
     StopRelay();
 }
 
-// A full message queue (10 000 messages) makes PostMessage fail; wait for
-// the UI to catch up instead of losing data. Any other failure (window
-// gone) gives up.
-bool RelayNetwork::PostRetry(UINT msg, WPARAM wp, LPARAM lp)
+// State changes weigh 0 and never wait. A relay that is stopping drops nothing
+// that matters: the window clears the queue when it ends the session.
+void RelayNetwork::Post(RelayEvent::Kind kind, int num, std::wstring text, bool fromWait)
 {
-    for (;;) {
-        if (PostMessageW(m_notifyWnd, msg, wp, lp)) return true;
-        if (GetLastError() != ERROR_NOT_ENOUGH_QUOTA || m_stopRequested) return false;
-        Sleep(5);
-    }
+    RelayEvent ev;
+    ev.kind     = kind;
+    ev.num      = num;
+    ev.fromWait = fromWait;
+    ev.text     = std::move(text);
+    m_events.Push(std::move(ev), 0, m_stopRequested);
 }
 
 void RelayNetwork::PostError(int wsaErr, const std::wstring& msg)
 {
-    auto* p = new std::wstring(msg.empty() ? WsaMessage(wsaErr) : msg);
-    if (!PostRetry(WM_RELAY_ERROR, (WPARAM)wsaErr, (LPARAM)p)) delete p;
+    Post(RelayEvent::Kind::Error, wsaErr, msg.empty() ? WsaMessage(wsaErr) : msg);
 }
 
 void RelayNetwork::FatalStop(int wsaErr, const std::wstring& msg)
@@ -95,19 +75,21 @@ void RelayNetwork::FatalStop(int wsaErr, const std::wstring& msg)
     PostError(wsaErr, msg);
     m_stopRequested = true;
     if (!m_stoppedPosted.exchange(true))
-        PostMessageW(m_notifyWnd, WM_RELAY_STOPPED, 0, 0);
+        Post(RelayEvent::Kind::Stopped);
 }
 
+// Data weighs its size: when the window falls behind, Push blocks and this
+// thread simply reads its socket later. Forwarding was already done.
 void RelayNetwork::PostData(bool c2t, const BYTE* data, size_t n, bool forwarded)
 {
     if (n == 0) return;
     if (!forwarded) (c2t ? m_heldC2T : m_heldT2C).fetch_add(1);
-    BYTE* copy = new BYTE[n];
-    memcpy(copy, data, n);
-    WPARAM wp = (WPARAM)n;
-    if (forwarded) wp |= RELAY_FLAG_FORWARDED;
-    if (!PostRetry(c2t ? WM_RELAY_CLIENT_DATA : WM_RELAY_TARGET_DATA, wp, (LPARAM)copy))
-        delete[] copy;
+    RelayEvent ev;
+    ev.kind      = RelayEvent::Kind::Data;
+    ev.c2t       = c2t;
+    ev.forwarded = forwarded;
+    ev.data.assign(data, data + n);
+    m_events.Push(std::move(ev), n, m_stopRequested);
 }
 
 bool RelayNetwork::SleepInterruptible(int ms)
@@ -147,7 +129,7 @@ void RelayNetwork::CloseSocket(std::atomic<SOCKET>& slot, std::mutex* sendMutex,
 
 // ---- StartRelay / StopRelay ------------------------------------
 
-bool RelayNetwork::StartRelay(int listenPort, const std::string& targetHost, int targetPort,
+bool RelayNetwork::StartRelay(int listenPort, const std::wstring& targetHost, int targetPort,
                                int timeoutSec, bool udpMode)
 {
     if (m_acceptThread.joinable() || m_targetThread.joinable()) return false;
@@ -160,7 +142,8 @@ bool RelayNetwork::StartRelay(int listenPort, const std::string& targetHost, int
     m_heldC2T = m_heldT2C = 0;
     m_udpMode    = udpMode;
     m_timeoutSec = timeoutSec > 0 ? timeoutSec : 0;
-    m_udpClientAddr = {};
+    m_udpClient = {};
+    m_waiting.clear();
 
     try {
         if (m_udpMode) {
@@ -231,11 +214,11 @@ size_t RelayNetwork::SendAll(SOCKET s, const BYTE* p, size_t n, int maxStallMs,
     return sent;
 }
 
-bool RelayNetwork::SendDatagram(SOCKET s, const BYTE* p, size_t n, const sockaddr_in* to)
+bool RelayNetwork::SendDatagram(SOCKET s, const BYTE* p, size_t n, const NetAddr::Endpoint* to)
 {
     if (n == 0 || n > 65507) return false;
     for (int tries = 0; tries < 20 && !m_stopRequested; ++tries) {
-        int r = to ? sendto(s, (const char*)p, (int)n, 0, (const sockaddr*)to, sizeof(*to))
+        int r = to ? sendto(s, (const char*)p, (int)n, 0, to->sa(), to->len)
                    : ::send(s, (const char*)p, (int)n, 0);
         if (r >= 0) return true;
         if (WSAGetLastError() != WSAEWOULDBLOCK) return false;
@@ -262,7 +245,7 @@ size_t RelayNetwork::SendToClient(const BYTE* p, size_t n, int maxStallMs)
     if (m_udpMode) {
         SOCKET ls = m_listenSock;
         if (ls == INVALID_SOCKET) return 0;
-        return SendDatagram(ls, p, n, &m_udpClientAddr) ? n : 0;
+        return SendDatagram(ls, p, n, &m_udpClient) ? n : 0;
     }
     SOCKET s = m_clientSock;
     if (s == INVALID_SOCKET) return 0;
@@ -301,24 +284,24 @@ void RelayNetwork::HandleData(bool c2t, const BYTE* d, int n)
 // ---- TargetConnectLoop -----------------------------------------
 // Connects to the target, relays until it drops, reconnects every 2 s.
 
-void RelayNetwork::TargetConnectLoop(std::string host, int port)
+void RelayNetwork::TargetConnectLoop(std::wstring host, int port)
 {
     std::wstring lastError;
     while (!m_stopRequested) {
-        PostRetry(WM_RELAY_TARGET_CONNECTING, 0, 0);
+        Post(RelayEvent::Kind::TargetConnecting);
 
         SOCKET s = ConnectToTarget(host, port, lastError);
         if (s != INVALID_SOCKET) {
             lastError.clear();
             PublishSocket(m_targetSock, m_targetSendMutex, s);
             m_targetConnected = true;
-            PostRetry(WM_RELAY_TARGET_CONN, 0, 0);
+            Post(RelayEvent::Kind::TargetConn);
 
             TargetRecvLoop(s);
 
             m_targetConnected = false;
             CloseSocket(m_targetSock, &m_targetSendMutex, &m_targetClosing);
-            if (!m_stopRequested) PostRetry(WM_RELAY_TARGET_DISCONN, 0, 0);
+            if (!m_stopRequested) Post(RelayEvent::Kind::TargetDisconn);
         }
         if (!SleepInterruptible(2000)) break;
     }
@@ -328,78 +311,97 @@ void RelayNetwork::TargetConnectLoop(std::string host, int port)
 
 // Returns a connected, non-blocking socket or INVALID_SOCKET. A failure is
 // reported once per distinct reason (the loop retries every few seconds).
-SOCKET RelayNetwork::ConnectToTarget(const std::string& host, int port, std::wstring& lastError)
+// Lookup and connect poll m_stopRequested, so Stop is never held up by them.
+SOCKET RelayNetwork::ConnectToTarget(const std::wstring& host, int port, std::wstring& lastError)
 {
     auto fail = [&](int code, const std::wstring& why) {
-        std::wstring msg = L"Target " + Utils::ToWide(host) + L":" + std::to_wstring(port) +
+        std::wstring msg = L"Target " + NetAddr::JoinHostPort(host, port) +
                            L": " + why + L" (retrying)";
         if (msg != lastError) { lastError = msg; PostError(code, msg); }
     };
 
-    sockaddr_in addr = {};
-    int rc = ResolveV4(host, port, addr);
+    std::vector<NetAddr::Endpoint> eps;
+    int rc = NetAddr::Resolve(host, port, SOCK_STREAM, m_stopRequested, eps);
+    if (rc == WSA_E_CANCELLED) return INVALID_SOCKET;
     if (rc != 0) { fail(rc, L"cannot resolve host name"); return INVALID_SOCKET; }
 
-    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) { fail(WSAGetLastError(), L"socket() failed"); return INVALID_SOCKET; }
+    // timeoutSec 0 ("No timeout") still needs a per-attempt limit: 3 s.
+    const int limitMs = (m_timeoutSec > 0 ? m_timeoutSec : 3) * 1000;
+    int err = 0;
+    SOCKET s = NetAddr::Connect(eps, SOCK_STREAM, limitMs, m_stopRequested, err, true);
+    if (s == INVALID_SOCKET) {
+        if (err != WSA_E_CANCELLED) fail(err, WsaMessage(err));
+        return INVALID_SOCKET;
+    }
     BOOL nodelay = TRUE;
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char*)&nodelay, sizeof(nodelay));
-    SetNonBlocking(s);
-
-    if (::connect(s, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR &&
-        WSAGetLastError() != WSAEWOULDBLOCK) {
-        fail(WSAGetLastError(), WsaMessage(WSAGetLastError()));
-        closesocket(s);
-        return INVALID_SOCKET;
-    }
-
-    // timeoutSec 0 ("No timeout") still needs a per-attempt limit: 3 s.
-    int limitMs = (m_timeoutSec > 0 ? m_timeoutSec : 3) * 1000;
-    auto start = std::chrono::steady_clock::now();
-    fd_set wfds, efds;
-    for (;;) {
-        if (m_stopRequested) { closesocket(s); return INVALID_SOCKET; }
-        FD_ZERO(&wfds); FD_SET(s, &wfds);
-        FD_ZERO(&efds); FD_SET(s, &efds);
-        timeval tv { 0, 100000 };
-        int r = select(0, nullptr, &wfds, &efds, &tv);
-        if (r > 0) break;
-        if (r < 0) { fail(WSAGetLastError(), L"select() failed"); closesocket(s); return INVALID_SOCKET; }
-        if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(limitMs)) {
-            fail(WSAETIMEDOUT, L"connection timed out");
-            closesocket(s);
-            return INVALID_SOCKET;
-        }
-    }
-    if (FD_ISSET(s, &efds)) {
-        int err = 0, len = sizeof(err);
-        getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&err, &len);
-        fail(err, WsaMessage(err));
-        closesocket(s);
-        return INVALID_SOCKET;
-    }
     return s;
 }
 
 // ---- AcceptClientLoop ------------------------------------------
-// Listens and serves one client at a time (further clients wait in the backlog).
+// Listens and serves one client at a time. While one is relayed, further
+// connections are accepted and parked unread (m_waiting, in order, up to
+// RELAY_MAX_WAITING); when the current client leaves the first one is next.
+
+static std::wstring ListenFailText(int port, int err)
+{
+    if (err == WSAEADDRINUSE || err == WSAEACCES)
+        return L"Listen port " + std::to_wstring(port) +
+               L" is already in use (by another program or another tab)";
+    return L"Cannot listen on port " + std::to_wstring(port) + L": " + WsaMessage(err);
+}
+
+bool RelayNetwork::AcceptOne(SOCKET ls, Waiting& out)
+{
+    NetAddr::Endpoint peer;
+    peer.len = sizeof(peer.addr);
+    SOCKET cs = accept(ls, peer.sa(), &peer.len);
+    if (cs == INVALID_SOCKET) return false;
+    BOOL nd = TRUE;
+    setsockopt(cs, IPPROTO_TCP, TCP_NODELAY, (char*)&nd, sizeof(nd));
+    SetNonBlocking(cs);
+    out.sock = cs;
+    out.addr = NetAddr::ToString(peer);
+    return true;
+}
+
+// A parked client that went away without sending anything (or reset) is
+// dropped; one that sent data and then closed still gets its turn.
+void RelayNetwork::SweepWaiting()
+{
+    for (size_t i = 0; i < m_waiting.size(); ) {
+        SOCKET s = m_waiting[i].sock;
+        fd_set rfds; FD_ZERO(&rfds); FD_SET(s, &rfds);
+        timeval tv { 0, 0 };
+        bool gone = false;
+        if (select(0, &rfds, nullptr, nullptr, &tv) > 0) {
+            char c;
+            int n = recv(s, &c, 1, MSG_PEEK);
+            if (n == 0) gone = true;
+            else if (n < 0) {
+                int e = WSAGetLastError();
+                gone = (e != WSAEWOULDBLOCK && e != WSAEMSGSIZE);
+            }
+        }
+        if (!gone) { ++i; continue; }
+        std::wstring addr = m_waiting[i].addr;
+        closesocket(s);
+        m_waiting.erase(m_waiting.begin() + i);
+        Post(RelayEvent::Kind::ClientWaitLeft, (int)m_waiting.size(), addr);
+    }
+}
+
+void RelayNetwork::CloseWaiting()
+{
+    for (auto& w : m_waiting) closesocket(w.sock);
+    m_waiting.clear();
+}
 
 void RelayNetwork::AcceptClientLoop(int listenPort)
 {
-    SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (ls == INVALID_SOCKET) { FatalStop(WSAGetLastError(), L"socket() failed"); return; }
-
-    sockaddr_in addr = {};
-    addr.sin_family      = AF_INET;
-    addr.sin_port        = htons((u_short)listenPort);
-    addr.sin_addr.s_addr = INADDR_ANY;
-
-    if (bind(ls, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        int e = WSAGetLastError();
-        closesocket(ls);
-        FatalStop(e, L"bind() failed on port " + std::to_wstring(listenPort) + L": " + WsaMessage(e));
-        return;
-    }
+    int err = 0;
+    SOCKET ls = NetAddr::CreateListenSocket(SOCK_STREAM, listenPort, err);
+    if (ls == INVALID_SOCKET) { FatalStop(err, ListenFailText(listenPort, err)); return; }
     if (listen(ls, SOMAXCONN) == SOCKET_ERROR) {
         int e = WSAGetLastError();
         closesocket(ls);
@@ -413,36 +415,36 @@ void RelayNetwork::AcceptClientLoop(int listenPort)
         m_listenSock = ls;
     }
     m_listening = true;
-    PostRetry(WM_RELAY_LISTENING, (WPARAM)listenPort, 0);
+    Post(RelayEvent::Kind::Listening, listenPort);
 
     while (!m_stopRequested) {
-        fd_set rfds;
-        FD_ZERO(&rfds); FD_SET(ls, &rfds);
-        timeval tv { 0, 100000 };
-        int r = select(0, &rfds, nullptr, nullptr, &tv);
-        if (r < 0) { FatalStop(WSAGetLastError(), L"Listening socket failed"); break; }
-        if (r == 0) continue;
+        Waiting cur;
+        bool fromWait = false;
+        if (!m_waiting.empty()) {
+            cur = m_waiting.front();
+            m_waiting.pop_front();
+            fromWait = true;
+        } else {
+            fd_set rfds;
+            FD_ZERO(&rfds); FD_SET(ls, &rfds);
+            timeval tv { 0, 100000 };
+            int r = select(0, &rfds, nullptr, nullptr, &tv);
+            if (r < 0) { FatalStop(WSAGetLastError(), L"Listening socket failed"); break; }
+            if (r == 0 || !AcceptOne(ls, cur)) continue;
+        }
 
-        sockaddr_in ca = {}; int clen = sizeof(ca);
-        SOCKET cs = accept(ls, (sockaddr*)&ca, &clen);
-        if (cs == INVALID_SOCKET) continue;
-
-        BOOL nd = TRUE;
-        setsockopt(cs, IPPROTO_TCP, TCP_NODELAY, (char*)&nd, sizeof(nd));
-        SetNonBlocking(cs);
-
-        PublishSocket(m_clientSock, m_clientSendMutex, cs);
+        PublishSocket(m_clientSock, m_clientSendMutex, cur.sock);
         m_clientConnected = true;
-        auto* a = new std::wstring(AddrStr(ca));
-        if (!PostRetry(WM_RELAY_CLIENT_CONN, 0, (LPARAM)a)) delete a;
+        Post(RelayEvent::Kind::ClientConn, (int)m_waiting.size(), cur.addr, fromWait);
 
-        ClientRecvLoop(cs);
+        ClientRecvLoop(cur.sock, ls);
 
         m_clientConnected = false;
         CloseSocket(m_clientSock, &m_clientSendMutex, &m_clientClosing);
-        if (!m_stopRequested) PostRetry(WM_RELAY_CLIENT_DISCONN, 0, 0);
+        if (!m_stopRequested) Post(RelayEvent::Kind::ClientDisconn);
     }
 
+    CloseWaiting();
     m_listening = false;
     CloseSocket(m_listenSock, nullptr, nullptr);
     m_stopRequested = true;   // lets TargetConnectLoop end too
@@ -450,16 +452,33 @@ void RelayNetwork::AcceptClientLoop(int listenPort)
 
 // ---- ClientRecvLoop / TargetRecvLoop ---------------------------
 
-void RelayNetwork::ClientRecvLoop(SOCKET s)
+void RelayNetwork::ClientRecvLoop(SOCKET s, SOCKET ls)
 {
     std::vector<BYTE> buf(65536);
+    ULONGLONG lastSweep = GetTickCount64();
     while (!m_stopRequested) {
+        // At the limit the listen socket is left alone: further clients wait
+        // in the system's backlog instead.
+        const bool watchListen = m_waiting.size() < RELAY_MAX_WAITING;
         fd_set rfds;
         FD_ZERO(&rfds); FD_SET(s, &rfds);
+        if (watchListen) FD_SET(ls, &rfds);
         timeval tv { 0, 100000 };
         int r = select(0, &rfds, nullptr, nullptr, &tv);
         if (r < 0) break;
-        if (r == 0) continue;
+
+        if (watchListen && r > 0 && FD_ISSET(ls, &rfds)) {
+            Waiting w;
+            if (AcceptOne(ls, w)) {
+                m_waiting.push_back(w);
+                Post(RelayEvent::Kind::ClientWaiting, (int)m_waiting.size(), w.addr);
+            }
+        }
+        if (GetTickCount64() - lastSweep >= 250) {
+            lastSweep = GetTickCount64();
+            SweepWaiting();
+        }
+        if (r == 0 || !FD_ISSET(s, &rfds)) continue;
 
         int n = recv(s, (char*)buf.data(), (int)buf.size(), 0);
         if (n == 0) break;
@@ -494,50 +513,40 @@ void RelayNetwork::TargetRecvLoop(SOCKET s)
 
 // ---- UdpLoop ---------------------------------------------------
 // One thread serves both directions. The "client" is whoever sent the last
-// datagram; replies from the target go to that address.
+// datagram; replies from the target go to that exact endpoint. The listen
+// socket is dual-stack; the target socket has the family of the target.
 
-void RelayNetwork::UdpLoop(int listenPort, std::string host, int targetPort)
+void RelayNetwork::UdpLoop(int listenPort, std::wstring host, int targetPort)
 {
-    SOCKET ls = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (ls == INVALID_SOCKET) { FatalStop(WSAGetLastError(), L"socket() failed"); return; }
+    int err = 0;
+    SOCKET ls = NetAddr::CreateListenSocket(SOCK_DGRAM, listenPort, err);
+    if (ls == INVALID_SOCKET) { FatalStop(err, ListenFailText(listenPort, err)); return; }
     DisableUdpConnReset(ls);
 
-    sockaddr_in addr = {};
-    addr.sin_family      = AF_INET;
-    addr.sin_port        = htons((u_short)listenPort);
-    addr.sin_addr.s_addr = INADDR_ANY;
-    if (bind(ls, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        int e = WSAGetLastError();
-        closesocket(ls);
-        FatalStop(e, L"bind() failed on port " + std::to_wstring(listenPort) + L": " + WsaMessage(e));
-        return;
-    }
-
-    sockaddr_in taddr = {};
-    int rc = ResolveV4(host, targetPort, taddr);
+    std::vector<NetAddr::Endpoint> eps;
+    int rc = NetAddr::Resolve(host, targetPort, SOCK_DGRAM, m_stopRequested, eps);
     if (rc != 0) {
         closesocket(ls);
-        FatalStop(rc, L"Failed to resolve target: " + Utils::ToWide(host));
+        if (rc != WSA_E_CANCELLED)
+            FatalStop(rc, L"Failed to resolve target: " + NetAddr::JoinHostPort(host, targetPort));
         return;
     }
-    SOCKET ts = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (ts == INVALID_SOCKET || ::connect(ts, (sockaddr*)&taddr, sizeof(taddr)) == SOCKET_ERROR) {
-        int e = WSAGetLastError();
-        if (ts != INVALID_SOCKET) closesocket(ts);
+    SOCKET ts = NetAddr::Connect(eps, SOCK_DGRAM, 0, m_stopRequested, err, true);
+    if (ts == INVALID_SOCKET) {
         closesocket(ls);
-        FatalStop(e, L"Cannot create the target socket: " + WsaMessage(e));
+        if (err != WSA_E_CANCELLED)
+            FatalStop(err, L"Cannot create the target socket: " + WsaMessage(err));
         return;
     }
     DisableUdpConnReset(ts);
     SetNonBlocking(ls);
-    SetNonBlocking(ts);
 
     PublishSocket(m_listenSock, m_clientSendMutex, ls);
     PublishSocket(m_targetSock, m_targetSendMutex, ts);
     m_listening       = true;
     m_targetConnected = true;
-    PostRetry(WM_RELAY_LISTENING, (WPARAM)listenPort, 0);
-    PostRetry(WM_RELAY_TARGET_CONN, 0, 0);
+    Post(RelayEvent::Kind::Listening, listenPort);
+    Post(RelayEvent::Kind::TargetConn);
 
     std::vector<BYTE> buf(65536);
     while (!m_stopRequested) {
@@ -549,22 +558,17 @@ void RelayNetwork::UdpLoop(int listenPort, std::string host, int targetPort)
         if (r == 0) continue;
 
         if (FD_ISSET(ls, &rfds)) {
-            sockaddr_in from = {};
-            int fromLen = sizeof(from);
-            int n = recvfrom(ls, (char*)buf.data(), (int)buf.size(), 0, (sockaddr*)&from, &fromLen);
+            NetAddr::Endpoint from;
+            from.len = sizeof(from.addr);
+            int n = recvfrom(ls, (char*)buf.data(), (int)buf.size(), 0, from.sa(), &from.len);
             if (n > 0) {
                 bool isNew;
                 {
                     std::lock_guard<std::mutex> lk(m_clientSendMutex);
-                    isNew = !m_clientConnected ||
-                            from.sin_addr.s_addr != m_udpClientAddr.sin_addr.s_addr ||
-                            from.sin_port != m_udpClientAddr.sin_port;
-                    if (isNew) { m_udpClientAddr = from; m_clientConnected = true; }
+                    isNew = !m_clientConnected || !NetAddr::Same(from, m_udpClient);
+                    if (isNew) { m_udpClient = from; m_clientConnected = true; }
                 }
-                if (isNew) {
-                    auto* a = new std::wstring(AddrStr(from));
-                    if (!PostRetry(WM_RELAY_CLIENT_CONN, 0, (LPARAM)a)) delete a;
-                }
+                if (isNew) Post(RelayEvent::Kind::ClientConn, 0, NetAddr::ToString(from));
                 HandleData(true, buf.data(), n);
             }
         }

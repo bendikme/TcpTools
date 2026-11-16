@@ -139,9 +139,10 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
                 L"\u2500\u2500\u2500 GETTING STARTED \u2500\u2500\u2500\n"
                 L"\n"
                 L"1. Enter the server address and port at the top.\n"
-                L"You can type host:port (e.g. 192.168.1.10:502) "
+                L"The host can be a name, an IPv4 or an IPv6 address. "
+                L"You can type host:port (192.168.1.10:502, [::1]:502) "
                 L"and both fields are filled automatically.\n"
-                L"2. Choose TCP or UDP and set the timeout (IPv4 only).\n"
+                L"2. Choose TCP or UDP and set the timeout.\n"
                 L"3. Click Connect (or enable Auto-Connect). Disconnect "
                 L"also cancels a connection attempt in progress.\n"
                 L"4. Type data in the Send editor and click Send.\n"
@@ -162,8 +163,9 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
                 L"\u2022 Cyclic Send \u2014 Repeat the payload at a timed "
                 L"interval (down to 1 ms) for stress testing.\n"
                 L"\u2022 Auto-Connect \u2014 Connect on demand when sending.\n"
-                L"\u2022 Auto-Disconnect \u2014 Drop the connection right after "
-                L"each send (a response not yet received is lost).\n"
+                L"\u2022 Auto-Disconnect \u2014 End the session after each send, "
+                L"but only when the reply is in: when the peer closes, 250 ms "
+                L"after the last data, or 1 s after the send if nothing arrives.\n"
                 L"\u2022 Keep-Alive \u2014 Detect broken TCP connections early.\n"
                 L"\u2022 Load/Save \u2014 Load a file (up to 64 MB) as the data to "
                 L"send, exactly as it is on disk; save the last received "
@@ -202,27 +204,8 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
         return 0;
 
     // ---- Network messages ------------------------------------
-    case WM_NET_CONNECTED:
-        if (self) self->OnNetConnected();
-        return 0;
-    case WM_NET_DISCONNECTED:
-        if (self) self->OnNetDisconnected(wParam != 0);
-        return 0;
-    case WM_NET_DATA_RECEIVED:
-        if (self) self->OnNetDataReceived((size_t)wParam, (BYTE*)lParam);
-        return 0;
-    case WM_NET_SEND_COMPLETE:
-        if (self) self->OnNetSendComplete((size_t)wParam, (CycleStats*)lParam);
-        return 0;
-    case WM_NET_ERROR:
-        if (self) self->OnNetError((int)wParam, (std::wstring*)lParam);
-        return 0;
-    case WM_NET_RECV_LATENCY:
-        if (self) {
-            // Reconstruct int64 latency (microseconds) from lo32/hi32
-            int64_t latUs = (int64_t)(DWORD)wParam | ((int64_t)(DWORD)lParam << 32);
-            self->OnNetLatency(latUs / 1000.0);
-        }
+    case WM_NET_QUEUE:
+        if (self) self->OnNetQueue();
         return 0;
     case WM_CTLCOLORSTATIC:
     {
@@ -1077,17 +1060,26 @@ void MainWindow::OnHostComboSelChange()
 
 void MainWindow::DoParseComboParts()
 {
-    std::wstring text = Utils::GetWindowText(m_hComboHost);
-    auto pos = text.rfind(L':');
-    if (pos != std::wstring::npos && pos > 0 && pos < text.size() - 1) {
-        std::wstring host = text.substr(0, pos);
-        std::wstring port = text.substr(pos + 1);
-        int p = 0;
-        if (Utils::IsValidPort(port, p)) {
-            SetWindowTextW(m_hComboHost, host.c_str());
-            SetWindowTextW(m_hEditPort, port.c_str());
-        }
+    // A bare IPv6 address is a host; only "host:port" and "[v6]:port" carry a port.
+    NetAddr::HostPort hp;
+    if (NetAddr::SplitHostPort(Utils::GetWindowText(m_hComboHost), hp) && hp.hasPort) {
+        SetWindowTextW(m_hComboHost, hp.host.c_str());
+        SetWindowTextW(m_hEditPort, std::to_wstring(hp.port).c_str());
     }
+}
+
+// The host as it is connected to: brackets and an attached port removed.
+std::wstring MainWindow::CurrentHost()
+{
+    const std::wstring text = Utils::GetWindowText(m_hComboHost);
+    NetAddr::HostPort hp;
+    return NetAddr::SplitHostPort(text, hp) ? hp.host : text;
+}
+
+// "host:port" / "[v6]:port" of the current fields, for title, log and history.
+std::wstring MainWindow::CurrentTarget()
+{
+    return NetAddr::JoinHostPort(CurrentHost(), _wtoi(Utils::GetWindowText(m_hEditPort).c_str()));
 }
 
 // ============================================================
@@ -1154,23 +1146,17 @@ bool MainWindow::DoConnect()
     if (m_sessionActive) return false;
 
     // Parse "host:port" from combo if the user typed/pasted a combined value
-    std::wstring hostW = Utils::GetWindowText(m_hComboHost);
-    auto colon = hostW.rfind(L':');
-    if (colon != std::wstring::npos && colon > 0 && colon < hostW.size() - 1) {
-        std::wstring maybePort = hostW.substr(colon + 1);
-        int p = 0;
-        if (Utils::IsValidPort(maybePort, p)) {
-            hostW = hostW.substr(0, colon);
-            SetWindowTextW(m_hComboHost, hostW.c_str());
-            SetWindowTextW(m_hEditPort, maybePort.c_str());
-        }
-    }
-
-    // Validate host/IP
-    if (!Utils::IsValidHostOrIP(hostW)) {
-        MessageBoxW(m_hWnd, L"Please enter a valid hostname or IPv4 address.", L"Invalid host", MB_ICONWARNING);
+    NetAddr::HostPort hp;
+    if (!NetAddr::SplitHostPort(Utils::GetWindowText(m_hComboHost), hp) || !NetAddr::IsValidHost(hp.host)) {
+        MessageBoxW(m_hWnd, L"Please enter a valid hostname, IPv4 or IPv6 address "
+                            L"(for example 192.168.1.10, myserver.local, ::1 or [::1]:502).",
+                    L"Invalid host", MB_ICONWARNING);
         SetFocus(m_hComboHost);
         return false;
+    }
+    if (hp.hasPort) {
+        SetWindowTextW(m_hComboHost, hp.host.c_str());
+        SetWindowTextW(m_hEditPort, std::to_wstring(hp.port).c_str());
     }
 
     // Validate port
@@ -1213,6 +1199,7 @@ void MainWindow::DoDisconnect()
 {
     m_pendingAutoSend    = false;
     m_pendingCyclicStart = false;
+    m_sendAfterClose     = false;
     // The cyclic thread notices the stop flag / the closed session by itself and
     // reports back with WM_CYCLIC_UPDATE; nothing here waits for it.
     if (m_cyclicRunning) m_cyclicStop = true;
@@ -1230,6 +1217,14 @@ void MainWindow::DoDisconnect()
 
 void MainWindow::DoSend()
 {
+    // The session is winding down after an Auto-Disconnect send (waiting for the
+    // reply to finish): this send belongs to the next session.
+    if (m_lingering) {
+        if (Button_GetCheck(m_hChkAutoConnect) == BST_CHECKED) m_sendAfterClose = true;
+        else MessageBoxW(m_hWnd, L"Not connected.", L"Not connected", MB_ICONWARNING);
+        return;
+    }
+
     // Auto-connect if enabled and not connected. A flag instead of a retry message:
     // OnNetConnected() calls DoSend() exactly once when the connection is up.
     if (!m_connected && Button_GetCheck(m_hChkAutoConnect) == BST_CHECKED) {
@@ -1415,7 +1410,7 @@ void MainWindow::DoLoadFile()
 bool MainWindow::BuildNetConfig(NetConfig& cfg, bool forSend)
 {
     cfg = NetConfig();
-    cfg.host          = Utils::ToUTF8(Utils::GetWindowText(m_hComboHost));
+    cfg.host          = Utils::ToUTF8(CurrentHost());
     cfg.port          = Utils::GetDlgInt(m_hWnd, IDC_EDIT_PORT, 9000);
     cfg.timeoutSec    = std::clamp(Utils::GetDlgInt(m_hWnd, IDC_EDIT_TIMEOUT, 5), 0, 3600);
     cfg.keepAlive     = Button_GetCheck(m_hChkKeepAlive) == BST_CHECKED;
@@ -1543,23 +1538,10 @@ void MainWindow::RefreshDiagnostics()
     std::wstring info;
     bool ok = m_net->WithSocket([&](SOCKET sock) {
 
-    // Local endpoint
-    sockaddr_in localAddr = {};
-    int localLen = sizeof(localAddr);
-    if (getsockname(sock, (sockaddr*)&localAddr, &localLen) == 0) {
-        wchar_t ip[64]; DWORD ipLen = 64;
-        WSAAddressToStringW((sockaddr*)&localAddr, localLen, nullptr, ip, &ipLen);
-        info += L"Local: " + std::wstring(ip) + L"  ";
-    }
-
-    // Remote endpoint
-    sockaddr_in remoteAddr = {};
-    int remoteLen = sizeof(remoteAddr);
-    if (getpeername(sock, (sockaddr*)&remoteAddr, &remoteLen) == 0) {
-        wchar_t ip[64]; DWORD ipLen = 64;
-        WSAAddressToStringW((sockaddr*)&remoteAddr, remoteLen, nullptr, ip, &ipLen);
-        info += L"Remote: " + std::wstring(ip) + L"\r\n";
-    }
+    // Local / remote endpoint (IPv4 or IPv6)
+    const std::wstring local = NetAddr::LocalName(sock), remote = NetAddr::PeerName(sock);
+    if (!local.empty())  info += L"Local: " + local + L"  ";
+    if (!remote.empty()) info += L"Remote: " + remote + L"\r\n";
 
     // SO_SNDBUF / SO_RCVBUF
     int sndbuf = 0, rcvbuf = 0, optLen = sizeof(int);
@@ -1622,6 +1604,7 @@ void MainWindow::SetConnectionUI(ConnState st)
 {
     m_sessionActive = (st != CS_IDLE);
     m_connected     = (st == CS_CONNECTED);
+    if (st != CS_CONNECTED) m_lingering = false;
     EnableWindow(m_hBtnConnect,    !m_sessionActive);
     EnableWindow(m_hBtnDisconnect,  m_sessionActive);
     UpdateSendEnable();
@@ -1637,8 +1620,7 @@ void MainWindow::SetConnectionUI(ConnState st)
     std::wstring detail;
     if (m_sessionActive) {
         bool isUdp = (SendMessage(m_hComboProtocol, CB_GETCURSEL, 0, 0) == 1);
-        detail = std::wstring(isUdp ? L"UDP " : L"") + Utils::GetWindowText(m_hComboHost)
-                 + L":" + Utils::GetWindowText(m_hEditPort);
+        detail = std::wstring(isUdp ? L"UDP " : L"") + CurrentTarget();
     }
     switch (st) {
     case CS_CONNECTED:
@@ -1673,10 +1655,8 @@ void MainWindow::OnNetConnected()
     // Save connection to history. Other pages write the same file, so merge with
     // what is on disk instead of overwriting it with this page's older copy.
     {
-        std::wstring host = Utils::GetWindowText(m_hComboHost);
-        std::wstring port = Utils::GetWindowText(m_hEditPort);
         m_connHistory = Utils::LoadHistory(L"TcpClient");
-        Utils::SaveHistory(L"TcpClient", host + L":" + port, m_connHistory);
+        Utils::SaveHistory(L"TcpClient", CurrentTarget(), m_connHistory);
         PopulateHostCombo();
     }
 
@@ -1686,9 +1666,7 @@ void MainWindow::OnNetConnected()
     LogEntry le;
     le.type      = LogType::Connected;
     le.timestamp = Utils::NowTimestamp();
-    le.preview   = std::wstring(L"[") + proto + L"] Connected to "
-                   + Utils::GetWindowText(m_hComboHost)
-                   + L":" + Utils::GetWindowText(m_hEditPort);
+    le.preview   = std::wstring(L"[") + proto + L"] Connected to " + CurrentTarget();
     le.byteCount = 0;
     AddLogEntry(std::move(le));
 
@@ -1710,15 +1688,12 @@ void MainWindow::OnNetConnected()
         li.preview = infoBuf;
         AddLogEntry(std::move(li));
 
-        sockaddr_in localAddr = {};
-        int localLen = sizeof(localAddr);
-        if (getsockname(sock, (sockaddr*)&localAddr, &localLen) == 0) {
-            wchar_t ip[64] = {}; DWORD ipLen = 64;
-            WSAAddressToStringW((sockaddr*)&localAddr, localLen, nullptr, ip, &ipLen);
+        const std::wstring local = NetAddr::LocalName(sock);
+        if (!local.empty()) {
             LogEntry li2;
             li2.type = LogType::Info;
             li2.timestamp = Utils::NowTimestamp();
-            li2.preview = L"Local endpoint: " + std::wstring(ip);
+            li2.preview = L"Local endpoint: " + local;
             AddLogEntry(std::move(li2));
         }
     });
@@ -1744,7 +1719,51 @@ void MainWindow::OnNetConnected()
     }
 }
 
-void MainWindow::OnNetDisconnected(bool neverConnected)
+// Drains the hand-off queue one slice at a time (the queue wakes us again when
+// more is left, so clicks and paints get in between). Data of one slice is shown
+// with one append and one log entry; the list view and the labels are updated
+// once. Events keep their order: data is flushed before any other event.
+// 64 KB: the Edit control needs ~0.1 s per such slice, so a click waits ~0.3 s at most.
+static constexpr size_t DRAIN_SLICE_BYTES = 64 * 1024;
+
+void MainWindow::OnNetQueue()
+{
+    if (!m_net) return;
+    std::vector<NetEvent> events = m_net->Drain(DRAIN_SLICE_BYTES);
+    if (events.empty()) return;
+
+    m_logBatch = true;
+    std::vector<BYTE> slice;
+    double lat = -1;
+    auto flushData = [&] {
+        if (slice.empty()) return;
+        OnNetData(std::move(slice), lat);
+        slice.clear();
+        lat = -1;
+    };
+
+    for (NetEvent& ev : events) {
+        if (ev.kind == NetEvent::Kind::Data) {
+            if (lat < 0) lat = ev.latMs;
+            slice.insert(slice.end(), ev.data.begin(), ev.data.end());
+            continue;
+        }
+        flushData();
+        switch (ev.kind) {
+        case NetEvent::Kind::Connected:    OnNetConnected(); break;
+        case NetEvent::Kind::Disconnected: OnNetDisconnected(ev.code != 0, ev.flag); break;
+        case NetEvent::Kind::SendComplete: OnNetSendComplete(ev); break;
+        case NetEvent::Kind::Error:        OnNetError(ev.text); break;
+        default: break;
+        }
+    }
+    flushData();
+
+    m_logBatch = false;
+    SyncLogView();
+}
+
+void MainWindow::OnNetDisconnected(bool neverConnected, bool byAutoDisconnect)
 {
     m_pendingAutoSend    = false; // cancel pending auto-send if connection dropped
     m_pendingCyclicStart = false;
@@ -1762,20 +1781,25 @@ void MainWindow::OnNetDisconnected(bool neverConnected)
         le.type      = neverConnected ? LogType::Info : LogType::Disconnected;
         le.timestamp = Utils::NowTimestamp();
         le.preview   = std::wstring(L"[") + proto + L"] "
-                       + (neverConnected ? L"Connection attempt cancelled" : L"Disconnected (connection closed)");
+                       + (neverConnected ? L"Connection attempt cancelled"
+                          : byAutoDisconnect ? L"Disconnected (Auto-Disconnect, reply complete)"
+                                             : L"Disconnected (connection closed)");
         le.byteCount = 0;
         AddLogEntry(std::move(le));
     }
 
     RefreshDiagnostics();
+
+    // A Send was clicked while this session was ending: it goes out on a new one.
+    if (m_sendAfterClose) {
+        m_sendAfterClose = false;
+        if (!neverConnected && !hadError) DoSend();
+    }
 }
 
-void MainWindow::OnNetDataReceived(size_t len, BYTE* pData)
+void MainWindow::OnNetData(std::vector<BYTE>&& chunk, double latMs)
 {
-    // Takes ownership of pData
-    std::vector<BYTE> chunk(pData, pData + len);
-    delete[] pData;
-
+    const size_t len = chunk.size();
     // Accumulate total bytes
     m_totalBytesRecv += len;
 
@@ -1805,6 +1829,7 @@ void MainWindow::OnNetDataReceived(size_t len, BYTE* pData)
     le.preview   = std::wstring(L"[") + proto + L"] " + MakePreview(chunk.data(), chunk.size());
     le.data      = std::move(chunk);
     AddLogEntry(std::move(le));
+    if (latMs >= 0) OnNetLatency(latMs);
 
     // Update total stats labels
     {
@@ -1830,17 +1855,20 @@ void MainWindow::OnNetLatency(double latMs)
     }
 }
 
-void MainWindow::OnNetSendComplete(size_t bytesSent, CycleStats* pStats)
+void MainWindow::OnNetSendComplete(const NetEvent& ev)
 {
-    CycleStats s;
-    if (pStats) { s = *pStats; delete pStats; }
+    const CycleStats& s = ev.stats;
 
     // Accumulate total bytes
-    m_totalBytesSent += bytesSent;
+    m_totalBytesSent += ev.bytesSent;
 
     if (m_connected && !m_lastError.empty()) {   // a non-fatal error (UDP) is over
         m_lastError.clear();
         SetWindowTextW(m_hStaticStatus, L"● Connected");
+    }
+    if (ev.flag && m_connected) {                // Auto-Disconnect: waiting for the reply to end
+        m_lingering = true;
+        SetWindowTextW(m_hStaticStatus, L"● Connected - closing after the reply");
     }
 
     // During cyclic mode, skip log entry updates (no individual log entries)
@@ -1866,13 +1894,11 @@ void MainWindow::OnNetSendComplete(size_t bytesSent, CycleStats* pStats)
 
 // Errors come from the network thread, possibly while another tab is in front,
 // so they go to the log and the status line, never to a modal box. The session
-// end (WM_NET_DISCONNECTED) follows for every fatal one.
-void MainWindow::OnNetError(int /*wsaErr*/, std::wstring* pMsg)
+// end (a Disconnected event) follows for every fatal one.
+void MainWindow::OnNetError(const std::wstring& msg)
 {
     m_pendingAutoSend    = false;
     m_pendingCyclicStart = false;
-    std::wstring msg;
-    if (pMsg) { msg = *pMsg; delete pMsg; }
 
     m_lastError = msg;
     if (m_sessionActive)
@@ -2008,10 +2034,22 @@ void MainWindow::AddLogEntry(LogEntry&& e)
     if (!PassesLogFilter(le.type, m_logFilter)) return;
 
     m_logVisible.push_back(origIdx);
+    if (m_logBatch) { m_logDirty = true; return; }   // SyncLogView does the list view once per batch
     int count = (int)m_logVisible.size();
     ListView_SetItemCountEx(m_hListLog, count, LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL);
     ListView_RedrawItems(m_hListLog, count - 1, count - 1);
     ListView_EnsureVisible(m_hListLog, count - 1, FALSE);
+}
+
+void MainWindow::SyncLogView()
+{
+    if (!m_logDirty) return;
+    m_logDirty = false;
+    const int old   = ListView_GetItemCount(m_hListLog);
+    const int count = (int)m_logVisible.size();
+    ListView_SetItemCountEx(m_hListLog, count, LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL);
+    if (count > old) ListView_RedrawItems(m_hListLog, old, count - 1);
+    if (count > 0)   ListView_EnsureVisible(m_hListLog, count - 1, FALSE);
 }
 
 // ============================================================
@@ -2159,9 +2197,11 @@ void MainWindow::CreateTooltips()
         L"You can type a new address or pick one from the dropdown, "
         L"which stores your recent connections automatically.\n\n"
         L"Supported formats:\n"
-        L"\u2022 IPv4 address: 192.168.1.10 (IPv6 is not supported)\n"
+        L"\u2022 IPv4 address: 192.168.1.10\n"
+        L"\u2022 IPv6 address: ::1 or fe80::1%12 (with scope)\n"
         L"\u2022 Hostname: myserver.local\n"
         L"\u2022 host:port shortcut: 192.168.1.10:9001\n"
+        L"   or [::1]:9001 for IPv6 (brackets)\n"
         L"   (auto-fills both Host and Port fields)");
 
     tip(m_hEditPort,
@@ -2216,8 +2256,12 @@ void MainWindow::CreateTooltips()
 
     tip(m_hChkAutoDisc,
         L"Auto-Disconnect after every send.\n\n"
-        L"The connection is closed immediately after each payload "
-        L"is transmitted; a response that has not arrived yet is lost. Useful for protocols that expect a fresh "
+        L"After each payload the session stays open just long enough to "
+        L"receive the reply, then it is closed. It ends when the peer "
+        L"closes the connection, or 250 ms after the last data has "
+        L"arrived, or 1 s after the send if nothing arrives at all. "
+        L"Nothing is half-closed before that, because some devices treat "
+        L"that as an abort. Useful for protocols that expect a fresh "
         L"connection per request (e.g. some HTTP/1.0 or industrial "
         L"protocols).\n\n"
         L"Can be combined with Auto-Connect for fully automatic "
@@ -2327,8 +2371,8 @@ void MainWindow::CreateTooltips()
         L"The counter shows how many sends have been executed.\n\n"
         L"Click again to stop the cycle.\n\n"
         L"The cycle ends by itself if the connection is lost or a send "
-        L"fails. With Auto-Disconnect the connection is closed after the first "
-        L"send, which ends the cycle.");
+        L"fails. With Auto-Disconnect the session ends after the first "
+        L"send (once its reply is in), which ends the cycle.");
 
     tip(m_hStaticCyclicCount,
         L"Cyclic send counter.\n\n"

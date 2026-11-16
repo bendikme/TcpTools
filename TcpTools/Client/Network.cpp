@@ -46,13 +46,17 @@ static std::vector<BYTE> ApplySeparator(const std::vector<BYTE>& raw, const NetC
     return out;
 }
 
+static int64_t NowMs()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 // ============================================================
-//  Core - everything the session threads touch. Owned through shared_ptr by
-//  the TcpNetwork handle and by the worker thread, so neither can outlive the
-//  data the other one uses.
+//  Core - everything the session threads touch.
 //
 //  Locking (always in this order): sendMu -> mu.
-//    mu      guards `notify` and `sock`
+//    mu      guards `sock`
 //    sendMu  held for the whole of a ::send(); the socket is closed under it,
 //            so a sender never uses a closed (or recycled) handle
 //  Only the worker closes the socket, and only after joining its send thread.
@@ -60,29 +64,29 @@ static std::vector<BYTE> ApplySeparator(const std::vector<BYTE>& raw, const NetC
 //  select/recv/send calls.
 // ============================================================
 
-static std::wstring ErrText(int err)
-{
-    wchar_t buf[256] = {};
-    DWORD n = FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-                             nullptr, (DWORD)err, 0, buf, 256, nullptr);
-    std::wstring s(buf, n);
-    while (!s.empty() && (s.back() == L'\r' || s.back() == L'\n' || s.back() == L' ' || s.back() == L'.'))
-        s.pop_back();
-    if (s.empty()) s = L"error";
-    return s + L" (" + std::to_wstring(err) + L")";
-}
-
 struct TcpNetwork::Core
 {
     std::mutex          mu;
-    HWND                notify {nullptr};
     SOCKET              sock   {INVALID_SOCKET};
     std::mutex          sendMu;
+
+    // The one channel to the window. Data waits when the window falls behind;
+    // `stop` wakes a waiting Push.
+    HandoffQueue<NetEvent> events;
 
     std::atomic<bool>   connected {false};
     std::atomic<bool>   stop      {false};
     std::atomic<bool>   running   {false};
     bool                udp       {false};
+
+    // Auto-Disconnect state (see AUTODISC_*): `closing` is set when a send with
+    // Auto-Disconnect is done; from then on no further send is accepted and the
+    // receive loop ends the session by the quiet-time rules.
+    std::atomic<bool>    closing       {false};
+    std::atomic<bool>    endedByAuto   {false};
+    std::atomic<int64_t> sendStartMs   {0};
+    std::atomic<int64_t> sendEndMs     {0};
+    std::atomic<int64_t> lastRecvMs    {0};
 
     std::queue<SendRequest> queue;
     std::mutex              qMu;
@@ -92,27 +96,15 @@ struct TcpNetwork::Core
     CycleStats          stats;
     std::mutex          statsMu;
 
-    // Delivers a message unless the window is gone. False = not delivered.
-    bool Post(UINT msg, WPARAM w, LPARAM l)
-    {
-        std::lock_guard<std::mutex> lk(mu);
-        if (!notify) return false;
-        return PostMessageW(notify, msg, w, l) != FALSE;
-    }
-    // Like Post, but waits while the UI's message queue is full (back-pressure).
-    bool PostWait(UINT msg, WPARAM w, LPARAM l)
-    {
-        while (!Post(msg, w, l)) {
-            { std::lock_guard<std::mutex> lk(mu); if (!notify) return false; }
-            if (stop) return false;
-            Sleep(5);
-        }
-        return true;
-    }
+    // State changes never wait; data waits for room (weight = payload size).
+    void Emit(NetEvent&& ev, size_t weight = 0) { events.Push(std::move(ev), weight, stop); }
     void PostError(int err, const std::wstring& msg)
     {
-        auto* p = new std::wstring(msg);
-        if (!Post(WM_NET_ERROR, (WPARAM)err, (LPARAM)p)) delete p;
+        NetEvent ev;
+        ev.kind = NetEvent::Kind::Error;
+        ev.code = err;
+        ev.text = msg;
+        Emit(std::move(ev));
     }
 
     void ShutdownSocket()
@@ -129,80 +121,42 @@ struct TcpNetwork::Core
     }
     void Abandon()   // the owner is going away: no more posts
     {
-        { std::lock_guard<std::mutex> lk(mu); notify = nullptr; }
+        events.Close();
         RequestStop();
     }
 
-    bool ConnectSocket(SOCKET s, const NetConfig& cfg);
+    SOCKET OpenSocket(const NetConfig& cfg);
     void Run(NetConfig cfg);
     void RecvLoop(SOCKET s);
     void SendLoop();
     bool Send(const std::vector<BYTE>& raw, const NetConfig& cfg);
 };
 
-bool TcpNetwork::Core::ConnectSocket(SOCKET s, const NetConfig& cfg)
+// Resolves and connects over every address of the host; reports a failure as an
+// Error event. INVALID_SOCKET also when cancelled (then without an error).
+SOCKET TcpNetwork::Core::OpenSocket(const NetConfig& cfg)
 {
-    u_long nb = 1;
-    ioctlsocket(s, FIONBIO, &nb);
+    const int socktype = udp ? SOCK_DGRAM : SOCK_STREAM;
+    const std::wstring host   = Utils::ToWide(cfg.host);
+    const std::wstring target = NetAddr::JoinHostPort(host, cfg.port);
 
-    // Name lookup cannot be interrupted; `stop` is checked right after it.
-    addrinfo hints = {}, *res = nullptr;
-    hints.ai_family   = AF_INET;
-    hints.ai_socktype = udp ? SOCK_DGRAM : SOCK_STREAM;
-    std::string portStr = std::to_string(cfg.port);
-    int gai = getaddrinfo(cfg.host.c_str(), portStr.c_str(), &hints, &res);
-    if (gai != 0 || !res) {
-        int e = gai ? gai : WSAHOST_NOT_FOUND;
-        if (!stop) PostError(e, L"Cannot resolve host '" + Utils::ToWide(cfg.host) + L"': " + ErrText(e));
-        if (res) freeaddrinfo(res);
-        return false;
-    }
-    sockaddr_in addr = {};
-    memcpy(&addr, res->ai_addr, std::min<size_t>(res->ai_addrlen, sizeof(addr)));
-    freeaddrinfo(res);
-    if (stop) return false;
-
-    const std::wstring target = Utils::ToWide(cfg.host) + L":" + std::to_wstring(cfg.port);
-    if (::connect(s, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        int e = WSAGetLastError();
-        if (e != WSAEWOULDBLOCK) {
-            PostError(e, L"Connection to " + target + L" failed: " + ErrText(e));
-            return false;
-        }
-        // Wait in short slices so Disconnect() can cancel; timeout 0 = no limit.
-        const bool limited = cfg.timeoutSec > 0;
-        auto deadline = Utils::Now() + std::chrono::seconds(limited ? cfg.timeoutSec : 0);
-        fd_set wfds, efds;
-        for (;;) {
-            if (stop) return false;
-            FD_ZERO(&wfds); FD_SET(s, &wfds);
-            FD_ZERO(&efds); FD_SET(s, &efds);
-            timeval tv { 0, 100000 };
-            int r = select(0, nullptr, &wfds, &efds, &tv);
-            if (r < 0) {
-                e = WSAGetLastError();
-                if (!stop) PostError(e, L"Connection to " + target + L" failed: " + ErrText(e));
-                return false;
-            }
-            if (r > 0) break;
-            if (limited && Utils::Now() >= deadline) {
-                PostError(WSAETIMEDOUT, L"Connection to " + target + L" timed out after "
-                          + std::to_wstring(cfg.timeoutSec) + L" s");
-                return false;
-            }
-        }
-        int soErr = 0, len = sizeof(soErr);
-        getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&soErr, &len);
-        if (soErr == 0 && FD_ISSET(s, &efds)) soErr = WSAECONNREFUSED;
-        if (soErr != 0) {
-            PostError(soErr, L"Connection to " + target + L" failed: " + ErrText(soErr));
-            return false;
-        }
+    std::vector<NetAddr::Endpoint> eps;
+    int rc = NetAddr::Resolve(host, cfg.port, socktype, stop, eps);
+    if (rc == WSA_E_CANCELLED || stop) return INVALID_SOCKET;
+    if (rc != 0) {
+        PostError(rc, L"Cannot resolve host '" + host + L"': " + NetAddr::ErrorText(rc));
+        return INVALID_SOCKET;
     }
 
-    nb = 0;
-    ioctlsocket(s, FIONBIO, &nb);
-    return true;
+    int err = 0;
+    SOCKET s = NetAddr::Connect(eps, socktype, cfg.timeoutSec > 0 ? cfg.timeoutSec * 1000 : 0, stop, err);
+    if (s != INVALID_SOCKET) return s;
+    if (err == WSA_E_CANCELLED || stop) return INVALID_SOCKET;
+    if (err == WSAETIMEDOUT)
+        PostError(err, L"Connection to " + target + L" timed out after " + std::to_wstring(cfg.timeoutSec) + L" s");
+    else
+        PostError(err, L"Connection to " + target + L" failed: " + NetAddr::ErrorText(err));
+    return INVALID_SOCKET;
 }
 
 void TcpNetwork::Core::Run(NetConfig cfg)
@@ -210,28 +164,26 @@ void TcpNetwork::Core::Run(NetConfig cfg)
     bool wasConnected = false;
     std::thread sender;
 
-    SOCKET s = socket(AF_INET, udp ? SOCK_DGRAM : SOCK_STREAM, udp ? IPPROTO_UDP : IPPROTO_TCP);
-    if (s == INVALID_SOCKET) {
-        int e = WSAGetLastError();
-        PostError(e, L"Cannot create socket: " + ErrText(e));
-    } else {
+    SOCKET s = stop ? INVALID_SOCKET : OpenSocket(cfg);
+    if (s != INVALID_SOCKET) {
         { std::lock_guard<std::mutex> lk(mu); sock = s; }
-
-        if (!udp) {
-            BOOL nodelay = TRUE;   // lowest latency
-            setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char*)&nodelay, sizeof(nodelay));
-            if (cfg.keepAlive) {
-                // Probe after 10 s idle, then every 1 s: a dead peer is noticed in ~20 s.
-                tcp_keepalive ka = { 1, 10000, 1000 };
-                DWORD ret = 0;
-                if (WSAIoctl(s, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), nullptr, 0, &ret, nullptr, nullptr) != 0) {
-                    BOOL on = TRUE;
-                    setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, (char*)&on, sizeof(on));
+        if (stop) {
+            // Disconnect arrived between the connect and publishing the socket.
+        } else {
+            if (!udp) {
+                BOOL nodelay = TRUE;   // lowest latency
+                setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char*)&nodelay, sizeof(nodelay));
+                if (cfg.keepAlive) {
+                    // Probe after 10 s idle, then every 1 s: a dead peer is noticed in ~20 s.
+                    tcp_keepalive ka = { 1, 10000, 1000 };
+                    DWORD ret = 0;
+                    if (WSAIoctl(s, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), nullptr, 0, &ret, nullptr, nullptr) != 0) {
+                        BOOL on = TRUE;
+                        setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, (char*)&on, sizeof(on));
+                    }
                 }
             }
-        }
 
-        if (!stop && ConnectSocket(s, cfg)) {
             // Blocking sends give up after the timeout (0 = never; Disconnect still wakes them).
             DWORD tv = (DWORD)std::max(0, cfg.timeoutSec) * 1000;
             setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char*)&tv, sizeof(tv));
@@ -249,7 +201,7 @@ void TcpNetwork::Core::Run(NetConfig cfg)
             }
             wasConnected = true;
             connected = true;
-            Post(WM_NET_CONNECTED, 0, 0);
+            { NetEvent ev; ev.kind = NetEvent::Kind::Connected; Emit(std::move(ev)); }
 
             sender = std::thread([this] { SendLoop(); });
             RecvLoop(s);
@@ -270,11 +222,16 @@ void TcpNetwork::Core::Run(NetConfig cfg)
         std::lock_guard<std::mutex> slk(sendMu);   // a cyclic Send() may still be inside
         std::lock_guard<std::mutex> lk(mu);
         if (sock != INVALID_SOCKET) { closesocket(sock); sock = INVALID_SOCKET; }
+        else if (s != INVALID_SOCKET) closesocket(s);
     }
 
-    // `running` goes false first: the UI may call Connect() as soon as it sees the message.
+    // `running` goes false first: the UI may call Connect() as soon as it sees the event.
     running = false;
-    Post(WM_NET_DISCONNECTED, wasConnected ? 0 : 1, 0);
+    NetEvent ev;
+    ev.kind = NetEvent::Kind::Disconnected;
+    ev.code = wasConnected ? 0 : 1;
+    ev.flag = endedByAuto.load();
+    Emit(std::move(ev));
 }
 
 void TcpNetwork::Core::RecvLoop(SOCKET s)
@@ -283,13 +240,25 @@ void TcpNetwork::Core::RecvLoop(SOCKET s)
     std::vector<BYTE> buf(BUF);
 
     while (!stop) {
+        // Auto-Disconnect: the reply is complete when it has gone quiet.
+        const bool closingNow = closing.load();
+        if (closingNow) {
+            const int64_t now = NowMs(), last = lastRecvMs.load();
+            const bool gotReply = last != 0 && last >= sendStartMs.load();
+            const int64_t idle = now - (gotReply ? last : sendEndMs.load());
+            if (idle >= (gotReply ? AUTODISC_QUIET_MS : AUTODISC_NO_REPLY_MS)) {
+                endedByAuto = true;
+                break;
+            }
+        }
+
         fd_set rfds;
         FD_ZERO(&rfds); FD_SET(s, &rfds);
-        timeval tv { 0, 100000 }; // 100ms poll
+        timeval tv { 0, closingNow ? 20000 : 100000 };   // finer polling while the quiet time is measured
         int r = select(0, &rfds, nullptr, nullptr, &tv);
         if (r < 0) {
             int e = WSAGetLastError();
-            if (!stop) PostError(e, L"Connection lost: " + ErrText(e));
+            if (!stop) PostError(e, L"Connection lost: " + NetAddr::ErrorText(e));
             break;
         }
         if (r == 0) continue;
@@ -301,9 +270,10 @@ void TcpNetwork::Core::RecvLoop(SOCKET s)
         }
         if (n < 0) {
             int e = WSAGetLastError();
-            if (!stop) PostError(e, L"Connection lost: " + ErrText(e));
+            if (!stop) PostError(e, L"Connection lost: " + NetAddr::ErrorText(e));
             break;
         }
+        lastRecvMs = NowMs();
 
         bool firstRecv = false;
         double latMs = -1;
@@ -321,16 +291,11 @@ void TcpNetwork::Core::RecvLoop(SOCKET s)
             stats.recvEnd = now;
         }
 
-        // Post data to UI (UI must free the BYTE*)
-        BYTE* copy = new BYTE[n];
-        memcpy(copy, buf.data(), n);
-        if (!PostWait(WM_NET_DATA_RECEIVED, (WPARAM)n, (LPARAM)copy)) { delete[] copy; break; }
-
-        if (firstRecv && latMs >= 0) {
-            int64_t latUs = (int64_t)(latMs * 1000.0);
-            Post(WM_NET_RECV_LATENCY, (WPARAM)(DWORD)(latUs & 0xFFFFFFFF),
-                 (LPARAM)(DWORD)((latUs >> 32) & 0xFFFFFFFF));
-        }
+        NetEvent ev;
+        ev.kind = NetEvent::Kind::Data;
+        ev.data.assign(buf.begin(), buf.begin() + n);
+        if (firstRecv) ev.latMs = latMs;
+        if (!events.Push(std::move(ev), (size_t)n, stop)) break;   // stopped or the window is gone
     }
 }
 
@@ -351,14 +316,14 @@ void TcpNetwork::Core::SendLoop()
 
 bool TcpNetwork::Core::Send(const std::vector<BYTE>& raw, const NetConfig& cfg)
 {
-    if (stop || !connected) return false;
+    if (stop || !connected || closing) return false;
 
     std::vector<BYTE> data = ApplySeparator(raw, cfg);
 
     std::lock_guard<std::mutex> lk(sendMu);
     SOCKET s;
     { std::lock_guard<std::mutex> mlk(mu); s = sock; }
-    if (s == INVALID_SOCKET || stop) return false;
+    if (s == INVALID_SOCKET || stop || closing) return false;
 
     {
         std::lock_guard<std::mutex> slk(statsMu);
@@ -368,6 +333,7 @@ bool TcpNetwork::Core::Send(const std::vector<BYTE>& raw, const NetConfig& cfg)
         stats.recvStart     = {};
         stats.recvEnd       = {};
     }
+    sendStartMs = NowMs();
 
     size_t sent = 0;
     while (sent < data.size()) {
@@ -376,7 +342,7 @@ bool TcpNetwork::Core::Send(const std::vector<BYTE>& raw, const NetConfig& cfg)
         if (n == SOCKET_ERROR) {
             int e = WSAGetLastError();
             if (!stop) {
-                PostError(e, L"Send failed: " + ErrText(e));
+                PostError(e, L"Send failed: " + NetAddr::ErrorText(e));
                 if (!udp) RequestStop();   // a TCP stream is in an unknown state after a failed send
             }
             return false;
@@ -384,16 +350,23 @@ bool TcpNetwork::Core::Send(const std::vector<BYTE>& raw, const NetConfig& cfg)
         sent += (size_t)n;
     }
 
-    auto* pStats = new CycleStats;
+    NetEvent ev;
+    ev.kind = NetEvent::Kind::SendComplete;
     {
         std::lock_guard<std::mutex> slk(statsMu);
         stats.sendEnd   = Utils::Now();
         stats.bytesSent = sent;
-        *pStats = stats;
+        ev.stats        = stats;
     }
-    if (!Post(WM_NET_SEND_COMPLETE, (WPARAM)sent, (LPARAM)pStats)) delete pStats;
+    ev.bytesSent = sent;
+    ev.flag      = cfg.autoDisconnect;
+    Emit(std::move(ev));
 
-    if (cfg.autoDisconnect) RequestStop();
+    if (cfg.autoDisconnect) {
+        // The session stays open for the reply; the receive loop ends it.
+        sendEndMs = NowMs();
+        closing   = true;
+    }
     return true;
 }
 
@@ -404,19 +377,13 @@ bool TcpNetwork::Core::Send(const std::vector<BYTE>& raw, const NetConfig& cfg)
 TcpNetwork::TcpNetwork(HWND notifyWnd)
     : m_core(std::make_shared<Core>())
 {
-    m_core->notify = notifyWnd;
+    m_core->events.SetTarget(notifyWnd, WM_NET_QUEUE);
 }
 
 TcpNetwork::~TcpNetwork()
 {
     m_core->Abandon();
-    if (m_worker.joinable()) {
-        // Normally the worker is done within ~100 ms, but it may be inside a name
-        // lookup that cannot be interrupted: never block the UI thread on that.
-        // It owns a reference to the Core, so letting it finish alone is safe.
-        if (!m_core->running) m_worker.join();
-        else                  m_worker.detach();
-    }
+    if (m_worker.joinable()) m_worker.join();
 }
 
 bool TcpNetwork::Connect(const NetConfig& cfg)
@@ -427,6 +394,11 @@ bool TcpNetwork::Connect(const NetConfig& cfg)
     m_core->udp = cfg.udpMode;
     m_core->stop = false;
     m_core->connected = false;
+    m_core->closing = false;
+    m_core->endedByAuto = false;
+    m_core->sendStartMs = 0;
+    m_core->sendEndMs = 0;
+    m_core->lastRecvMs = 0;
     m_core->running = true;
 
     std::shared_ptr<Core> core = m_core;
@@ -445,9 +417,14 @@ void TcpNetwork::Disconnect()
     if (m_core->running) m_core->RequestStop();
 }
 
+std::vector<NetEvent> TcpNetwork::Drain(size_t maxBytes)
+{
+    return m_core->events.Drain(maxBytes);
+}
+
 void TcpNetwork::QueueSend(std::vector<BYTE> data, const NetConfig& cfg)
 {
-    if (!m_core->connected || m_core->stop) return;
+    if (!m_core->connected || m_core->stop || m_core->closing) return;
     {
         std::lock_guard<std::mutex> lk(m_core->qMu);
         m_core->queue.push({std::move(data), cfg});

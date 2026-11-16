@@ -90,3 +90,7 @@
 
 #define WM_NET_LISTENING        (WM_APP + 6)   // server started listening
 #define WM_NET_STOPPED          (WM_APP + 7)   // server stopped
+
+// The one wake-up of the network hand-off queue (HandoffQueue<NetEvent>); the
+// WM_NET_* messages above are no longer posted, their ids stay reserved.
+#define WM_SERVER_EVENTS        (WM_APP + 30)

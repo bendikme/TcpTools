@@ -42,16 +42,17 @@ Settings and history are kept in `%APPDATA%\TcpTools\`.
 Connects to a TCP server or sends UDP datagrams.
 
 - Host / port (type `host:port` in the host field and both are filled in), protocol, connect timeout;
-  recent connections in the drop-down.
+  recent connections in the drop-down. Names, IPv4 and IPv6: `plc-17`, `10.0.0.5`, `::1`, `[2001:db8::5]:502`.
 - Send editor in text or **hex** (`48 65 6C 6C 6F`); load a file (binary files are sent byte-exact).
 - Framing: none, STX/ETX, CR LF, LF, CR, NUL, or a custom prefix/suffix in hex.
-- Auto-connect before a send, auto-disconnect after it, keep-alive, cyclic send down to 1 ms.
+- Auto-connect before a send, auto-disconnect after the reply, keep-alive, cyclic send down to 1 ms.
 - Receive view as text or hex dump, copy, save to file.
 - Log of every event with timing, socket diagnostics, statistics (latency, throughput, totals).
 
 ### Server
 
-Listens on a port (TCP: one client at a time; UDP: answers the last sender).
+Listens on a port, on IPv4 and IPv6 at once, and takes the port exclusively. TCP serves one client at a
+time — further clients wait their turn and the tab shows how many; UDP answers the last sender.
 
 - **Echo mode** returns everything it receives.
 - The same send editor, framing, receive view, log, diagnostics and statistics as the client.
@@ -60,7 +61,8 @@ Listens on a port (TCP: one client at a time; UDP: answers the last sender).
 
 Sits between a client and a target server and shows what passes in both directions.
 
-- Listens on a port and connects to the target; forwards client → target and target → client.
+- Listens on a port (IPv4 and IPv6) and connects to the target (name, IPv4 or IPv6); forwards
+  client → target and target → client. One client at a time; waiting clients are shown.
 - **Auto-forward** per direction; switched off, the packets wait until you press **Forward** or **Drop** —
   to hold back, delay or discard traffic by hand.
 - Both directions as text or hex dump, a log of every packet, statistics and socket diagnostics.
@@ -110,7 +112,15 @@ The result is `bin\Release\TcpTools.exe`. The release build links the C++ runtim
 ```
 
 starts the built `TcpTools.exe` and drives it end to end: server echo, the server's log file, the relay,
-the client tab in text and hex, UDP, and a clean exit while everything is connected.
+the client tab in text and hex, UDP, IPv6 and host names, responsiveness after a burst, stop/start cycles,
+waiting clients, the exclusive port, and a clean exit while everything is connected.
+
+### Release
+
+Push a tag `v<version>`: `.github/workflows/release.yml` runs `scripts\release.ps1` (build, tests, package)
+and publishes the GitHub release with `docs/release-notes/v<version>.md`. To sign the exe, add the
+repository secrets `TCPTOOLS_SIGN_PFX_BASE64` (the code-signing certificate as a base64 `.pfx`) and
+`TCPTOOLS_SIGN_PFX_PASSWORD`; locally, `scripts\release.ps1 -SignThumbprint <thumbprint>`.
 
 ### Version
 
@@ -125,7 +135,7 @@ The version is in `Version.h` only (`year.month.patch`); a release is tagged `v<
 | `TcpTools/main.cpp`       | entry point, command line, message loop                              |
 | `TcpTools/AppFrame.*`     | the main window: tab strip, pages, shortcuts, window placement       |
 | `TcpTools/Tools.h`        | how the frame creates a tool page                                    |
-| `TcpTools/Common/`        | shared code: `HexView` (hex dump control), `Utils.h` (strings, hex, DPI, history), `ToolHost.h` (page ↔ frame contract) |
+| `TcpTools/Common/`        | shared code: `HexView` (hex dump control), `Utils.h` (strings, hex, DPI, history), `NetAddr.h` (IPv4/IPv6 addresses, listen, lookup, connect), `HandoffQueue.h` (network thread → window), `ToolHost.h` (page ↔ frame contract) |
 | `TcpTools/Client/`        | the client page and its network class (namespace `Client`)           |
 | `TcpTools/Server/`        | the server page and its network class (namespace `Server`)           |
 | `TcpTools/Relay/`         | the relay page and its network class                                 |

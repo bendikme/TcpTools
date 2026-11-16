@@ -2,6 +2,7 @@
 #include "pch.h"
 #include "Utils.h"
 #include "RelayNetwork.h"
+#include "HandoffQueue.h"
 
 // ============================================================
 //  RelayMainWindow  -  TCP/UDP Relay (man-in-the-middle) UI
@@ -71,7 +72,10 @@ private:
     void AppendView(bool c2t, const BYTE* data, size_t len);
     bool FlushHeld(bool c2t);
     void DiscardHeld(bool c2t, const wchar_t* why);
-    void DrainNetworkMessages();
+    void OnRelayEvents();
+    void FlushSlice();
+    void SyncLogList();
+    void UpdateClientIndicator();
     void ResetSessionUI();
     void UpdateStatusText();
     void UpdateTitle();
@@ -80,14 +84,13 @@ private:
 
     // ---- Network events ----
     void OnRelayListening(int port);
-    void OnRelayClientConn(const std::wstring& addr);
+    void OnRelayClientConn(const std::wstring& addr, int waiting, bool fromWait);
+    void OnRelayClientWaiting(const std::wstring& addr, int waiting, bool left);
     void OnRelayClientDisconn();
     void OnRelayTargetConn();
     void OnRelayTargetDisconn();
     void OnRelayTargetConnecting();
     void OnRelayData(bool c2t, const BYTE* data, int len, bool forwarded);
-    void OnRelayClientData(const BYTE* data, int len, bool forwarded);
-    void OnRelayTargetData(const BYTE* data, int len, bool forwarded);
     void OnRelayError(int err, const std::wstring& msg);
     void OnRelayStopped();
 
@@ -100,6 +103,9 @@ private:
     // ---- Members ----
     HWND        m_hWnd     {nullptr};
     HINSTANCE   m_hInst    {nullptr};
+    // Network threads -> window: every notification, in order, drained in slices.
+    // Declared before m_network so it outlives the threads.
+    HandoffQueue<RelayEvent> m_queue;
     std::unique_ptr<RelayNetwork> m_network;
 
     // Config controls
@@ -182,6 +188,16 @@ private:
     // newest last, capped (RELAY_VIEW_CAP). Both views show the same bytes.
     std::vector<BYTE>     m_viewC2T;
     std::vector<BYTE>     m_viewT2C;
+    // Received in the slice being handled, shown with one append at its end.
+    std::vector<BYTE>     m_sliceC2T;
+    std::vector<BYTE>     m_sliceT2C;
+    // A view that was not updated because the page is hidden: rebuilt on show.
+    bool                  m_viewStaleC2T  {false};
+    bool                  m_viewStaleT2C  {false};
+    bool                  m_bufDirtyC2T   {false};   // buffer label wanted, set per slice
+    bool                  m_bufDirtyT2C   {false};
+    bool                  m_inSlice       {false};
+    bool                  m_stoppedInSlice{false};
 
     // Statistics
     size_t m_bytesC2T       {0};
@@ -191,6 +207,8 @@ private:
 
     // Connection info
     std::wstring m_clientAddr;
+    std::wstring m_clientIndBase {L"○ Client: -"};  // indicator text without the waiting count
+    int          m_waitingCount  {0};     // TCP clients parked behind the current one
     std::wstring m_targetAddr;   // stored when target connects
     bool         m_isListening    {false};
     bool         m_clientUp       {false};  // as told by the network events

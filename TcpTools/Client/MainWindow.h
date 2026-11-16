@@ -52,13 +52,15 @@ private:
     void OnContextMenuLog(POINT pt);
 
     // ---- Network message handlers ------------------------------
+    void OnNetQueue();                       // drains the hand-off queue in slices
     void OnNetConnected();
-    void OnNetDisconnected(bool neverConnected);
-    void OnNetDataReceived(size_t len, BYTE* pData);   // takes ownership of pData
-    void OnNetSendComplete(size_t bytesSent, CycleStats* pStats);
-    void OnNetError(int wsaErr, std::wstring* pMsg);
+    void OnNetDisconnected(bool neverConnected, bool byAutoDisconnect);
+    void OnNetData(std::vector<BYTE>&& chunk, double latMs);   // one drained slice of received data
+    void OnNetSendComplete(const NetEvent& ev);
+    void OnNetError(const std::wstring& msg);
     void OnCyclicMessage(size_t count, bool final, uint32_t gen);
     void OnNetLatency(double latMs);
+    void SyncLogView();       // brings the list view up to date after a batch of AddLogEntry
 
     // ---- UI Actions --------------------------------------------
     bool DoConnect();
@@ -214,6 +216,10 @@ private:
     HWND                        m_hBtnHelp         {nullptr};
     bool                        m_tooltipsEnabled  {false};
     bool                        m_connected    {false};
+    bool                        m_lingering    {false};  // Auto-Disconnect send done, session ends after the reply
+    bool                        m_sendAfterClose{false}; // Send clicked while the session was ending: send on the next one
+    bool                        m_logBatch     {false};  // inside OnNetQueue: AddLogEntry leaves the list view to SyncLogView
+    bool                        m_logDirty     {false};
     bool                        m_autoConnect     {false};
     bool                        m_pendingAutoSend   {false}; // set when auto-connect is triggered before send
     bool                        m_pendingCyclicStart{false}; // set when auto-connect is triggered before cyclic
@@ -230,6 +236,8 @@ private:
     void    PopulateHostCombo();
     void    OnHostComboSelChange();
     void    DoParseComboParts();
+    std::wstring CurrentHost();     // host field without brackets / attached port
+    std::wstring CurrentTarget();   // JoinHostPort of host and port fields
 };
 
 } // namespace Client

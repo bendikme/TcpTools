@@ -1,15 +1,18 @@
 #pragma once
 #include "pch.h"
 #include "Utils.h"
+#include "NetAddr.h"
+#include "HandoffQueue.h"
 
 namespace Server {
 
 // ============================================================
-//  ServerNetwork - Winsock2 TCP/UDP server (IPv4 only)
+//  ServerNetwork - Winsock2 TCP/UDP server (IPv4 and IPv6)
 //
 //  Threads (all joinable members, joined before reuse / destruction):
-//    - accept thread : bind + listen + accept (TCP, one client at a time, receives
-//                      inside RecvLoop) or recvfrom (UDP)
+//    - accept thread : bind + listen + accept (TCP: one client is served inside
+//                      RecvLoop, further clients are accepted and parked without
+//                      being read) or recvfrom (UDP)
 //    - send worker   : persistent; processes QueueSend() jobs so the UI thread
 //                      never blocks on a stalled peer
 //
@@ -75,19 +78,24 @@ struct NetConfig {
     std::vector<BYTE>customSuffix;
 };
 
-// Messages posted to the UI window (PostMessage only, never SendMessage):
-//  WM_NET_LISTENING        wParam=port             lParam=nullptr
-//  WM_NET_STOPPED          wParam=0                lParam=nullptr   (always the last message of a run, also when start failed)
-//  WM_NET_CONNECTED        wParam=0                lParam=std::wstring* client "ip:port" (heap, must delete)
-//  WM_NET_DISCONNECTED     wParam=0                lParam=nullptr
-//  WM_NET_DATA_RECEIVED    wParam=len              lParam=BYTE*   (heap new[], must delete[])
-//  WM_NET_SEND_COMPLETE    wParam=bytesSent        lParam=CycleStats* (heap, must delete)
-//  WM_NET_ERROR            wParam=wsaErr           lParam=std::wstring* (heap, must delete)
+// Everything the network threads tell the window goes through ONE HandoffQueue
+// (ordered, bounded, a single wake-up message per burst). Stopped is always the
+// last event of a run, also when the start failed.
+struct NetEvent {
+    enum class Kind { Listening, Stopped, Connected, Disconnected, Data, SendComplete, Error, Waiting };
+    Kind               kind        {Kind::Error};
+    int                value       {0};      // Listening: port; Error: Winsock error; Connected / Waiting: clients still waiting
+    std::wstring       text;                 // Connected / Waiting: client address; Error: message
+    std::vector<BYTE>  data;                 // Data
+    CycleStats         stats;                // Data / SendComplete: snapshot taken on the network thread
+    size_t             bytes       {0};      // SendComplete: bytes sent
+    bool               fromWaiting {false};  // Connected: the client had been waiting for its turn
+};
 
 class ServerNetwork
 {
 public:
-    explicit ServerNetwork(HWND notifyWnd, bool echoMode = false);
+    ServerNetwork(HWND notifyWnd, UINT wakeMessage, bool echoMode = false);
     ~ServerNetwork();
 
     bool  StartListening(int port, int timeoutSec = 5, bool udpMode = false);
@@ -111,6 +119,9 @@ public:
 
     CycleStats GetStats();
 
+    // The window drains this when it receives its wake-up message.
+    HandoffQueue<NetEvent>& Events() { return m_events; }
+
     void  SetEchoMode(bool echo)    { m_echoMode = echo; }
     bool  GetEchoMode()       const { return m_echoMode; }
 
@@ -126,17 +137,21 @@ private:
 
     void  AcceptThreadMain(int port, int timeoutSec);
     void  ServeUdp(SOCKET sock);
-    void  ServeTcp(SOCKET sock, int timeoutSec);
-    void  RecvLoop(SOCKET clientSock);
+    struct Parked { SOCKET sock; std::wstring addr; };
+    void  ServeTcp(SOCKET sock);
+    void  RecvLoop(SOCKET clientSock, SOCKET listenSock, std::deque<Parked>& parked);
+    bool  AcceptClient(SOCKET listenSock, Parked& out);
     void  SendWorkerLoop();
     void  ProcessJob(SendJob& job);
     void  CloseOwned(SOCKET& member);
     void  ClearQueue();
     void  PostError(int wsaErr, const std::wstring& msg);
     void  AppendLogFile(const std::vector<BYTE>& data);
-    bool  Post(UINT msg, WPARAM w, LPARAM l);
+    // Queues an event for the window; `weight` = payload bytes. May wait while the
+    // window is behind, but never past a stop request.
+    bool  Emit(NetEvent&& ev, size_t weight = 0);
 
-    std::atomic<HWND>  m_notifyWnd       {nullptr};
+    HandoffQueue<NetEvent> m_events;
     std::atomic<bool>  m_echoMode        {false};
     std::wstring       m_logFile;
     bool               m_logErrorPosted  {false};   // accept thread only
@@ -144,7 +159,7 @@ private:
     // Guarded by m_sockMutex
     SOCKET             m_listenSock      {INVALID_SOCKET};
     SOCKET             m_clientSock      {INVALID_SOCKET};
-    sockaddr_in        m_udpPeer         {};
+    NetAddr::Endpoint  m_udpPeer         {};
     std::mutex         m_sockMutex;
 
     std::atomic<bool>  m_running         {false};   // accept thread active

@@ -41,14 +41,9 @@ static std::vector<BYTE> ApplySeparator(const std::vector<BYTE>& raw, const NetC
     return out;
 }
 
-static std::wstring AddrToString(const sockaddr_in& a)
-{
-    wchar_t ip[64] = {};
-    InetNtopW(AF_INET, (void*)&a.sin_addr, ip, 64);
-    wchar_t combined[96];
-    swprintf_s(combined, L"%s:%d", ip, (int)ntohs(a.sin_port));
-    return combined;
-}
+// How many clients may wait (accepted, not read) behind the one being served.
+// Further ones stay in the listen backlog.
+static constexpr size_t MAX_WAITING = 16;
 
 // Blocking send of the whole buffer. Returns false on error (err = WSA error, sent = bytes out).
 static bool SendAll(SOCKET s, const BYTE* p, int total, int& sent, int& err)
@@ -66,9 +61,10 @@ static bool SendAll(SOCKET s, const BYTE* p, int total, int& sent, int& err)
 //  ServerNetwork
 // ============================================================
 
-ServerNetwork::ServerNetwork(HWND notifyWnd, bool echoMode)
-    : m_notifyWnd(notifyWnd), m_echoMode(echoMode)
+ServerNetwork::ServerNetwork(HWND notifyWnd, UINT wakeMessage, bool echoMode)
+    : m_echoMode(echoMode)
 {
+    m_events.SetTarget(notifyWnd, wakeMessage);
     m_sendThread = std::thread([this] { SendWorkerLoop(); });
 }
 
@@ -77,30 +73,26 @@ ServerNetwork::~ServerNetwork()
     Shutdown();
 }
 
-bool ServerNetwork::Post(UINT msg, WPARAM w, LPARAM l)
+bool ServerNetwork::Emit(NetEvent&& ev, size_t weight)
 {
-    HWND h = m_notifyWnd.load();
-    return h && PostMessageW(h, msg, w, l);
+    return m_events.Push(std::move(ev), weight, m_stopRequested);
 }
 
 void ServerNetwork::PostError(int wsaErr, const std::wstring& msg)
 {
-    std::wstring text = msg;
-    if (wsaErr != 0) {
-        wchar_t buf[256] = {};
-        DWORD n = FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-                                 nullptr, (DWORD)wsaErr, 0, buf, 256, nullptr);
-        while (n > 0 && (buf[n - 1] == L'\r' || buf[n - 1] == L'\n' || buf[n - 1] == L' ')) buf[--n] = 0;
-        if (n) text += L": " + std::wstring(buf);
-        text += L" (" + std::to_wstring(wsaErr) + L")";
-    }
-    auto* p = new std::wstring(std::move(text));
-    if (!Post(WM_NET_ERROR, (WPARAM)wsaErr, (LPARAM)p)) delete p;
+    NetEvent ev;
+    ev.kind  = NetEvent::Kind::Error;
+    ev.value = wsaErr;
+    ev.text  = msg;
+    if (wsaErr != 0) ev.text += L": " + NetAddr::ErrorText(wsaErr);
+    Emit(std::move(ev));
 }
 
 void ServerNetwork::AppendLogFile(const std::vector<BYTE>& data)
 {
     if (m_logFile.empty()) return;
+    // Opened per chunk on purpose: the file is complete after every write, so a
+    // reader that has seen the echo can rely on it.
     std::ofstream f(m_logFile, std::ios::binary | std::ios::app);
     if (f) f.write(reinterpret_cast<const char*>(data.data()), (std::streamsize)data.size());
     if ((!f || !f.good()) && !m_logErrorPosted) {
@@ -182,8 +174,8 @@ void ServerNetwork::StopServer()
 
 void ServerNetwork::Shutdown()
 {
-    m_notifyWnd = nullptr;
     StopServer();
+    m_events.Close();           // no more wake-ups; whatever is still queued is freed
     {
         std::lock_guard<std::mutex> lk(m_queueMutex);
         m_workerQuit = true;
@@ -207,7 +199,7 @@ void ServerNetwork::DisconnectClient()
             was = m_clientConnected.exchange(false);
             m_udpPeer = {};
         }
-        if (was) Post(WM_NET_DISCONNECTED, 0, 0);
+        if (was) { NetEvent ev; ev.kind = NetEvent::Kind::Disconnected; Emit(std::move(ev)); }
         return;
     }
     // TCP: the accept thread sees the closed connection, closes the handle and reports it
@@ -220,42 +212,37 @@ void ServerNetwork::DisconnectClient()
 void ServerNetwork::AcceptThreadMain(int port, int timeoutSec)
 {
     const bool udp = m_udpMode;
-    SOCKET s = socket(AF_INET, udp ? SOCK_DGRAM : SOCK_STREAM, udp ? IPPROTO_UDP : IPPROTO_TCP);
+    bool ok = false;
+
+    // One dual-stack socket (IPv4 and IPv6) with the port taken exclusively: a busy
+    // port fails here, with a readable reason, instead of silently sharing it.
+    int err = 0;
+    SOCKET s = NetAddr::CreateListenSocket(udp ? SOCK_DGRAM : SOCK_STREAM, port, err);
     if (s == INVALID_SOCKET) {
-        PostError(WSAGetLastError(), L"socket() failed");
+        const bool busy = (err == WSAEADDRINUSE || err == WSAEACCES);
+        PostError(err, busy ? L"Cannot listen on port " + std::to_wstring(port) + L" - the port is already in use"
+                            : L"Cannot listen on port " + std::to_wstring(port));
     }
     else {
-        BOOL reuse = TRUE;
-        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (char*)&reuse, sizeof(reuse));
-
-        sockaddr_in addr = {};
-        addr.sin_family      = AF_INET;
-        addr.sin_port        = htons((u_short)port);
-        addr.sin_addr.s_addr = INADDR_ANY;
-
-        bool ok = true;
-        if (bind(s, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-            PostError(WSAGetLastError(), L"bind() failed on port " + std::to_wstring(port));
-            ok = false;
-        }
-        else if (udp) {
+        if (udp) {
             // Without this an ICMP "port unreachable" (peer gone after an echo) makes
             // recvfrom fail with WSAECONNRESET.
             DWORD bytes = 0; BOOL off = FALSE;
             WSAIoctl(s, SIO_UDP_CONNRESET, &off, sizeof(off), nullptr, 0, &bytes, nullptr, nullptr);
+            ok = true;
         }
         else if (listen(s, SOMAXCONN) == SOCKET_ERROR) {
             PostError(WSAGetLastError(), L"listen() failed");
-            ok = false;
         }
+        else ok = true;
 
         if (ok) {
             { std::lock_guard<std::mutex> lk(m_sockMutex); m_listenSock = s; }
             m_listening = true;
-            Post(WM_NET_LISTENING, (WPARAM)port, 0);
+            { NetEvent ev; ev.kind = NetEvent::Kind::Listening; ev.value = port; Emit(std::move(ev)); }
 
             if (udp) ServeUdp(s);
-            else     ServeTcp(s, timeoutSec);
+            else     ServeTcp(s);
 
             m_listening = false;
             CloseOwned(m_listenSock);
@@ -264,11 +251,12 @@ void ServerNetwork::AcceptThreadMain(int port, int timeoutSec)
             closesocket(s);
         }
     }
+    (void)timeoutSec;
 
     ClearQueue();
     m_clientConnected = false;
-    // Last message of every run, also a failed start, so the UI always returns to idle.
-    Post(WM_NET_STOPPED, 0, 0);
+    // Last event of every run, also a failed start, so the UI always returns to idle.
+    { NetEvent ev; ev.kind = NetEvent::Kind::Stopped; Emit(std::move(ev)); }
     m_running = false;
 }
 
@@ -285,27 +273,29 @@ void ServerNetwork::ServeUdp(SOCKET sock)
         if (r == SOCKET_ERROR) { PostError(WSAGetLastError(), L"select() failed"); break; }
         if (r == 0) continue;
 
-        sockaddr_in from = {};
-        int fromLen = sizeof(from);
-        int n = recvfrom(sock, (char*)buf.data(), BUF, 0, (sockaddr*)&from, &fromLen);
+        NetAddr::Endpoint from;
+        from.len = sizeof(from.addr);
+        int n = recvfrom(sock, (char*)buf.data(), BUF, 0, from.sa(), &from.len);
         Utils::TimePoint tRecv = Utils::Now();
         if (n <= 0) { if (n < 0) Sleep(5); continue; }
 
         bool newPeer;
         {
             std::lock_guard<std::mutex> lk(m_sockMutex);
-            newPeer = !m_clientConnected
-                   || memcmp(&from.sin_addr, &m_udpPeer.sin_addr, sizeof(from.sin_addr)) != 0
-                   || from.sin_port != m_udpPeer.sin_port;
+            newPeer = !m_clientConnected || !NetAddr::Same(from, m_udpPeer);
             if (newPeer) { m_udpPeer = from; m_clientConnected = true; }
         }
         if (newPeer) {
-            auto* addrStr = new std::wstring(AddrToString(from));
-            if (!Post(WM_NET_CONNECTED, 0, (LPARAM)addrStr)) delete addrStr;
-            std::lock_guard<std::mutex> lk(m_statsMutex);
-            m_stats = {};
-            m_stats.connectTime = Utils::Now();
-            m_stats.valid = true;
+            {
+                std::lock_guard<std::mutex> lk(m_statsMutex);
+                m_stats = {};
+                m_stats.connectTime = Utils::Now();
+                m_stats.valid = true;
+            }
+            NetEvent ev;
+            ev.kind = NetEvent::Kind::Connected;
+            ev.text = NetAddr::ToString(from);
+            Emit(std::move(ev));
         }
 
         std::vector<BYTE> chunk(buf.begin(), buf.begin() + n);
@@ -316,13 +306,14 @@ void ServerNetwork::ServeUdp(SOCKET sock)
             int ns = 0;
             {
                 std::lock_guard<std::mutex> sl(m_sendMutex);
-                ns = sendto(sock, (char*)buf.data(), n, 0, (sockaddr*)&from, sizeof(from));
+                ns = sendto(sock, (char*)buf.data(), n, 0, from.sa(), from.len);
             }
             int err = (ns == SOCKET_ERROR) ? WSAGetLastError() : 0;
             Utils::TimePoint echoEnd = Utils::Now();
             if (ns == SOCKET_ERROR) { ns = 0; PostError(err, L"Echo sendto() failed"); }
 
-            auto* pStats = new CycleStats;
+            NetEvent ev;
+            ev.kind = NetEvent::Kind::SendComplete;
             {
                 std::lock_guard<std::mutex> slk(m_statsMutex);
                 m_stats.recvStart = m_stats.recvEnd = tRecv;
@@ -330,55 +321,82 @@ void ServerNetwork::ServeUdp(SOCKET sock)
                 m_stats.sendStart = echoStart;
                 m_stats.sendEnd   = echoEnd;
                 m_stats.bytesSent = (size_t)ns;
-                *pStats = m_stats;
+                ev.stats = m_stats;
             }
-            pStats->isEcho = true;
-            pStats->ok     = (err == 0);
-            if (!Post(WM_NET_SEND_COMPLETE, (WPARAM)ns, (LPARAM)pStats)) delete pStats;
-        }
-        else {
-            std::lock_guard<std::mutex> lk(m_statsMutex);
-            if (m_stats.bytesReceived == 0) m_stats.recvStart = tRecv;
-            m_stats.bytesReceived += (size_t)n;
-            m_stats.recvEnd = tRecv;
+            ev.stats.isEcho = true;
+            ev.stats.ok     = (err == 0);
+            ev.bytes        = (size_t)ns;
+            Emit(std::move(ev));
         }
 
-        BYTE* copy = new BYTE[n];
-        memcpy(copy, buf.data(), n);
-        if (!Post(WM_NET_DATA_RECEIVED, (WPARAM)n, (LPARAM)copy)) delete[] copy;
+        NetEvent ev;
+        ev.kind = NetEvent::Kind::Data;
+        {
+            std::lock_guard<std::mutex> lk(m_statsMutex);
+            if (!m_echoMode) {
+                if (m_stats.bytesReceived == 0) m_stats.recvStart = tRecv;
+                m_stats.bytesReceived += (size_t)n;
+                m_stats.recvEnd = tRecv;
+            }
+            ev.stats = m_stats;
+        }
+        ev.data = std::move(chunk);
+        Emit(std::move(ev), (size_t)n);
     }
 
-    if (m_clientConnected.exchange(false))
-        Post(WM_NET_DISCONNECTED, 0, 0);
+    if (m_clientConnected.exchange(false)) {
+        NetEvent ev; ev.kind = NetEvent::Kind::Disconnected; Emit(std::move(ev));
+    }
 }
 
-void ServerNetwork::ServeTcp(SOCKET listenSock, int /*timeoutSec*/)
+bool ServerNetwork::AcceptClient(SOCKET listenSock, Parked& out)
 {
-    // One client at a time; further connections wait in the backlog until the
-    // current client is gone.
+    NetAddr::Endpoint peer;
+    peer.len = sizeof(peer.addr);
+    SOCKET s = accept(listenSock, peer.sa(), &peer.len);
+    if (s == INVALID_SOCKET) { Sleep(10); return false; }
+
+    // Receive uses select() polling; the timeout bounds how long a send may stall.
+    DWORD sndMs = m_sndTimeoutMs;
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char*)&sndMs, sizeof(sndMs));
+    BOOL nd = TRUE;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char*)&nd, sizeof(nd));
+
+    out.sock = s;
+    out.addr = NetAddr::ToString(peer);
+    return true;
+}
+
+void ServerNetwork::ServeTcp(SOCKET listenSock)
+{
+    // One client is served at a time. Others that connect meanwhile are accepted
+    // and parked - never read, so whatever they send stays in their socket buffer -
+    // and get their turn in arrival order.
+    std::deque<Parked> parked;
+
     while (!m_stopRequested)
     {
-        fd_set rfds;
-        FD_ZERO(&rfds); FD_SET(listenSock, &rfds);
-        timeval tv { 0, 200000 };
-        int r = select(0, &rfds, nullptr, nullptr, &tv);
-        if (r == SOCKET_ERROR) { PostError(WSAGetLastError(), L"select() failed"); break; }
-        if (r == 0) continue;
+        Parked cur {INVALID_SOCKET, {}};
+        bool fromWaiting = false;
 
-        sockaddr_in clientAddr = {};
-        int clen = sizeof(clientAddr);
-        SOCKET clientSock = accept(listenSock, (sockaddr*)&clientAddr, &clen);
-        if (clientSock == INVALID_SOCKET) { Sleep(10); continue; }
-
-        // Receive uses select() polling; the timeout bounds how long a send may stall.
-        DWORD sndMs = m_sndTimeoutMs;
-        setsockopt(clientSock, SOL_SOCKET, SO_SNDTIMEO, (char*)&sndMs, sizeof(sndMs));
-        BOOL nd = TRUE;
-        setsockopt(clientSock, IPPROTO_TCP, TCP_NODELAY, (char*)&nd, sizeof(nd));
+        if (!parked.empty()) {
+            cur = std::move(parked.front());
+            parked.pop_front();
+            fromWaiting = true;
+        }
+        else {
+            fd_set rfds;
+            FD_ZERO(&rfds); FD_SET(listenSock, &rfds);
+            timeval tv { 0, 200000 };
+            int r = select(0, &rfds, nullptr, nullptr, &tv);
+            if (r == SOCKET_ERROR) { PostError(WSAGetLastError(), L"select() failed"); break; }
+            if (r == 0) continue;
+            if (!AcceptClient(listenSock, cur)) continue;
+        }
 
         {
             std::lock_guard<std::mutex> lk(m_sockMutex);
-            m_clientSock = clientSock;
+            m_clientSock = cur.sock;
         }
         {
             std::lock_guard<std::mutex> lk(m_statsMutex);
@@ -388,31 +406,56 @@ void ServerNetwork::ServeTcp(SOCKET listenSock, int /*timeoutSec*/)
         }
         m_clientConnected = true;
 
-        auto* addrStr = new std::wstring(AddrToString(clientAddr));
-        if (!Post(WM_NET_CONNECTED, 0, (LPARAM)addrStr)) delete addrStr;
+        {
+            NetEvent ev;
+            ev.kind        = NetEvent::Kind::Connected;
+            ev.text        = cur.addr;
+            ev.value       = (int)parked.size();
+            ev.fromWaiting = fromWaiting;
+            Emit(std::move(ev));
+        }
 
-        RecvLoop(clientSock);
+        RecvLoop(cur.sock, listenSock, parked);
 
         m_clientConnected = false;
         ClearQueue();
         CloseOwned(m_clientSock);
-        Post(WM_NET_DISCONNECTED, 0, 0);
+        { NetEvent ev; ev.kind = NetEvent::Kind::Disconnected; Emit(std::move(ev)); }
     }
+
+    for (Parked& p : parked) closesocket(p.sock);
 }
 
-void ServerNetwork::RecvLoop(SOCKET clientSock)
+void ServerNetwork::RecvLoop(SOCKET clientSock, SOCKET listenSock, std::deque<Parked>& parked)
 {
     constexpr int BUF = 65536;
     std::vector<BYTE> buf(BUF);
 
     while (!m_stopRequested)
     {
+        // The listen socket is watched too, so a newcomer is noticed (and shown as
+        // waiting) while this client is being served.
+        const bool watchListen = parked.size() < MAX_WAITING;
         fd_set rfds;
         FD_ZERO(&rfds); FD_SET(clientSock, &rfds);
+        if (watchListen) FD_SET(listenSock, &rfds);
         timeval tv { 0, 100000 };
         int r = select(0, &rfds, nullptr, nullptr, &tv);
         if (r == SOCKET_ERROR) break;
         if (r == 0) continue;
+
+        if (watchListen && FD_ISSET(listenSock, &rfds)) {
+            Parked p {INVALID_SOCKET, {}};
+            if (AcceptClient(listenSock, p)) {
+                NetEvent ev;
+                ev.kind  = NetEvent::Kind::Waiting;
+                ev.text  = p.addr;
+                parked.push_back(std::move(p));
+                ev.value = (int)parked.size();
+                Emit(std::move(ev));
+            }
+        }
+        if (!FD_ISSET(clientSock, &rfds)) continue;
 
         int n = recv(clientSock, (char*)buf.data(), BUF, 0);
         if (n <= 0) break;
@@ -424,18 +467,22 @@ void ServerNetwork::RecvLoop(SOCKET clientSock)
         // echo can rely on the file being complete.
         AppendLogFile(chunk);
 
+        int echoErr = 0;
         if (m_echoMode) {
+            // The echo goes out here, on the network thread, before the event is
+            // queued: it never waits for the window.
             Utils::TimePoint echoStart = Utils::Now();
-            int sent = 0, err = 0;
+            int sent = 0;
             {
                 std::lock_guard<std::mutex> sl(m_sendMutex);
-                SendAll(clientSock, buf.data(), n, sent, err);
+                SendAll(clientSock, buf.data(), n, sent, echoErr);
             }
             Utils::TimePoint echoEnd = Utils::Now();
-            if (err) PostError(err, L"Echo send() failed");
+            if (echoErr) PostError(echoErr, L"Echo send() failed");
 
             // An echo is its own transaction: statistics describe this chunk only.
-            auto* pStats = new CycleStats;
+            NetEvent ev;
+            ev.kind = NetEvent::Kind::SendComplete;
             {
                 std::lock_guard<std::mutex> slk(m_statsMutex);
                 m_stats.recvStart = m_stats.recvEnd = tRecv;
@@ -443,30 +490,31 @@ void ServerNetwork::RecvLoop(SOCKET clientSock)
                 m_stats.sendStart = echoStart;
                 m_stats.sendEnd   = echoEnd;
                 m_stats.bytesSent = (size_t)sent;
-                *pStats = m_stats;
+                ev.stats = m_stats;
             }
-            pStats->isEcho = true;
-            pStats->ok     = (err == 0);
-            if (!Post(WM_NET_SEND_COMPLETE, (WPARAM)sent, (LPARAM)pStats)) delete pStats;
-            if (err) {
-                // The peer is not taking data (timeout) or is gone: drop the connection.
-                // The data just received is still reported below.
-                BYTE* copy = new BYTE[n];
-                memcpy(copy, buf.data(), n);
-                if (!Post(WM_NET_DATA_RECEIVED, (WPARAM)n, (LPARAM)copy)) delete[] copy;
-                break;
-            }
-        }
-        else {
-            std::lock_guard<std::mutex> lk(m_statsMutex);
-            if (m_stats.bytesReceived == 0) m_stats.recvStart = tRecv;
-            m_stats.bytesReceived += (size_t)n;
-            m_stats.recvEnd = tRecv;
+            ev.stats.isEcho = true;
+            ev.stats.ok     = (echoErr == 0);
+            ev.bytes        = (size_t)sent;
+            Emit(std::move(ev));
         }
 
-        BYTE* copy = new BYTE[n];
-        memcpy(copy, buf.data(), n);
-        if (!Post(WM_NET_DATA_RECEIVED, (WPARAM)n, (LPARAM)copy)) delete[] copy;
+        NetEvent ev;
+        ev.kind = NetEvent::Kind::Data;
+        {
+            std::lock_guard<std::mutex> lk(m_statsMutex);
+            if (!m_echoMode) {
+                if (m_stats.bytesReceived == 0) m_stats.recvStart = tRecv;
+                m_stats.bytesReceived += (size_t)n;
+                m_stats.recvEnd = tRecv;
+            }
+            ev.stats = m_stats;
+        }
+        ev.data = std::move(chunk);
+        Emit(std::move(ev), (size_t)n);
+
+        // The peer is not taking data (timeout) or is gone: drop the connection.
+        // The data just received was reported above.
+        if (echoErr) break;
     }
 }
 
@@ -521,7 +569,7 @@ void ServerNetwork::ProcessJob(SendJob& job)
         std::lock_guard<std::mutex> sl(m_sendMutex);
         const bool udp = m_udpMode;
         SOCKET s = INVALID_SOCKET;
-        sockaddr_in peer = {};
+        NetAddr::Endpoint peer;
         {
             std::lock_guard<std::mutex> lk(m_sockMutex);
             if (m_clientConnected) {
@@ -533,7 +581,7 @@ void ServerNetwork::ProcessJob(SendJob& job)
             ok = false; err = 0; what = L"Not sent: the client is gone";
         }
         else if (udp) {
-            int n = sendto(s, (const char*)data.data(), total, 0, (sockaddr*)&peer, sizeof(peer));
+            int n = sendto(s, (const char*)data.data(), total, 0, peer.sa(), peer.len);
             if (n == SOCKET_ERROR) { ok = false; err = WSAGetLastError(); what = L"sendto() failed"; }
             else sent = n;
         }
@@ -544,17 +592,19 @@ void ServerNetwork::ProcessJob(SendJob& job)
     Utils::TimePoint t1 = Utils::Now();
     if (!ok) PostError(err, what);
 
-    auto* pStats = new CycleStats;
+    NetEvent ev;
+    ev.kind  = NetEvent::Kind::SendComplete;
+    ev.bytes = (size_t)sent;
     {
         std::lock_guard<std::mutex> slk(m_statsMutex);
         m_stats.sendEnd   = t1;
         m_stats.bytesSent = (size_t)sent;
-        *pStats = m_stats;
+        ev.stats = m_stats;
     }
-    pStats->isEcho = false;
-    pStats->ok     = ok;
-    pStats->id     = job.id;
-    if (!Post(WM_NET_SEND_COMPLETE, (WPARAM)sent, (LPARAM)pStats)) delete pStats;
+    ev.stats.isEcho = false;
+    ev.stats.ok     = ok;
+    ev.stats.id     = job.id;
+    Emit(std::move(ev));
 
     if (ok && job.cfg.autoDisconnect)
         DisconnectClient();

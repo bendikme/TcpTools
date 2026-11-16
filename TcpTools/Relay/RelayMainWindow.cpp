@@ -108,8 +108,17 @@ LRESULT RelayMainWindow::HandleMessage(HWND hWnd, UINT msg, WPARAM wParam, LPARA
     {
     case WM_CREATE:
         m_hWnd = hWnd;
+        m_queue.SetTarget(hWnd, WM_RELAY_EVENTS);
         OnCreate(hWnd);
         return 0;
+
+    case WM_SHOWWINDOW:
+        // A view that was left alone while the page was hidden is rebuilt now.
+        if (wParam) {
+            if (m_viewStaleC2T) ShowViews(true);
+            if (m_viewStaleT2C) ShowViews(false);
+        }
+        break;
 
     case WM_SIZE:
         OnSize(hWnd, LOWORD(lParam), HIWORD(lParam));
@@ -129,14 +138,22 @@ LRESULT RelayMainWindow::HandleMessage(HWND hWnd, UINT msg, WPARAM wParam, LPARA
                 L"\n"
                 L"1. Set the Listen Port (local port for clients).\n"
                 L"2. Enter the Target address and port (upstream "
-                L"server to forward traffic to). You can type "
-                L"host:port and both fields auto-fill.\n"
+                L"server to forward traffic to): a name, an IPv4 "
+                L"address or an IPv6 address. You can type "
+                L"host:port, [::1]:9002 or pick an entry from the "
+                L"history and both fields auto-fill.\n"
                 L"3. Choose TCP or UDP.\n"
                 L"4. Click Start Relay.\n"
                 L"5. The relay listens for a client and connects to "
                 L"the target (and keeps retrying until you click "
                 L"Stop), and forwards data both ways. One client "
-                L"is served at a time.\n"
+                L"is served at a time; further clients that connect "
+                L"meanwhile wait in line (the Client indicator shows "
+                L"how many, up to 16) and get their turn in order "
+                L"when the current client leaves. The client side "
+                L"and the target side may use different address "
+                L"families (IPv4 client, IPv6 target, or the other "
+                L"way round).\n"
                 L"\n"
                 L"\u2500\u2500\u2500 DATA FLOW \u2500\u2500\u2500\n"
                 L"\n"
@@ -164,9 +181,10 @@ LRESULT RelayMainWindow::HandleMessage(HWND hWnd, UINT msg, WPARAM wParam, LPARA
                 L"\u2022 Hex View \u2014 Display relayed data as hex.\n"
                 L"\u2022 Manual buffering \u2014 Pause, inspect, forward "
                 L"or drop packets in each direction.\n"
-                L"\u2022 Protocol support \u2014 TCP and UDP relay (IPv4 "
-                L"only). In UDP mode replies go to the sender of "
-                L"the most recent datagram.\n"
+                L"\u2022 Protocol support \u2014 TCP and UDP relay, IPv4 "
+                L"and IPv6 (one dual-stack listening socket; the "
+                L"port is taken exclusively). In UDP mode replies "
+                L"go to the sender of the most recent datagram.\n"
                 L"\u2022 Target History \u2014 Dropdown remembers recent "
                 L"target host:port entries across sessions.\n"
                 L"\n"
@@ -196,57 +214,9 @@ LRESULT RelayMainWindow::HandleMessage(HWND hWnd, UINT msg, WPARAM wParam, LPARA
             OnContextMenuLog(hWnd, GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
         return 0;
 
-    // ---- Relay network events ----
-    case WM_RELAY_LISTENING:
-        OnRelayListening((int)wParam);
-        return 0;
-
-    case WM_RELAY_CLIENT_CONN: {
-        std::wstring* addr = (std::wstring*)lParam;
-        OnRelayClientConn(addr ? *addr : L"unknown");
-        delete addr;
-        return 0;
-    }
-    case WM_RELAY_CLIENT_DISCONN:
-        OnRelayClientDisconn();
-        return 0;
-
-    case WM_RELAY_TARGET_CONN:
-        OnRelayTargetConn();
-        return 0;
-
-    case WM_RELAY_TARGET_DISCONN:
-        OnRelayTargetDisconn();
-        return 0;
-
-    case WM_RELAY_CLIENT_DATA: {
-        BYTE* data = (BYTE*)lParam;
-        bool forwarded = (wParam & RELAY_FLAG_FORWARDED) != 0;
-        int len = (int)(wParam & 0x7FFFFFFF);
-        OnRelayClientData(data, len, forwarded);
-        delete[] data;
-        return 0;
-    }
-    case WM_RELAY_TARGET_DATA: {
-        BYTE* data = (BYTE*)lParam;
-        bool forwarded = (wParam & RELAY_FLAG_FORWARDED) != 0;
-        int len = (int)(wParam & 0x7FFFFFFF);
-        OnRelayTargetData(data, len, forwarded);
-        delete[] data;
-        return 0;
-    }
-    case WM_RELAY_ERROR: {
-        std::wstring* msg2 = (std::wstring*)lParam;
-        OnRelayError((int)wParam, msg2 ? *msg2 : L"Unknown error");
-        delete msg2;
-        return 0;
-    }
-    case WM_RELAY_STOPPED:
-        OnRelayStopped();
-        return 0;
-
-    case WM_RELAY_TARGET_CONNECTING:
-        OnRelayTargetConnecting();
+    // ---- Relay network events: one wake-up, the events wait in m_queue ----
+    case WM_RELAY_EVENTS:
+        OnRelayEvents();
         return 0;
 
     case WM_PARSE_TARGET_COMBO:
@@ -254,9 +224,9 @@ LRESULT RelayMainWindow::HandleMessage(HWND hWnd, UINT msg, WPARAM wParam, LPARA
         return 0;
 
     case WM_DESTROY:
-        // Stops and joins the network threads, then frees what they posted last.
+        // Stops and joins the network threads; then nothing is queued for this page any more.
         m_network.reset();
-        DrainNetworkMessages();
+        m_queue.Close();
         if (m_hListLog) ListView_SetImageList(m_hListLog, nullptr, LVSIL_SMALL);  // the list must not free it too
         if (m_hImgListLog) { ImageList_Destroy(m_hImgListLog); m_hImgListLog = nullptr; }
         if (m_hTooltip) { DestroyWindow(m_hTooltip); m_hTooltip = nullptr; }
@@ -869,11 +839,19 @@ void RelayMainWindow::AddLogEntry(LogType type, const std::wstring& dir, size_t 
     m_log.push_back(std::move(e));
     NotifyToolEvent(m_hWnd);   // every entry counts, also ones the log filter hides
 
-    if (PassesFilter(type, m_filterIndex)) {
-        m_logVisible.push_back(idx);
-        int count = (int)m_logVisible.size();
-        ListView_SetItemCountEx(m_hListLog, count, LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL);
-        ListView_RedrawItems(m_hListLog, count - 1, count - 1);
+    if (PassesFilter(type, m_filterIndex)) m_logVisible.push_back(idx);
+    if (!m_inSlice) SyncLogList();   // inside a slice the list is updated once, at its end
+}
+
+// Tells the list control about the entries added since it was last told.
+void RelayMainWindow::SyncLogList()
+{
+    const int count  = (int)m_logVisible.size();
+    const int before = ListView_GetItemCount(m_hListLog);
+    if (count == before) return;
+    ListView_SetItemCountEx(m_hListLog, count, LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL);
+    if (count > before) {
+        ListView_RedrawItems(m_hListLog, before, count - 1);
         ListView_EnsureVisible(m_hListLog, count - 1, FALSE);
     }
 }
@@ -917,19 +895,17 @@ void RelayMainWindow::OnTargetComboSelChange()
     PostMessageW(m_hWnd, WM_PARSE_TARGET_COMBO, 0, 0);
 }
 
+// "host:port", "[::1]:9002" or "[::1]" typed or picked from the history: the
+// host goes to the combo (without brackets), a port to the port field.
 void RelayMainWindow::DoParseComboParts()
 {
     std::wstring text = Utils::GetWindowText(m_hComboTarget);
-    auto pos = text.rfind(L':');
-    if (pos != std::wstring::npos && pos > 0 && pos < text.size() - 1) {
-        std::wstring host = text.substr(0, pos);
-        std::wstring port = text.substr(pos + 1);
-        int p = 0;
-        if (Utils::IsValidPort(port, p)) {
-            SetWindowTextW(m_hComboTarget, host.c_str());
-            SetWindowTextW(m_hEditTargetPort, port.c_str());
-        }
-    }
+    NetAddr::HostPort hp;
+    if (!NetAddr::SplitHostPort(text, hp)) return;
+    const bool bracketed = text.find(L'[') != std::wstring::npos;
+    if (!hp.hasPort && !bracketed) return;
+    SetWindowTextW(m_hComboTarget, hp.host.c_str());
+    if (hp.hasPort) SetWindowTextW(m_hEditTargetPort, std::to_wstring(hp.port).c_str());
 }
 
 // ---- Actions ---------------------------------------------------
@@ -947,26 +923,19 @@ void RelayMainWindow::DoStartRelay()
         return;
     }
 
-    // Parse "host:port" from combo if the user typed/pasted a combined value
-    std::wstring targetW = Utils::GetWindowText(m_hComboTarget);
-    auto colon = targetW.rfind(L':');
-    if (colon != std::wstring::npos && colon > 0 && colon < targetW.size() - 1) {
-        std::wstring maybePort = targetW.substr(colon + 1);
-        int p = 0;
-        if (Utils::IsValidPort(maybePort, p)) {
-            targetW = targetW.substr(0, colon);
-            SetWindowTextW(m_hComboTarget, targetW.c_str());
-            SetWindowTextW(GetDlgItem(m_hWnd, IDC_EDIT_TARGET_PORT), maybePort.c_str());
-        }
-    }
-
-    // Validate target host/IP
-    if (!Utils::IsValidHostOrIP(targetW)) {
-        MessageBoxW(m_hWnd, L"Please enter a valid target hostname or IPv4 address.", L"Invalid target", MB_ICONWARNING);
+    // The combo may hold "host:port", "[::1]:9002" or a bare host.
+    std::wstring targetText = Utils::GetWindowText(m_hComboTarget);
+    NetAddr::HostPort hp;
+    if (!NetAddr::SplitHostPort(targetText, hp) || !NetAddr::IsValidHost(hp.host)) {
+        MessageBoxW(m_hWnd, L"Please enter a valid target host name, IPv4 address or IPv6 address "
+                            L"(for example 192.168.1.10, myserver.local, ::1 or [::1]:9002).",
+                    L"Invalid target", MB_ICONWARNING);
         SetFocus(m_hComboTarget);
         return;
     }
-    std::string targetIP = Utils::ToUTF8(targetW);
+    std::wstring targetW = hp.host;
+    SetWindowTextW(m_hComboTarget, targetW.c_str());
+    if (hp.hasPort) SetWindowTextW(GetDlgItem(m_hWnd, IDC_EDIT_TARGET_PORT), std::to_wstring(hp.port).c_str());
 
     // Validate target port
     std::wstring targetPortW = Utils::GetWindowText(GetDlgItem(m_hWnd, IDC_EDIT_TARGET_PORT));
@@ -993,26 +962,19 @@ void RelayMainWindow::DoStartRelay()
     }
     bool udpMode = (SendMessageW(m_hComboProtocol, CB_GETCURSEL, 0, 0) == 1);
 
-    // Check if listen port is already in use
-    if (!Utils::IsPortAvailable(listenPort, udpMode)) {
-        wchar_t msg[128];
-        swprintf_s(msg, L"Listen port %d is already in use.\nPlease choose a different port.", listenPort);
-        MessageBoxW(m_hWnd, msg, L"Port busy", MB_ICONWARNING);
-        SetFocus(GetDlgItem(m_hWnd, IDC_EDIT_LISTEN_PORT));
-        return;
-    }
-
-    DrainNetworkMessages();
+    // A busy listen port is reported by the network thread (the port is taken
+    // exclusively there): it ends up in the log and the status line.
+    m_queue.Clear();
     ResetSessionUI();
     m_lastError.clear();
     m_proto      = udpMode ? L"UDP" : L"TCP";
     m_listenText = std::to_wstring(listenPort);
-    m_targetText = Utils::ToWide(targetIP) + L":" + std::to_wstring(targetPort);
+    m_targetText = NetAddr::JoinHostPort(targetW, targetPort);
 
-    m_network = std::make_unique<RelayNetwork>(m_hWnd);
+    m_network = std::make_unique<RelayNetwork>(m_queue);
     m_network->SetAutoForwardC2T(SendMessageW(m_hChkAutoC2T, BM_GETCHECK, 0, 0) == BST_CHECKED);
     m_network->SetAutoForwardT2C(SendMessageW(m_hChkAutoT2C, BM_GETCHECK, 0, 0) == BST_CHECKED);
-    if (!m_network->StartRelay(listenPort, targetIP, targetPort, timeout, udpMode)) {
+    if (!m_network->StartRelay(listenPort, targetW, targetPort, timeout, udpMode)) {
         MessageBoxW(m_hWnd, L"Failed to start relay.", L"Relay", MB_ICONERROR);
         m_network.reset();
         return;
@@ -1036,7 +998,7 @@ void RelayMainWindow::DoStopRelay()
 {
     if (!m_network) return;
     m_network->StopRelay();
-    DrainNetworkMessages();   // events of the relay that just ended must not reach the next one
+    m_queue.Clear();          // events of the relay that just ended must not reach the next one
     m_lastError.clear();      // a stop the user asked for is not an error
     OnRelayStopped();
 }
@@ -1049,33 +1011,62 @@ void RelayMainWindow::ResetSessionUI()
     m_viewC2T.clear(); m_viewT2C.clear();
     m_clientUp = m_targetUp = false;
     m_clientAddr.clear(); m_targetAddr.clear();
+    m_sliceC2T.clear(); m_sliceT2C.clear();
+    m_waitingCount = 0;
     UpdateBufferLabel(true);
     UpdateBufferLabel(false);
     RefreshC2TView();
     RefreshT2CView();
-    Utils::SetWindowText(m_hStaticClientInd, L"\u25CB Client: -");
+    m_clientIndBase = L"\u25CB Client: -";
+    UpdateClientIndicator();
     Utils::SetWindowText(m_hStaticTargetInd, L"\u25CB Target: -");
 }
 
-// Frees the payloads of network messages still queued for this window.
-void RelayMainWindow::DrainNetworkMessages()
+// One slice is about 64 KB of payload: the text view needs ~2 us per byte, so a
+// slice stays near 100 ms and clicks get in between.
+constexpr size_t RELAY_SLICE_BYTES = 64 * 1024;
+
+// The wake-up: handles one slice of what the network threads queued, then
+// returns. Everything the slice produced is shown once: one append per view,
+// one list update, one refresh of the labels.
+void RelayMainWindow::OnRelayEvents()
 {
-    MSG m;
-    while (PeekMessageW(&m, m_hWnd, WM_RELAY_LISTENING, WM_RELAY_TARGET_CONNECTING, PM_REMOVE)) {
-        // PeekMessage hands out a pending WM_QUIT whatever the filter says;
-        // swallowing it here would leave the process running without a window.
-        if (m.message == WM_QUIT) { PostQuitMessage((int)m.wParam); break; }
-        switch (m.message) {
-        case WM_RELAY_CLIENT_CONN:
-        case WM_RELAY_ERROR:
-            delete (std::wstring*)m.lParam;
+    std::vector<RelayEvent> events = m_queue.Drain(RELAY_SLICE_BYTES);
+    if (events.empty()) return;
+
+    m_inSlice        = true;
+    m_stoppedInSlice = false;
+    for (RelayEvent& ev : events) {
+        switch (ev.kind) {
+        case RelayEvent::Kind::Listening:        OnRelayListening(ev.num); break;
+        case RelayEvent::Kind::ClientConn:       OnRelayClientConn(ev.text, ev.num, ev.fromWait); break;
+        case RelayEvent::Kind::ClientWaiting:    OnRelayClientWaiting(ev.text, ev.num, false); break;
+        case RelayEvent::Kind::ClientWaitLeft:   OnRelayClientWaiting(ev.text, ev.num, true); break;
+        case RelayEvent::Kind::ClientDisconn:    OnRelayClientDisconn(); break;
+        case RelayEvent::Kind::TargetConnecting: OnRelayTargetConnecting(); break;
+        case RelayEvent::Kind::TargetConn:       OnRelayTargetConn(); break;
+        case RelayEvent::Kind::TargetDisconn:    OnRelayTargetDisconn(); break;
+        case RelayEvent::Kind::Data:
+            OnRelayData(ev.c2t, ev.data.data(), (int)ev.data.size(), ev.forwarded);
             break;
-        case WM_RELAY_CLIENT_DATA:
-        case WM_RELAY_TARGET_DATA:
-            delete[] (BYTE*)m.lParam;
-            break;
+        case RelayEvent::Kind::Error:            OnRelayError(ev.num, ev.text); break;
+        case RelayEvent::Kind::Stopped:          OnRelayStopped(); break;
         }
+        if (m_stoppedInSlice) break;   // the rest belongs to a relay that no longer exists
     }
+    FlushSlice();
+    m_inSlice = false;
+}
+
+// Shows what the slice collected.
+void RelayMainWindow::FlushSlice()
+{
+    if (!m_sliceC2T.empty()) { AppendView(true,  m_sliceC2T.data(), m_sliceC2T.size()); m_sliceC2T.clear(); }
+    if (!m_sliceT2C.empty()) { AppendView(false, m_sliceT2C.data(), m_sliceT2C.size()); m_sliceT2C.clear(); }
+    if (m_bufDirtyC2T) { m_bufDirtyC2T = false; UpdateBufferLabel(true); }
+    if (m_bufDirtyT2C) { m_bufDirtyT2C = false; UpdateBufferLabel(false); }
+    SyncLogList();
+    if (m_bottomTab == 2) UpdateStats();
 }
 
 static std::wstring HexPreview(const std::vector<BYTE>& b)
@@ -1182,6 +1173,7 @@ void RelayMainWindow::ShowViews(bool c2t)
         ShowWindow(edit, SW_SHOW);
         SetWindowTextW(edit, Utils::BytesToDisplayText(v).c_str());
     }
+    (c2t ? m_viewStaleC2T : m_viewStaleT2C) = false;
 }
 
 void RelayMainWindow::RefreshC2TView() { ShowViews(true); }
@@ -1190,12 +1182,15 @@ void RelayMainWindow::RefreshT2CView() { ShowViews(false); }
 void RelayMainWindow::AppendView(bool c2t, const BYTE* data, size_t len)
 {
     auto& v = c2t ? m_viewC2T : m_viewT2C;
+    bool& stale = c2t ? m_viewStaleC2T : m_viewStaleT2C;
     v.insert(v.end(), data, data + len);
-    if (v.size() > RELAY_VIEW_CAP) {
-        v.erase(v.begin(), v.begin() + (v.size() - RELAY_VIEW_CAP / 2));
-        ShowViews(c2t);
-        return;
-    }
+    const bool capped = v.size() > RELAY_VIEW_CAP;
+    if (capped) v.erase(v.begin(), v.begin() + (v.size() - RELAY_VIEW_CAP / 2));
+
+    // A hidden page is not drawn on: the view is rebuilt when the page is shown.
+    if (!IsWindowVisible(m_hWnd)) { stale = true; return; }
+    if (capped || stale) { ShowViews(c2t); return; }
+
     if (c2t ? m_hexModeC2T : m_hexModeT2C) {
         HexView::AppendData(c2t ? m_hHexC2T : m_hHexT2C, data, len);
     } else {
@@ -1235,6 +1230,7 @@ void RelayMainWindow::SetRelayUI(bool listening)
 
 void RelayMainWindow::UpdateBufferLabel(bool c2t)
 {
+    if (m_inSlice) { (c2t ? m_bufDirtyC2T : m_bufDirtyT2C) = true; return; }   // once, at the slice's end
     const auto& q     = c2t ? m_pendC2T : m_pendT2C;
     size_t      bytes = c2t ? m_pendBytesC2T : m_pendBytesT2C;
     Utils::SetWindowText(c2t ? m_hStaticBufC2T : m_hStaticBufT2C,
@@ -1312,13 +1308,7 @@ void RelayMainWindow::RefreshDiagnostics()
     // Listen socket info
     SOCKET lsock = m_network->GetListenSocket();
     if (lsock != INVALID_SOCKET) {
-        sockaddr_in localAddr = {};
-        int localLen = sizeof(localAddr);
-        if (getsockname(lsock, (sockaddr*)&localAddr, &localLen) == 0) {
-            wchar_t ip[64]; DWORD ipLen = 64;
-            WSAAddressToStringW((sockaddr*)&localAddr, localLen, nullptr, ip, &ipLen);
-            info += L"Listen: " + std::wstring(ip) + L"\r\n";
-        }
+        info += L"Listen: " + NetAddr::LocalName(lsock) + L"\r\n";
 
         int sndbuf = 0, rcvbuf = 0, optLen = sizeof(int);
         getsockopt(lsock, SOL_SOCKET, SO_SNDBUF, (char*)&sndbuf, &optLen);
@@ -1330,21 +1320,15 @@ void RelayMainWindow::RefreshDiagnostics()
         info += L"\r\n\r\n";
     }
 
-    // Client socket info
-    SOCKET csock = m_network->GetClientSocket();
-    if (csock != INVALID_SOCKET && m_network->IsClientConnected()) {
-        sockaddr_in remoteAddr = {};
-        int remoteLen = sizeof(remoteAddr);
-        if (getpeername(csock, (sockaddr*)&remoteAddr, &remoteLen) == 0) {
-            wchar_t ip[64]; DWORD ipLen = 64;
-            WSAAddressToStringW((sockaddr*)&remoteAddr, remoteLen, nullptr, ip, &ipLen);
-            info += L"Client: " + std::wstring(ip) + L"\r\n";
-        }
+    // Client / target socket info (the two sides may be of different families)
+    auto describe = [&](SOCKET sock, const wchar_t* label) {
+        std::wstring peer = NetAddr::PeerName(sock);
+        if (!peer.empty()) info += std::wstring(label) + L": " + peer + L"\r\n";
 
         int sndbuf = 0, rcvbuf = 0, optLen = sizeof(int);
-        getsockopt(csock, SOL_SOCKET, SO_SNDBUF, (char*)&sndbuf, &optLen);
+        getsockopt(sock, SOL_SOCKET, SO_SNDBUF, (char*)&sndbuf, &optLen);
         optLen = sizeof(int);
-        getsockopt(csock, SOL_SOCKET, SO_RCVBUF, (char*)&rcvbuf, &optLen);
+        getsockopt(sock, SOL_SOCKET, SO_RCVBUF, (char*)&rcvbuf, &optLen);
 
         wchar_t buf[256];
         swprintf_s(buf, L"  SO_SNDBUF: %d B  SO_RCVBUF: %d B", sndbuf, rcvbuf);
@@ -1352,53 +1336,32 @@ void RelayMainWindow::RefreshDiagnostics()
 
         if (!m_network->IsUdpMode()) {
             BOOL nodelay = FALSE; optLen = sizeof(BOOL);
-            getsockopt(csock, IPPROTO_TCP, TCP_NODELAY, (char*)&nodelay, &optLen);
+            getsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (char*)&nodelay, &optLen);
             info += nodelay ? L"  Nagle: OFF" : L"  Nagle: ON";
 
             int mss = 0; optLen = sizeof(int);
-            if (getsockopt(csock, IPPROTO_TCP, TCP_MAXSEG, (char*)&mss, &optLen) == 0 && mss > 0) {
+            if (getsockopt(sock, IPPROTO_TCP, TCP_MAXSEG, (char*)&mss, &optLen) == 0 && mss > 0) {
                 swprintf_s(buf, L"\r\n  MSS: %d B  MTU: ~%d B  Frame: ~%d B", mss, mss + 40, mss + 40 + 14);
                 info += buf;
             }
         }
-        info += L"\r\n\r\n";
+    };
+
+    SOCKET csock = m_network->GetClientSocket();
+    if (csock != INVALID_SOCKET && m_network->IsClientConnected()) {
+        describe(csock, L"Client");
+        info += L"\r\n";
+        if (m_waitingCount > 0) info += L"  " + std::to_wstring(m_waitingCount) + L" more waiting\r\n";
+        info += L"\r\n";
     } else if (m_network->IsUdpMode() && m_clientUp) {
         info += L"Client (last sender): " + m_clientAddr + L"\r\n\r\n";
     } else {
         info += L"Client: not connected\r\n\r\n";
     }
 
-    // Target socket info
     SOCKET tsock = m_network->GetTargetSocket();
     if (tsock != INVALID_SOCKET && m_network->IsTargetConnected()) {
-        sockaddr_in remoteAddr = {};
-        int remoteLen = sizeof(remoteAddr);
-        if (getpeername(tsock, (sockaddr*)&remoteAddr, &remoteLen) == 0) {
-            wchar_t ip[64]; DWORD ipLen = 64;
-            WSAAddressToStringW((sockaddr*)&remoteAddr, remoteLen, nullptr, ip, &ipLen);
-            info += L"Target: " + std::wstring(ip) + L"\r\n";
-        }
-
-        int sndbuf = 0, rcvbuf = 0, optLen = sizeof(int);
-        getsockopt(tsock, SOL_SOCKET, SO_SNDBUF, (char*)&sndbuf, &optLen);
-        optLen = sizeof(int);
-        getsockopt(tsock, SOL_SOCKET, SO_RCVBUF, (char*)&rcvbuf, &optLen);
-
-        wchar_t buf[256];
-        swprintf_s(buf, L"  SO_SNDBUF: %d B  SO_RCVBUF: %d B", sndbuf, rcvbuf);
-        info += buf;
-
-        if (!m_network->IsUdpMode()) {
-            BOOL nodelay = FALSE; optLen = sizeof(BOOL);
-            getsockopt(tsock, IPPROTO_TCP, TCP_NODELAY, (char*)&nodelay, &optLen);
-            info += nodelay ? L"  Nagle: OFF" : L"  Nagle: ON";
-
-            int mss = 0; optLen = sizeof(int);
-            if (getsockopt(tsock, IPPROTO_TCP, TCP_MAXSEG, (char*)&mss, &optLen) == 0 && mss > 0) {
-                swprintf_s(buf, L"\r\n  MSS: %d B  MTU: ~%d B  Frame: ~%d B", mss, mss + 40, mss + 40 + 14);
-                info += buf;
-            }
-        }
+        describe(tsock, L"Target");
         info += L"\r\n";
     } else {
         info += L"Target: not connected\r\n";
@@ -1420,12 +1383,13 @@ void RelayMainWindow::UpdateStatusText()
 {
     if (!m_isListening) { Utils::SetWindowText(m_hStaticStatus, L"Idle"); return; }
     std::wstring p = L"[" + m_proto + L"] ";
+    const std::wstring more = m_waitingCount > 0 ? L" (+" + std::to_wstring(m_waitingCount) + L" waiting)" : L"";
     if (m_clientUp && m_targetUp)
-        Utils::SetWindowText(m_hStaticStatus, p + L"Relaying: " + m_clientAddr + L" \u2194 " + m_targetText);
+        Utils::SetWindowText(m_hStaticStatus, p + L"Relaying: " + m_clientAddr + L" \u2194 " + m_targetText + more);
     else if (m_targetUp)
         Utils::SetWindowText(m_hStaticStatus, p + L"Target connected, awaiting client...");
     else if (m_clientUp)
-        Utils::SetWindowText(m_hStaticStatus, p + L"Client: " + m_clientAddr + L" | Target: not connected, retrying...");
+        Utils::SetWindowText(m_hStaticStatus, p + L"Client: " + m_clientAddr + L" | Target: not connected, retrying..." + more);
     else
         Utils::SetWindowText(m_hStaticStatus, p + L"Listening on port " + m_listenText + L" | Target: not connected, retrying...");
 }
@@ -1439,18 +1403,49 @@ void RelayMainWindow::OnRelayListening(int port)
     UpdateTitle();
 }
 
-void RelayMainWindow::OnRelayClientConn(const std::wstring& addr)
+// The client indicator: the base text, plus how many clients wait behind it.
+void RelayMainWindow::UpdateClientIndicator()
 {
-    m_clientUp   = true;
-    m_clientAddr = addr;
+    std::wstring t = m_clientIndBase;
+    if (m_waitingCount > 0) {
+        if (!m_clientUp) t = L"\u25CB Client: -";
+        t += L" (+" + std::to_wstring(m_waitingCount) + L" waiting)";
+    }
+    Utils::SetWindowText(m_hStaticClientInd, t);
+}
+
+void RelayMainWindow::OnRelayClientConn(const std::wstring& addr, int waiting, bool fromWait)
+{
+    m_clientUp      = true;
+    m_clientAddr    = addr;
+    m_waitingCount  = waiting;
+    m_clientIndBase = L"\u25CF Client: " + addr;
     UpdateStatusText();
-    Utils::SetWindowText(m_hStaticClientInd, L"\u25CF Client: " + addr);
+    UpdateClientIndicator();
     AddLogEntry(LogType::ClientConn, L"-", 0,
-                L"[" + m_proto + L"] Client connected: " + addr, false);
+                L"[" + m_proto + L"] Client connected: " + addr +
+                (fromWait ? L" (its turn after waiting)" : L""), false);
     // Data the target sent before a client was there.
     if (m_network && m_network->GetAutoForwardT2C()) FlushHeld(false);
     if (m_bottomTab == 1) RefreshDiagnostics();
     UpdateTitle();
+}
+
+// A further client waits (TCP relays one client at a time) or gave up waiting.
+void RelayMainWindow::OnRelayClientWaiting(const std::wstring& addr, int waiting, bool left)
+{
+    m_waitingCount = waiting;
+    UpdateClientIndicator();
+    UpdateStatusText();
+    if (left)
+        AddLogEntry(LogType::Info, L"-", 0,
+                    L"[" + m_proto + L"] Waiting client left: " + addr +
+                    L" (" + std::to_wstring(waiting) + L" waiting)", false);
+    else
+        AddLogEntry(LogType::Info, L"-", 0,
+                    L"[" + m_proto + L"] Client waiting: " + addr +
+                    L" (" + std::to_wstring(waiting) + L" waiting; served when the current client leaves)", false);
+    if (m_bottomTab == 1) RefreshDiagnostics();
 }
 
 void RelayMainWindow::OnRelayClientDisconn()
@@ -1458,8 +1453,9 @@ void RelayMainWindow::OnRelayClientDisconn()
     std::wstring prevAddr = m_clientAddr;
     m_clientUp = false;
     m_clientAddr.clear();
+    m_clientIndBase = L"\u25CB Client: disconnected";
     UpdateStatusText();
-    Utils::SetWindowText(m_hStaticClientInd, L"\u25CB Client: disconnected");
+    UpdateClientIndicator();
     AddLogEntry(LogType::ClientDisconn, L"-", 0,
                 L"[" + m_proto + L"] Client disconnected" + (prevAddr.empty() ? L"" : L": " + prevAddr),
                 false);
@@ -1532,7 +1528,7 @@ void RelayMainWindow::OnRelayData(bool c2t, const BYTE* data, int len, bool forw
     const wchar_t* dir = c2t ? L"C\u2192T" : L"T\u2192C";
     LogType type = c2t ? LogType::DataC2T : LogType::DataT2C;
 
-    AppendView(c2t, data, (size_t)len);
+    (c2t ? m_sliceC2T : m_sliceT2C).insert((c2t ? m_sliceC2T : m_sliceT2C).end(), data, data + len);   // shown at the slice's end
 
     if (forwarded) {
         (c2t ? m_bytesC2T : m_bytesT2C) += len;
@@ -1561,16 +1557,6 @@ void RelayMainWindow::OnRelayData(bool c2t, const BYTE* data, int len, bool forw
         FlushHeld(c2t);
 }
 
-void RelayMainWindow::OnRelayClientData(const BYTE* data, int len, bool forwarded)
-{
-    OnRelayData(true, data, len, forwarded);
-}
-
-void RelayMainWindow::OnRelayTargetData(const BYTE* data, int len, bool forwarded)
-{
-    OnRelayData(false, data, len, forwarded);
-}
-
 // Errors come from the network threads: log and status line, no message box
 // (this tab may not be the one in front).
 void RelayMainWindow::OnRelayError(int err, const std::wstring& msg)
@@ -1585,11 +1571,14 @@ void RelayMainWindow::OnRelayStopped()
     DiscardHeld(true,  L"Discarded buffered data: the relay stopped");
     DiscardHeld(false, L"Discarded buffered data: the relay stopped");
     m_network.reset();           // joins the network threads
-    DrainNetworkMessages();      // whatever they posted last
+    m_queue.Clear();             // whatever they queued last
+    m_stoppedInSlice = true;
 
     SetRelayUI(false);           // sets m_isListening = false
     AddLogEntry(LogType::Stopped, L"-", 0, L"[" + m_proto + L"] Relay stopped", false);
-    Utils::SetWindowText(m_hStaticClientInd, L"\u25CB Client: -");
+    m_waitingCount  = 0;
+    m_clientIndBase = L"\u25CB Client: -";
+    UpdateClientIndicator();
     Utils::SetWindowText(m_hStaticTargetInd, L"\u25CB Target: -");
     m_clientUp = m_targetUp = false;
     m_clientAddr.clear();
@@ -1638,19 +1627,26 @@ void RelayMainWindow::CreateTooltips()
         L"for an incoming client connection. All data from "
         L"the client is forwarded to the target server "
         L"and vice-versa.\n\n"
+        L"The relay listens on IPv4 and IPv6 (one dual-stack "
+        L"socket) and takes the port exclusively.\n\n"
         L"NOTE: Ports below 1024 may need admin rights. "
-        L"A port already in use will be rejected.");
+        L"A port already in use is reported in the log and "
+        L"the status line.");
 
     tip(m_hComboTarget,
-        L"Target server address \u2014 IP or hostname.\n\n"
+        L"Target server address \u2014 IP address or hostname.\n\n"
         L"The upstream server the relay forwards data to. "
         L"Pick from recent targets in the dropdown or "
         L"type a new one.\n\n"
         L"Supported formats:\n"
-        L"\u2022 IPv4 address: 192.168.1.10 (IPv6 is not supported)\n"
+        L"\u2022 IPv4 address: 192.168.1.10\n"
+        L"\u2022 IPv6 address: ::1 or [::1] (brackets optional)\n"
         L"\u2022 Hostname: myserver.local\n"
-        L"\u2022 host:port shortcut: 192.168.1.10:9002\n"
-        L"   (auto-fills both Target and Port fields)");
+        L"\u2022 host:port shortcut: 192.168.1.10:9002 or [::1]:9002\n"
+        L"   (auto-fills both Target and Port fields; also when "
+        L"picked from the history)\n\n"
+        L"The client side and the target side may use different "
+        L"address families.");
 
     tip(m_hEditTargetPort,
         L"Target server port (1\u201365535).\n\n"
@@ -1689,14 +1685,16 @@ void RelayMainWindow::CreateTooltips()
 
     tip(m_hBtnStart,
         L"Start the relay.\n\n"
-        L"Binds to the listen port, accepts one client at a "
-        L"time and connects to the target server right away "
+        L"Binds to the listen port, relays one client at a "
+        L"time (others wait in line) and connects to the target server right away "
         L"(retrying until it succeeds), then forwards data in "
         L"both directions. In UDP mode the client is whoever "
         L"sent the last datagram.\n\n"
         L"The listen port must be free \u2014 if another process "
-        L"is using it, an error is displayed. "
-        L"The target address and port are validated first.");
+        L"is using it, an error is shown in the log and the "
+        L"status line. The target address and port are "
+        L"validated first. Stop returns at once, also while a "
+        L"slow name lookup or connect is running.");
 
     tip(m_hBtnStop,
         L"Stop the relay.\n\n"
@@ -1717,7 +1715,14 @@ void RelayMainWindow::CreateTooltips()
         L"Client connection indicator.\n\n"
         L"Shows whether an incoming client is connected "
         L"and its IP address. A filled circle (\u25CF) means "
-        L"connected; an empty circle (\u25CB) means idle.");
+        L"connected; an empty circle (\u25CB) means idle.\n\n"
+        L"The relay serves one TCP client at a time. Further "
+        L"clients that connect meanwhile wait in line (up to 16, "
+        L"unread, in order) and the indicator shows how many "
+        L"are waiting, for example \u201c(+2 waiting)\u201d. Each "
+        L"gets its turn when the client before it leaves; the "
+        L"log notes when a client starts waiting and when it "
+        L"gets its turn. Stop closes all waiting clients.");
 
     tip(m_hStaticTargetInd,
         L"Target connection indicator.\n\n"

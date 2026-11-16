@@ -137,7 +137,7 @@ LRESULT CALLBACK ServerMainWindow::WndProc(HWND hWnd, UINT msg, WPARAM wParam, L
                 L"Select from recent ports in the dropdown, "
                 L"or type a new port number.\n"
                 L"2. Choose TCP or UDP and set the send timeout.\n"
-                L"3. Click Start Server to begin listening (IPv4 only, all local addresses).\n"
+                L"3. Click Start Server to begin listening (IPv4 and IPv6, all local addresses; the port is taken exclusively).\n"
                 L"4. Wait for a client to connect (UDP: for a datagram to arrive).\n"
                 L"5. Received data appears in the Receive panel.\n"
                 L"6. Type a response in Send and click Send.\n"
@@ -161,6 +161,11 @@ LRESULT CALLBACK ServerMainWindow::WndProc(HWND hWnd, UINT msg, WPARAM wParam, L
                 L"(sent byte-exact), save received data to disk.\n"
                 L"• Port History — Dropdown remembers recent "
                 L"listen ports across sessions.\n"
+                L"• Waiting clients — TCP serves one client at a time. Further clients that connect "
+                L"are parked in arrival order (up to 16; the Client line shows \"(n waiting)\") and are "
+                L"served when the current client leaves. Data they send meanwhile is received then.\n"
+                L"• IPv4 and IPv6 — The server listens on both; IPv6 clients are shown as [addr]:port, "
+                L"IPv4 clients as addr:port.\n"
                 L"• UDP — There is no connection: the \"client\" is the sender of "
                 L"the last datagram, and Send goes to that sender.\n"
                 L"\n"
@@ -198,20 +203,8 @@ LRESULT CALLBACK ServerMainWindow::WndProc(HWND hWnd, UINT msg, WPARAM wParam, L
         break;
 
     // Network messages
-    case WM_NET_LISTENING:
-        if (self) self->OnNetListening((int)wParam); return 0;
-    case WM_NET_STOPPED:
-        if (self) self->OnNetStopped(); return 0;
-    case WM_NET_CONNECTED:
-        if (self) self->OnNetClientConnected((std::wstring*)lParam); return 0;
-    case WM_NET_DISCONNECTED:
-        if (self) self->OnNetClientDisconnected(); return 0;
-    case WM_NET_DATA_RECEIVED:
-        if (self) self->OnNetDataReceived((size_t)wParam, (BYTE*)lParam); return 0;
-    case WM_NET_SEND_COMPLETE:
-        if (self) self->OnNetSendComplete((size_t)wParam, (CycleStats*)lParam); return 0;
-    case WM_NET_ERROR:
-        if (self) self->OnNetError((int)wParam, (std::wstring*)lParam); return 0;
+    case WM_SERVER_EVENTS:
+        if (self) self->OnNetEvents(); return 0;
     case WM_CTLCOLORSTATIC:
     {
         HDC hdc = (HDC)wParam;
@@ -293,6 +286,9 @@ void ServerMainWindow::OnCreate(HWND hWnd, HINSTANCE hInst,
     m_hChkEcho      = MakeCheck(IDC_CHK_ECHO, L"Echo Mode", 0,0,10,10);
     m_hStaticStatus = MakeLabel(L"● Not listening", 0,0,10,10);
     m_hStaticClient = MakeLabel(L"No client", 0,0,10,10);
+    // Ids so that the status lines can be found (and read) from outside.
+    SetWindowLongPtrW(m_hStaticStatus, GWLP_ID, IDC_STATIC_CONNSTATUS);
+    SetWindowLongPtrW(m_hStaticClient, GWLP_ID, IDC_STATIC_CLIENTINFO);
     for (HWND h : { m_hStaticStatus, m_hStaticClient })   // long text gets "...", and tooltips can see the mouse
         SetWindowLongPtrW(h, GWL_STYLE, GetWindowLongPtrW(h, GWL_STYLE) | SS_ENDELLIPSIS | SS_NOTIFY);
 
@@ -472,7 +468,7 @@ void ServerMainWindow::OnCreate(HWND hWnd, HINSTANCE hInst,
     SendMessage(m_hBtnHelp, WM_SETFONT, (WPARAM)m_hFont, TRUE);
 
     // Initialize network object (pass notify window)
-    m_net = std::make_unique<ServerNetwork>(hWnd, echoMode);
+    m_net = std::make_unique<ServerNetwork>(hWnd, WM_SERVER_EVENTS, echoMode);
     if (!logFile.empty()) m_net->SetLogFile(logFile);
 
     // Initial layout
@@ -696,32 +692,13 @@ void ServerMainWindow::SwitchBottomTab(int tab)
 
 void ServerMainWindow::OnDestroy()
 {
-    // Joins the accept and send threads and detaches the window, so nothing
+    // Joins the accept and send threads and closes the hand-off queue, so nothing
     // touches this object (or posts to the window) after this call.
     if (m_net) m_net->Shutdown();
-    DrainPendingMessages();
     if (m_hImgListLog) ImageList_Destroy(m_hImgListLog);
     if (m_hTooltip) { DestroyWindow(m_hTooltip); m_hTooltip = nullptr; }
     if (m_hFont)     DeleteObject(m_hFont);
     if (m_hFontMono) DeleteObject(m_hFontMono);
-}
-
-// Frees the payloads of network messages that were posted but never handled.
-void ServerMainWindow::DrainPendingMessages()
-{
-    MSG msg;
-    while (PeekMessageW(&msg, m_hWnd, WM_APP + 1, WM_APP + 8, PM_REMOVE)) {
-        // PeekMessage hands out a pending WM_QUIT whatever the filter says;
-        // swallowing it here would leave the process running without a window.
-        if (msg.message == WM_QUIT) { PostQuitMessage((int)msg.wParam); break; }
-        switch (msg.message) {
-        case WM_NET_CONNECTED:
-        case WM_NET_ERROR:         delete (std::wstring*)msg.lParam; break;
-        case WM_NET_DATA_RECEIVED: delete[] (BYTE*)msg.lParam;       break;
-        case WM_NET_SEND_COMPLETE: delete (CycleStats*)msg.lParam;   break;
-        default: break;
-        }
-    }
 }
 
 // ============================================================
@@ -748,6 +725,7 @@ void ServerMainWindow::OnCommand(WORD id, WORD notify, HWND /*hCtrl*/)
         ResetRecvTextState();
         SetWindowTextW(m_hEditRecv, L"");
         HexView::ClearData(m_hHexRecv);
+        m_textStale = m_hexStale = false;
         break;
 
     case IDC_BTN_COPYRECV:
@@ -848,7 +826,7 @@ static bool ParseTimeoutSec(const std::wstring& s, int& out)
 
 bool ServerMainWindow::StartServer(int port, int timeoutSec, bool udp, bool echo)
 {
-    if (!m_net) m_net = std::make_unique<ServerNetwork>(m_hWnd);
+    if (!m_net) m_net = std::make_unique<ServerNetwork>(m_hWnd, WM_SERVER_EVENTS);
     m_net->SetEchoMode(echo);
     m_udpActive = udp;
     m_port      = port;
@@ -887,15 +865,8 @@ void ServerMainWindow::DoStartServer()
 
     bool udp = (SendMessage(m_hComboProtocol, CB_GETCURSEL, 0, 0) == 1);
 
-    // Check if port is already in use
-    if (!Utils::IsPortAvailable(port, udp)) {
-        wchar_t msg[128];
-        swprintf_s(msg, L"Port %d is already in use.\nPlease choose a different port.", port);
-        MessageBoxW(m_hWnd, msg, L"Port busy", MB_ICONWARNING);
-        SetFocus(m_hComboPort);
-        return;
-    }
-
+    // A busy port is reported by the start itself (log + status line), the same way
+    // for a click and for /autostart.
     StartServer(port, timeout, udp, Button_GetCheck(m_hChkEcho) == BST_CHECKED);
 }
 
@@ -1175,8 +1146,18 @@ SeparatorMode ServerMainWindow::GetSeparatorMode()
 //  (m_recvData); the checkbox only chooses which one is visible.
 // ============================================================
 
+// Only the visible view is kept up to date while data arrives; the hidden one is
+// flagged stale and rebuilt here, when it is shown.
 void ServerMainWindow::RefreshRecvView()
 {
+    if (m_hexRecvMode && m_hexStale) {
+        HexView::SetData(m_hHexRecv, m_recvData);
+        m_hexStale = false;
+    }
+    else if (!m_hexRecvMode && m_textStale) {
+        RebuildTextView();
+        m_textStale = false;
+    }
     ShowWindow(m_hEditRecv, m_hexRecvMode ? SW_HIDE : SW_SHOW);
     ShowWindow(m_hHexRecv,  m_hexRecvMode ? SW_SHOW : SW_HIDE);
 }
@@ -1221,13 +1202,18 @@ void ServerMainWindow::AppendReceiveText(const std::vector<BYTE>& data, bool flu
 
     std::wstring ws = Utils::BytesToDisplayText(bytes.data() + off, bytes.size() - off);
     int len = GetWindowTextLengthW(m_hEditRecv);
+    // No repaint while the text changes, and no undo record: a read-only view has no
+    // use for it, and it makes every append slower as the text grows.
+    SendMessage(m_hEditRecv, WM_SETREDRAW, FALSE, 0);
     SendMessage(m_hEditRecv, EM_SETSEL, (WPARAM)len, (LPARAM)len);
     SendMessage(m_hEditRecv, EM_REPLACESEL, FALSE, (LPARAM)ws.c_str());
+    SendMessage(m_hEditRecv, EM_EMPTYUNDOBUFFER, 0, 0);
+    SendMessage(m_hEditRecv, WM_SETREDRAW, TRUE, 0);
     SendMessage(m_hEditRecv, EM_SCROLLCARET, 0, 0);
+    InvalidateRect(m_hEditRecv, nullptr, FALSE);
 }
 
-// Replaces both views with the whole of m_recvData.
-void ServerMainWindow::RebuildReceiveView()
+void ServerMainWindow::RebuildTextView()
 {
     ResetRecvTextState();
     SetWindowTextW(m_hEditRecv, Utils::BytesToDisplayText(m_recvData).c_str());
@@ -1235,7 +1221,19 @@ void ServerMainWindow::RebuildReceiveView()
     int len = GetWindowTextLengthW(m_hEditRecv);
     SendMessage(m_hEditRecv, EM_SETSEL, (WPARAM)len, (LPARAM)len);
     SendMessage(m_hEditRecv, EM_SCROLLCARET, 0, 0);
-    HexView::SetData(m_hHexRecv, m_recvData);
+}
+
+// Replaces the visible view with the whole of m_recvData; the other one is rebuilt when shown.
+void ServerMainWindow::RebuildReceiveView()
+{
+    if (m_hexRecvMode) {
+        HexView::SetData(m_hHexRecv, m_recvData);
+        m_hexStale = false;  m_textStale = true;
+    }
+    else {
+        RebuildTextView();
+        m_textStale = false; m_hexStale = true;
+    }
 }
 
 // Keeps the newest half of a buffer that outgrew RECV_CAP, starting on a UTF-8 boundary.
@@ -1252,13 +1250,6 @@ static bool TrimToNewestHalf(std::vector<BYTE>& v)
 //  RefreshDiagnostics - nerdy socket info
 // ============================================================
 
-static std::wstring SockAddrText(const sockaddr_in& a)
-{
-    wchar_t ip[64] = {}; DWORD ipLen = 64;
-    WSAAddressToStringW((sockaddr*)&a, sizeof(a), nullptr, ip, &ipLen);
-    return ip;
-}
-
 void ServerMainWindow::RefreshDiagnostics()
 {
     if (!m_net) {
@@ -1269,10 +1260,7 @@ void ServerMainWindow::RefreshDiagnostics()
     std::wstring info;
 
     std::wstring listenEp;
-    m_net->WithListenSocket([&](SOCKET s) {
-        sockaddr_in a = {}; int len = sizeof(a);
-        if (getsockname(s, (sockaddr*)&a, &len) == 0) listenEp = SockAddrText(a);
-    });
+    m_net->WithListenSocket([&](SOCKET s) { listenEp = NetAddr::LocalName(s); });
     if (listenEp.empty()) {
         SetWindowTextW(m_hStaticDiagInfo, L"Server not listening — start the server for diagnostics");
         return;
@@ -1312,8 +1300,7 @@ void ServerMainWindow::RefreshDiagnostics()
         std::wstring clientEp;
         std::wstring opts;
         haveClient = m_net->WithClientSocket([&](SOCKET s) {
-            sockaddr_in a = {}; int len = sizeof(a);
-            if (getpeername(s, (sockaddr*)&a, &len) == 0) clientEp = SockAddrText(a);
+            clientEp = NetAddr::PeerName(s);
             std::wstring saved = std::move(info);
             info.clear();
             sockOpts(s, true);
@@ -1321,7 +1308,9 @@ void ServerMainWindow::RefreshDiagnostics()
             info = std::move(saved);
         });
         if (haveClient) {
-            info += L"Client: " + clientEp + L"\r\n" + opts;
+            info += L"Client: " + clientEp;
+            if (m_waiting > 0) info += L"  (" + std::to_wstring(m_waiting) + L" waiting)";
+            info += L"\r\n" + opts;
         }
         else {
             info += L"\r\nNo client — connect a client for full diagnostics";
@@ -1385,10 +1374,56 @@ void ServerMainWindow::ShowStatusNote(const std::wstring& text)
 //  Network message handlers
 // ============================================================
 
+// Largest payload handled per wake-up; the queue re-posts itself for the rest, so
+// clicks and paints get in between two slices.
+static constexpr size_t DRAIN_SLICE_BYTES = 64u * 1024;
+
+// The line under the status: the current client, and how many more wait behind it.
+void ServerMainWindow::UpdateClientLabel()
+{
+    std::wstring t;
+    if (m_clientConn) t = (m_udpActive ? L"Last sender: " : L"Client: ") + m_peerText;
+    if (m_waiting > 0) {
+        if (!t.empty()) t += L"  ";
+        t += L"(" + std::to_wstring(m_waiting) + L" waiting)";
+    }
+    SetWindowTextW(m_hStaticClient, t.c_str());
+    InvalidateRect(m_hStaticClient, nullptr, TRUE);
+}
+
+// One wake-up from the network threads: handles what has gathered, in order.
+// Consecutive data chunks are shown with one append, the log list is updated once.
+void ServerMainWindow::OnNetEvents()
+{
+    if (!m_net) return;
+    std::vector<NetEvent> evs = m_net->Events().Drain(DRAIN_SLICE_BYTES);
+
+    ++m_logBatch;
+    std::vector<NetEvent*> run;
+    auto flushRun = [&] { if (!run.empty()) { OnNetDataRun(run); run.clear(); } };
+    for (NetEvent& ev : evs) {
+        if (ev.kind == NetEvent::Kind::Data) { run.push_back(&ev); continue; }
+        flushRun();
+        switch (ev.kind) {
+        case NetEvent::Kind::Listening:    OnNetListening(ev.value);   break;
+        case NetEvent::Kind::Stopped:      OnNetStopped();             break;
+        case NetEvent::Kind::Connected:    OnNetClientConnected(ev);   break;
+        case NetEvent::Kind::Disconnected: OnNetClientDisconnected();  break;
+        case NetEvent::Kind::Waiting:      OnNetWaiting(ev);           break;
+        case NetEvent::Kind::SendComplete: OnNetSendComplete(ev);      break;
+        case NetEvent::Kind::Error:        OnNetError(ev.text);        break;
+        default: break;
+        }
+    }
+    flushRun();
+    if (--m_logBatch == 0) FlushLogView();
+}
+
 void ServerMainWindow::OnNetListening(int port)
 {
     m_starting = false;
     m_port     = port;
+    m_waiting  = 0;
     SetServerUI(true, false);
 
     // Save port to history
@@ -1410,17 +1445,14 @@ void ServerMainWindow::OnNetListening(int port)
     le.type      = LogType::Listening;
     le.timestamp = Utils::NowTimestamp();
     wchar_t leBuf[128];
-    swprintf_s(leBuf, L"[%s] Listening on port %d", m_udpActive ? L"UDP" : L"TCP", port);
+    swprintf_s(leBuf, L"[%s] Listening on port %d (IPv4 and IPv6)", m_udpActive ? L"UDP" : L"TCP", port);
     le.preview   = leBuf;
     AddLogEntry(std::move(le));
 
     // Exhaustive: listen socket info
     if (m_net) {
         std::wstring ep;
-        m_net->WithListenSocket([&](SOCKET s) {
-            sockaddr_in a = {}; int len = sizeof(a);
-            if (getsockname(s, (sockaddr*)&a, &len) == 0) ep = SockAddrText(a);
-        });
+        m_net->WithListenSocket([&](SOCKET s) { ep = NetAddr::LocalName(s); });
         if (!ep.empty()) {
             LogEntry li;
             li.type = LogType::Info;
@@ -1437,6 +1469,7 @@ void ServerMainWindow::OnNetStopped()
 {
     const bool wasListening = m_listening;
     m_starting = false;
+    m_waiting  = 0;
     m_peerText.clear();
     SetServerUI(false, false);
     SetWindowTextW(m_hStaticStatus, L"● Not listening");
@@ -1456,17 +1489,16 @@ void ServerMainWindow::OnNetStopped()
     RefreshDiagnostics();
 }
 
-void ServerMainWindow::OnNetClientConnected(std::wstring* pAddrStr)
+void ServerMainWindow::OnNetClientConnected(const NetEvent& ev)
 {
-    std::wstring addr;
-    if (pAddrStr) { addr = *pAddrStr; delete pAddrStr; }
+    const std::wstring& addr = ev.text;
     m_peerText = addr;
+    m_waiting  = ev.value;
 
     SetServerUI(true, true);
     SetWindowTextW(m_hStaticStatus, m_udpActive ? L"● Listening (receiving)" : L"● Listening (client connected)");
     InvalidateRect(m_hStaticStatus, nullptr, TRUE);
-    SetWindowTextW(m_hStaticClient, ((m_udpActive ? L"Last sender: " : L"Client: ") + addr).c_str());
-    InvalidateRect(m_hStaticClient, nullptr, TRUE);
+    UpdateClientLabel();
 
     {
         wchar_t sb[64];
@@ -1478,7 +1510,8 @@ void ServerMainWindow::OnNetClientConnected(std::wstring* pAddrStr)
     LogEntry le;
     le.type      = LogType::ClientConn;
     le.timestamp = Utils::NowTimestamp();
-    le.preview   = std::wstring(L"[") + (m_udpActive ? L"UDP] Datagrams from: " : L"TCP] Client connected: ") + addr;
+    le.preview   = std::wstring(L"[") + (m_udpActive ? L"UDP] Datagrams from: " : L"TCP] Client connected: ") + addr
+                 + (ev.fromWaiting ? L"  (was waiting, now served)" : L"");
     AddLogEntry(std::move(le));
 
     // Exhaustive: client socket info (TCP only; a UDP "client" has no socket)
@@ -1500,13 +1533,12 @@ void ServerMainWindow::OnNetClientConnected(std::wstring* pAddrStr)
             li.preview = infoBuf;
             AddLogEntry(std::move(li));
 
-            sockaddr_in localAddr = {};
-            int localLen = sizeof(localAddr);
-            if (getsockname(csock, (sockaddr*)&localAddr, &localLen) == 0) {
+            const std::wstring local = NetAddr::LocalName(csock);
+            if (!local.empty()) {
                 LogEntry li2;
                 li2.type = LogType::Info;
                 li2.timestamp = Utils::NowTimestamp();
-                li2.preview = L"Server-side endpoint: " + SockAddrText(localAddr);
+                li2.preview = L"Server-side endpoint: " + local;
                 AddLogEntry(std::move(li2));
             }
         });
@@ -1515,18 +1547,36 @@ void ServerMainWindow::OnNetClientConnected(std::wstring* pAddrStr)
     RefreshDiagnostics();
 }
 
+// A further client connected while another one is served: it is parked.
+void ServerMainWindow::OnNetWaiting(const NetEvent& ev)
+{
+    m_waiting = ev.value;
+    UpdateClientLabel();
+
+    LogEntry le;
+    le.type      = LogType::Info;
+    le.timestamp = Utils::NowTimestamp();
+    le.preview   = L"[TCP] Client waiting for its turn: " + ev.text + L"  (" + std::to_wstring(ev.value) + L" waiting)";
+    AddLogEntry(std::move(le));
+}
+
 void ServerMainWindow::OnNetClientDisconnected()
 {
     // A UTF-8 character still waiting for its rest will not get it now.
-    if (!m_recvTail.empty()) AppendReceiveText({}, true);
+    if (!m_recvTail.empty() && !m_hexRecvMode) AppendReceiveText({}, true);
+    m_recvTail.clear();
     m_recvLastCR = false;
 
     m_peerText.clear();
     SetServerUI(m_listening, false);
     if (m_listening) {
         SetWindowTextW(m_hStaticStatus, L"◌ Listening");
-        SetWindowTextW(m_hStaticClient, m_udpActive ? L"Sender cleared -- waiting for a datagram..."
-                                                    : L"Client disconnected -- waiting...");
+        if (m_udpActive)
+            SetWindowTextW(m_hStaticClient, L"Sender cleared -- waiting for a datagram...");
+        else if (m_waiting > 0)
+            SetWindowTextW(m_hStaticClient, (L"Client disconnected -- next of " + std::to_wstring(m_waiting) + L" waiting is being served...").c_str());
+        else
+            SetWindowTextW(m_hStaticClient, L"Client disconnected -- waiting...");
     } else {
         SetWindowTextW(m_hStaticStatus, L"● Not listening");
         SetWindowTextW(m_hStaticClient, L"");
@@ -1544,12 +1594,15 @@ void ServerMainWindow::OnNetClientDisconnected()
     RefreshDiagnostics();
 }
 
-void ServerMainWindow::OnNetDataReceived(size_t len, BYTE* pData)
+// Data chunks that arrived back to back: one update of the receive views, one of
+// the totals and statistics, one log entry per chunk (the entry keeps its bytes
+// for "Reload to Send/Receive").
+void ServerMainWindow::OnNetDataRun(std::vector<NetEvent*>& run)
 {
-    std::vector<BYTE> chunk(pData, pData + len);
-    delete[] pData;
+    size_t total = 0;
+    for (NetEvent* ev : run) total += ev->data.size();
 
-    m_totalBytesRecv += len;
+    m_totalBytesRecv += total;
     {
         wchar_t buf[80];
         swprintf_s(buf, L"Total recv: %s", Utils::FormatBytes(m_totalBytesRecv).c_str());
@@ -1563,46 +1616,62 @@ void ServerMainWindow::OnNetDataReceived(size_t len, BYTE* pData)
         ResetRecvTextState();
         SetWindowTextW(m_hEditRecv, L"");
         HexView::ClearData(m_hHexRecv);
+        m_textStale = m_hexStale = false;
     }
 
-    m_recvData.insert(m_recvData.end(), chunk.begin(), chunk.end());
-    m_lastRecvData.insert(m_lastRecvData.end(), chunk.begin(), chunk.end());
+    std::vector<BYTE> joined;
+    if (run.size() == 1) joined = run[0]->data;
+    else {
+        joined.reserve(total);
+        for (NetEvent* ev : run) joined.insert(joined.end(), ev->data.begin(), ev->data.end());
+    }
+
+    m_recvData.insert(m_recvData.end(), joined.begin(), joined.end());
+    m_lastRecvData.insert(m_lastRecvData.end(), joined.begin(), joined.end());
     TrimToNewestHalf(m_lastRecvData);
     if (TrimToNewestHalf(m_recvData)) {
         RebuildReceiveView();
     }
+    else if (m_hexRecvMode) {
+        HexView::AppendData(m_hHexRecv, joined.data(), joined.size());
+        m_textStale = true;                 // the text view is hidden: rebuilt when it is shown
+    }
     else {
-        AppendReceiveText(chunk);
-        HexView::AppendData(m_hHexRecv, chunk.data(), chunk.size());
+        AppendReceiveText(joined);
+        m_hexStale = true;                  // the hex view is hidden: rebuilt when it is shown
     }
 
-    // Latency of the first reply after a manual Send; statistics of the current cycle.
-    CycleStats st = m_net ? m_net->GetStats() : CycleStats();
-    double latency = -1;
-    if (st.valid && st.bytesReceived == len && st.sendEnd.time_since_epoch().count() != 0
-        && st.recvStart > st.sendEnd)
-        latency = st.SendToFirstRecvMs();
-    UpdateStats(st);
+    UpdateStats(run.back()->stats);
 
-    LogEntry le;
-    le.type      = LogType::Received;
-    le.timestamp = Utils::NowTimestamp();
-    le.data      = std::move(chunk);
-    le.byteCount = len;
-    le.latencyMs = latency;
-    std::wstring prev;
-    for (size_t i = 0; i < std::min(len, (size_t)80); ++i) {
-        BYTE b = le.data[i];
-        prev += (b >= 0x20 && b < 0x7F) ? (wchar_t)b : L'.';
+    for (NetEvent* ev : run) {
+        const size_t len = ev->data.size();
+        // Latency of the first reply after a manual Send.
+        const CycleStats& st = ev->stats;
+        double latency = -1;
+        if (st.valid && st.bytesReceived == len && st.sendEnd.time_since_epoch().count() != 0
+            && st.recvStart > st.sendEnd)
+            latency = st.SendToFirstRecvMs();
+
+        LogEntry le;
+        le.type      = LogType::Received;
+        le.timestamp = Utils::NowTimestamp();
+        le.data      = std::move(ev->data);
+        le.byteCount = len;
+        le.latencyMs = latency;
+        std::wstring prev;
+        for (size_t i = 0; i < std::min(len, (size_t)80); ++i) {
+            BYTE b = le.data[i];
+            prev += (b >= 0x20 && b < 0x7F) ? (wchar_t)b : L'.';
+        }
+        le.preview = std::wstring(L"[") + (m_udpActive ? L"UDP" : L"TCP") + L"] " + prev;
+        AddLogEntry(std::move(le));
     }
-    le.preview = std::wstring(L"[") + (m_udpActive ? L"UDP" : L"TCP") + L"] " + prev;
-    AddLogEntry(std::move(le));
 }
 
-void ServerMainWindow::OnNetSendComplete(size_t bytesSent, CycleStats* pStats)
+void ServerMainWindow::OnNetSendComplete(const NetEvent& ev)
 {
-    CycleStats s;
-    if (pStats) { s = *pStats; delete pStats; }
+    const CycleStats& s = ev.stats;
+    const size_t bytesSent = ev.bytes;
 
     m_totalBytesSent += bytesSent;
     {
@@ -1628,17 +1697,16 @@ void ServerMainWindow::OnNetSendComplete(size_t bytesSent, CycleStats* pStats)
         if (LogEntry* e = FindLogBySeq(s.id, &vis)) {
             e->stats = s;
             if (!s.ok) e->preview += L"  (NOT SENT)";
-            if (vis >= 0) ListView_RedrawItems(m_hListLog, vis, vis);
+            // Inside a batch the list may not know this item yet; it is redrawn anyway.
+            if (vis >= 0 && vis < ListView_GetItemCount(m_hListLog)) ListView_RedrawItems(m_hListLog, vis, vis);
         }
     }
 
     UpdateStats(s);
 }
 
-void ServerMainWindow::OnNetError(int /*wsaErr*/, std::wstring* pMsg)
+void ServerMainWindow::OnNetError(const std::wstring& msg)
 {
-    std::wstring msg;
-    if (pMsg) { msg = *pMsg; delete pMsg; }
     // Raised by the network threads, possibly while another tab is in front: log
     // it and show it on the status line instead of a modal box.
     ShowStatusNote(L"Error: " + msg);
@@ -1715,13 +1783,19 @@ static bool PassesLogFilter(LogType type, int filter)
     }
 }
 
-void ServerMainWindow::RefreshLogView()
+// Re-applies the filter to the whole log (vector only; the list view is touched by FlushLogView).
+void ServerMainWindow::RebuildLogVisible()
 {
     m_logVisible.clear();
     for (int i = 0; i < (int)m_log.size(); ++i) {
         if (PassesLogFilter(m_log[i].type, m_logFilter))
             m_logVisible.push_back(i);
     }
+}
+
+void ServerMainWindow::RefreshLogView()
+{
+    RebuildLogVisible();
     ListView_SetItemCountEx(m_hListLog, (int)m_logVisible.size(), 0);
     InvalidateRect(m_hListLog, nullptr, TRUE);
 }
@@ -1735,7 +1809,8 @@ void ServerMainWindow::TrimLog()
         for (size_t i = 0; i < n; ++i) m_logBytes -= m_log[i].data.size();
         m_log.erase(m_log.begin(), m_log.begin() + n);
     }
-    RefreshLogView();
+    RebuildLogVisible();
+    m_logRebuild = true;
 }
 
 // Entries are numbered consecutively and only ever removed from the front.
@@ -1751,29 +1826,42 @@ LogEntry* ServerMainWindow::FindLogBySeq(unsigned long long seq, int* visibleIdx
     return &m_log[idx];
 }
 
+// Adds to the log data and, outside a batch, to the list view. During a batch
+// (one drained slice of network events) the view is updated once at the end.
 void ServerMainWindow::AddLogEntry(LogEntry&& e)
 {
     e.seq = m_nextSeq++;
     m_logBytes += e.data.size();
     m_log.push_back(std::move(e));
-    NotifyToolEvent(m_hWnd);   // counts every appended entry, also filtered-out ones
+    ++m_logNotify;                     // counts every appended entry, also filtered-out ones
 
-    if (m_log.size() > LOG_MAX_ENTRIES || m_logBytes > LOG_MAX_BYTES) {
+    if (m_log.size() > LOG_MAX_ENTRIES || m_logBytes > LOG_MAX_BYTES)
         TrimLog();
-        ListView_EnsureVisible(m_hListLog, (int)m_logVisible.size() - 1, FALSE);
-        return;
+    else if (PassesLogFilter(m_log.back().type, m_logFilter))
+        m_logVisible.push_back((int)m_log.size() - 1);
+
+    m_logDirty = true;
+    if (m_logBatch == 0) FlushLogView();
+}
+
+void ServerMainWindow::FlushLogView()
+{
+    if (m_logNotify > 0) { NotifyToolEvent(m_hWnd, m_logNotify); m_logNotify = 0; }
+    if (!m_logDirty) return;
+    m_logDirty = false;
+
+    const int count = (int)m_logVisible.size();
+    if (m_logRebuild) {
+        m_logRebuild = false;
+        ListView_SetItemCountEx(m_hListLog, count, 0);
+        InvalidateRect(m_hListLog, nullptr, TRUE);
     }
-
-    const LogEntry& le = m_log.back();
-    int origIdx = (int)(m_log.size() - 1);
-
-    if (!PassesLogFilter(le.type, m_logFilter)) return;
-
-    m_logVisible.push_back(origIdx);
-    int count = (int)m_logVisible.size();
-    ListView_SetItemCountEx(m_hListLog, count, LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL);
-    ListView_RedrawItems(m_hListLog, count - 1, count - 1);
-    ListView_EnsureVisible(m_hListLog, count - 1, FALSE);
+    else {
+        const int before = ListView_GetItemCount(m_hListLog);
+        ListView_SetItemCountEx(m_hListLog, count, LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL);
+        if (count > before) ListView_RedrawItems(m_hListLog, before, count - 1);
+    }
+    if (count > 0) ListView_EnsureVisible(m_hListLog, count - 1, FALSE);
 }
 
 // ============================================================
@@ -1926,17 +2014,17 @@ void ServerMainWindow::CreateTooltips()
         L"Fixed while the server is running.");
 
     tip(m_hComboProtocol,
-        L"Network protocol the server uses (IPv4 only).\n\n"
+        L"Network protocol the server uses (IPv4 and IPv6).\n\n"
         L"TCP — Transmission Control Protocol.\n"
         L"Reliable, ordered, byte-stream delivery. "
-        L"Server serves one client at a time; further connections wait until it is gone.\n\n"
+        L"Server serves one client at a time; further clients (up to 16) are accepted and shown as waiting, and are served in arrival order when the current client leaves.\n\n"
         L"UDP — User Datagram Protocol.\n"
         L"Connectionless datagrams. Data from any sender is received; the sender of the last datagram is shown as the client and is where Send and Echo replies go.");
 
     tip(m_hBtnStart,
         L"Start the server.\n\n"
-        L"Binds to the configured port (all local IPv4 addresses) and begins listening. The status line shows “Listening on port ...” once the server is ready.\n\n"
-        L"The port must be free — if another process is already using it, a message is shown.");
+        L"Binds to the configured port (all local IPv4 and IPv6 addresses, one dual-stack socket) and begins listening. The status line shows “Listening on port ...” once the server is ready.\n\n"
+        L"The port is taken exclusively: if another process is already using it, the error is shown in the log and on the status line and the server stays idle.");
 
     tip(m_hBtnStop,
         L"Stop the server.\n\n"
@@ -1962,7 +2050,8 @@ void ServerMainWindow::CreateTooltips()
 
     tip(m_hStaticClient,
         L"Client information and messages.\n\n"
-        L"Displays the IP address and port of the connected client (UDP: the sender of the last datagram), or the last error. Empty when idle.");
+        L"Displays the address and port of the connected client (UDP: the sender of the last datagram; IPv6 as [addr]:port), or the last error. Empty when idle.\n\n"
+        L"\"(n waiting)\" means n more TCP clients are connected and parked; the next one is served when the current client leaves.");
 
     // ================================================================
     //  SEND GROUP

@@ -75,6 +75,11 @@
 #define IDM_LOG_CLEAR           2002
 
 // Custom Window Messages (WM_APP range)
+// Everything the network threads report arrives as ONE message; the events
+// themselves wait in the page's HandoffQueue.
+#define WM_RELAY_EVENTS             (WM_APP + 11)
+
+// Retired: one message per event. The numbers stay reserved.
 #define WM_RELAY_LISTENING          (WM_APP + 1)
 #define WM_RELAY_CLIENT_CONN        (WM_APP + 2)
 #define WM_RELAY_CLIENT_DISCONN     (WM_APP + 3)

@@ -91,12 +91,7 @@
 #define IDM_LOG_CLEAR           2003
 
 // Custom Window Messages (WM_APP range)
-#define WM_NET_CONNECTED        (WM_APP + 1)
-#define WM_NET_DISCONNECTED     (WM_APP + 2)
-#define WM_NET_DATA_RECEIVED    (WM_APP + 3)
-#define WM_NET_ERROR            (WM_APP + 4)
-#define WM_NET_SEND_COMPLETE    (WM_APP + 5)
-#define WM_NET_RECV_LATENCY     (WM_APP + 6)
+#define WM_NET_QUEUE            (WM_APP + 7)   // wake-up of the network HandoffQueue (all network events)
 #define IDC_BTN_HELP            1110
 
 #define WM_PARSE_HOST_COMBO     (WM_APP + 20)
